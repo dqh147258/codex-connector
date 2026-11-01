@@ -1,0 +1,27 @@
+{
+  "name": "codex-connector",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Codex session \u2194 Slack thread bridge with a Codex Skill",
+  "type": "module",
+  "bin": {
+    "codex-connector": "dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "start": "node dist/src/cli.js start"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@slack/socket-mode": "^2.0.5",
+    "@slack/web-api": "^7.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}

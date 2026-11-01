@@ -1,0 +1,9 @@
+{
+  "teamId": "T_REPLACE",
+  "allowedUsers": ["U_REPLACE"],
+  "allowedChannels": ["C_REPLACE"],
+  "projects": { "demo": "/absolute/path/to/your/project" },
+  "port": 17381,
+  "codexExecutable": "/absolute/path/to/codex",
+  "sandbox": "read-only"
+}
