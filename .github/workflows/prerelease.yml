@@ -1,0 +1,136 @@
+name: Build and publish prerelease
+on:
+  push:
+    tags: ['v*']
+    branches: [master]
+    paths: ['.github/workflows/prerelease.yml']
+permissions: {}
+concurrency:
+  group: prerelease-${{ github.ref_type == 'tag' && github.ref_name || 'v0.2.0-beta.1' }}
+  cancel-in-progress: false
+jobs:
+  build:
+    if: >-
+      github.repository == 'dqh147258/codex-connector' &&
+      ((github.event_name == 'push' && github.ref_type == 'tag') ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/master' &&
+        contains(github.event.head_commit.message, '[bootstrap-prerelease-v0.2.0-beta.1]')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.2.0-beta.1' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, verified upstream
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Validate prerelease and source
+        run: |
+          python3 - <<'PY'
+          import os,re,json,subprocess
+          tag=os.environ['RELEASE_TAG']
+          m=re.fullmatch(r'v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-(alpha|beta|rc)\.(0|[1-9]\d*)',tag)
+          assert m, 'Only strict prerelease tags supported'
+          assert '.'.join(m.group(1,2,3))==json.load(open('package.json'))['version'], 'Version mismatch'
+          assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==os.environ['GITHUB_SHA']
+          PY
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
+      - name: Package exact tested source
+        run: python3 scripts/package-release.py --tag "$RELEASE_TAG"
+      - name: Verify extracted portable package
+        run: |
+          cd release-assets
+          sha256sum -c SHA256SUMS
+          mkdir "$RUNNER_TEMP/portable-smoke"
+          tar -xzf "codex-connector-$RELEASE_TAG-node.tar.gz" -C "$RUNNER_TEMP/portable-smoke"
+          cd "$RUNNER_TEMP/portable-smoke/codex-connector-${RELEASE_TAG#v}"
+          npm ci --omit=dev --ignore-scripts
+          node dist/src/cli.js help >/dev/null
+          test ! -d node_modules/typescript
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: prerelease-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.2.0-beta.1' }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: prerelease-assets
+          path: release-assets
+      - name: Publish once, never overwrite an existing release or tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,re,subprocess
+          from pathlib import Path
+          tag=os.environ['RELEASE_TAG'];sha=os.environ['GITHUB_SHA'];repo=os.environ['GH_REPO']
+          assert re.fullmatch(r'v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-(alpha|beta|rc)\.(0|[1-9]\d*)',tag)
+          assert re.fullmatch(r'[0-9a-f]{40}',sha)
+          root=Path('release-assets')
+          expected={f'codex-connector-{tag}-source.tar.gz',f'codex-connector-{tag}-node.tar.gz','RELEASE-INFO.json','MACOS-SETUP.md','RELEASE-NOTES.zh-CN.md','SHA256SUMS'}
+          assert {p.name for p in root.iterdir()}==expected and all(p.is_file() and not p.is_symlink() for p in root.iterdir())
+          info=json.loads((root/'RELEASE-INFO.json').read_text());assert info['sourceCommit']==sha and info['release']==tag
+          hashes={}
+          for line in (root/'SHA256SUMS').read_text().splitlines():
+            digest,name=line.split('  ');assert name in expected-{'SHA256SUMS'} and name not in hashes
+            assert re.fullmatch(r'[0-9a-f]{64}',digest) and hashlib.sha256((root/name).read_bytes()).hexdigest()==digest
+            hashes[name]=digest
+          assert set(hashes)==expected-{'SHA256SUMS'}
+          def api(path,optional=False):
+            r=subprocess.run(['gh','api',f'repos/{repo}/{path}'],text=True,capture_output=True)
+            if r.returncode:
+              if optional and '(HTTP 404)' in r.stderr:return None
+              raise SystemExit('GitHub API request failed; no fallback or overwrite')
+            return json.loads(r.stdout)
+          def release_for_tag():
+            for page in range(1,21):
+              releases=api(f'releases?per_page=100&page={page}')
+              matches=[r for r in releases if r['tag_name']==tag]
+              if matches:return matches[0]
+              if len(releases)<100:return None
+            raise SystemExit('Release inventory exceeded safety bound')
+          def tag_commit():
+            ref=api('git/ref/tags/'+tag,True)
+            if ref is None:return None
+            obj=ref['object']
+            for _ in range(5):
+              if obj['type']=='commit':return obj['sha']
+              assert obj['type']=='tag'
+              obj=api('git/tags/'+obj['sha'])['object']
+            raise SystemExit('Tag resolution exceeded limit')
+          assert release_for_tag() is None, 'Existing release is never overwritten; choose a new version'
+          existing=tag_commit();assert existing is None or existing==sha, 'Existing tag points to another commit'
+          if os.environ['GITHUB_REF_TYPE']=='tag':assert existing==sha, 'Trigger tag disappeared or moved'
+          if existing is None:
+            subprocess.run(['gh','api',f'repos/{repo}/git/refs','-f','ref=refs/tags/'+tag,'-f','sha='+sha],check=True,stdout=subprocess.DEVNULL)
+          assert tag_commit()==sha, 'Tag creation or verification failed'
+          args=['gh','release','create',tag,'--repo',repo,'--target',sha,'--prerelease','--latest=false','--draft','--title',tag+' · macOS first-run preview','--notes-file',str(root/'RELEASE-NOTES.zh-CN.md')]
+          args.append('--verify-tag')
+          subprocess.run(args+[str(root/n) for n in sorted(expected)],check=True)
+          assert tag_commit()==sha, 'Published tag must remain pinned to tested commit'
+          release=release_for_tag();assert release is not None
+          assert release['draft'] and release['prerelease'] and {a['name'] for a in release['assets']}==expected
+          for asset in release['assets']:
+            p=root/asset['name'];assert asset['size']==p.stat().st_size
+            assert asset.get('digest')=='sha256:'+hashlib.sha256(p.read_bytes()).hexdigest(), 'Asset digest mismatch'
+          subprocess.run(['gh','release','edit',tag,'--repo',repo,'--draft=false','--prerelease','--latest=false'],check=True)
+          final=api('releases/'+str(release['id']));assert final['prerelease'] and not final['draft'] and tag_commit()==sha
+          print(final['html_url'])
+          PY
