@@ -19,15 +19,20 @@ async function start(){
   const store=new Store(home()),slack=new SlackClient(botToken),backend=new SharedAppServer(config.backend),connector=new Connector(config,store,backend,slack),server=apiServer(connector,token);
   const socket=new SocketModeClient({appToken,logLevel:LogLevel.ERROR});let stopping=false;let stopTask:Promise<void>|undefined;let timer:NodeJS.Timeout|undefined;let tick=Promise.resolve();
   const stop=()=>stopTask??=(async()=>{stopping=true;if(timer)clearInterval(timer);await socket.disconnect().catch(()=>{});await new Promise<void>(r=>server.close(()=>r()));await tick;await connector.close();store.close();})();
-  const onSignal=()=>{void stop().catch(()=>{console.error('Shutdown uncertain; inspect proxy and lock before restart.');process.exitCode=1;});};process.once('SIGINT',onSignal);process.once('SIGTERM',onSignal);
+  const onSignal=()=>{void stop().then(()=>{if(process.env.CONNECTOR_DESKTOP_CHILD==='1'&&process.connected)process.disconnect?.();}).catch(()=>{console.error('Shutdown uncertain; inspect proxy and lock before restart.');process.exitCode=1;});};process.on('SIGINT',onSignal);process.on('SIGTERM',onSignal);
+  if(process.env.CONNECTOR_DESKTOP_CHILD==='1'&&process.send){
+    process.on('message',m=>{if(m&&typeof m==='object'&&'type' in m&&m.type==='connector:stop'){if(process.connected)process.send?.({type:'connector:stopping'});void stop().then(()=>{if(process.connected)process.disconnect?.();}).catch(onSignal);}});
+    process.once('disconnect',onSignal);
+  }
   socket.on('message',async({body,ack}:any)=>{try{connector.accept(body);await ack();connector.pump();connector.flush();}catch{console.error('Event was not durably accepted; no acknowledgement. Check storage/queue.');}});
   socket.on('error',()=>console.error('Slack connection error; reconnect remains active.'));
   try{
     const auth=await slack.web.auth.test();if(stopping)return;if(auth.team_id!==config.slack.teamId)throw Error('WORKSPACE_MISMATCH');connector.selfUserId=auth.user_id||'';connector.selfBotId=auth.bot_id||'';
     await connector.initialize();if(stopping)return;await new Promise<void>((r,j)=>{server.once('error',j);server.listen(config.port,'127.0.0.1',r);});if(stopping)return;await socket.start();if(stopping){await socket.disconnect().catch(()=>{});return;}
     timer=setInterval(()=>{tick=tick.then(async()=>{if(!backend.connected)await connector.reconnect();await connector.expire();connector.pump();connector.flush();}).catch(()=>console.error('Connector background operation unavailable; inspect status.'));},5000);
+    process.send?.({type:'connector:ready'});
     console.log(`Connector ${config.instanceId} online at127.0.0.1:${config.port}; shared backend connected=${backend.connected}. Use status for capability failures.`);
-  }catch{await stop();throw Error('Startup failed; check config, identities, tokens, port and network. Raw credentials/errors withheld.');}
+  }catch(e){await stop();const error=Error('Startup failed; check config, identities, tokens, port and network. Raw credentials/errors withheld.');const cause=e as any;Object.assign(error,{code:cause?.code==='EADDRINUSE'?'LOCAL_PORT_IN_USE':cause?.message==='WORKSPACE_MISMATCH'?'WORKSPACE_MISMATCH':cause?.data?.error==='invalid_auth'||cause?.data?.error==='token_revoked'?'SLACK_AUTH_FAILED':'SERVER_START_FAILED'});throw error;}
 }
 async function main(){
   const [cmd='help',...args]=process.argv.slice(2),f=options(args);if(f.home)process.env.CONNECTOR_HOME=resolve(f.home);
@@ -52,4 +57,4 @@ async function main(){
   }else throw Error('Unknown CLI command; use help');
   console.log(JSON.stringify(await commandRequest(config.port,readToken(),payload),null,2));
 }
-main().catch(e=>{console.error(e instanceof Error?e.message:'Connector failure');process.exitCode=1;});
+main().catch(e=>{console.error(e instanceof Error?e.message:'Connector failure');process.exitCode=1;if(process.env.CONNECTOR_DESKTOP_CHILD==='1'&&process.connected){const c=(e as any)?.code;const code=c==='EEXIST'?'LOCK_EXISTS':c==='ENOENT'?'CONFIGURATION_INVALID':['LOCAL_PORT_IN_USE','WORKSPACE_MISMATCH','SLACK_AUTH_FAILED'].includes(c)?c:'SERVER_START_FAILED';process.send?.({type:'connector:failure',code},()=>{if(process.connected)process.disconnect?.();});}});

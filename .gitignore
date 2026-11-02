@@ -17,3 +17,7 @@ service.env
 daemon.env
 daemon.lock
 *.pid
+
+desktop-dist/
+*.tsbuildinfo
+desktop-preview/

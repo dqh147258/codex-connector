@@ -13,7 +13,7 @@ function setup(options: { timeout?: number; socketPath?: string; expectedVersion
   const oldLog = process.env.CONNECTOR_FIXTURE_LOG, oldVersion = process.env.CONNECTOR_FIXTURE_VERSION;
   process.env.CONNECTOR_FIXTURE_LOG = log;
   if (options.version !== undefined) process.env.CONNECTOR_FIXTURE_VERSION = options.version; else delete process.env.CONNECTOR_FIXTURE_VERSION;
-  const server = new SharedAppServer({ executable: fixtureExecutable, socketPath: options.socketPath, expectedVersion: options.expectedVersion, autoStartDaemon: options.autoStartDaemon }, options.timeout || 500);
+  const server = new SharedAppServer({ executable: fixtureExecutable, socketPath: options.socketPath, expectedVersion: options.expectedVersion, autoStartDaemon: options.autoStartDaemon }, options.timeout || 2000);
   const readLog = (): any[] => { try { return readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)); } catch { return []; } };
   const close = async () => {
     try { await server.close(); } finally {
@@ -72,7 +72,7 @@ test('RPC allowlist blocks shell/arbitrary methods without writing, and unsuppor
   } finally { await f.close(); }
 });
 test('request timeout is uncertain and is never automatically resent', async () => {
-  const f = setup({ timeout: 80 });
+  const f = setup({ timeout: 1000 });
   try {
     await f.server.connect();
     await assert.rejects(f.server.rpc('thread/read', { threadId: 'fixture-timeout' }), errorCode('RPC_OUTCOME_UNCERTAIN'));

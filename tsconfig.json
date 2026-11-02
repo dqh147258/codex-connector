@@ -1,1 +1,18 @@
-{"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","strict":true,"outDir":"dist","rootDir":".","esModuleInterop":true,"skipLibCheck":true,"noUncheckedIndexedAccess":true},"include":["src/**/*.ts","test/**/*.ts"]}
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noUncheckedIndexedAccess": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "desktop/**/*.ts"
+  ]
+}
