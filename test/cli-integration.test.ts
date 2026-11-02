@@ -16,7 +16,7 @@ test('real CLI↔authenticated API command+status, ambient proxy bypass, no remo
   const env:NodeJS.ProcessEnv={...process.env,CONNECTOR_HOME:f.dir,NODE_USE_ENV_PROXY:'1',HTTP_PROXY:`http://127.0.0.1:${pa.port}`,HTTPS_PROXY:`http://127.0.0.1:${pa.port}`,http_proxy:`http://127.0.0.1:${pa.port}`,NO_PROXY:'',no_proxy:''};delete env.CONNECTOR_TOKEN;
   const cli=async(...args:string[])=>JSON.parse((await exec(process.execPath,[resolve('dist/src/cli.js'),...args],{env})).stdout).result;
   try{
-    const sent=await cli('command','--name','session.create','--params','{"project":"repo"}');await waitFor(()=>f.store.state.work.find(w=>w.id===sent.id)?.status==='completed');
+    const sent=await cli('command','--name','session.create','--params','{"project":"repo","outputThreadTs":"100.1"}');await waitFor(()=>f.store.state.work.find(w=>w.id===sent.id)?.status==='completed');
     const status=await cli('status');assert.equal(status.sessions.length,1);assert.equal(proxyHits,0);
     const url=`http://127.0.0.1:${address.port}/v1/command`,headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'};
     assert.equal((await fetch(url,{method:'POST'})).status,401);

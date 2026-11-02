@@ -6,7 +6,8 @@ export class SlackClient implements SlackPort {
   readonly web:WebClient;
   constructor(token:string){this.web=new WebClient(token,{logLevel:LogLevel.ERROR,retryConfig:{retries:0},rejectRateLimitedCalls:true});}
   async post(channel:string,text:string,opts:{threadTs?:string;mentionUserId:string;deliveryId:string}){
-    const r=await this.web.chat.postMessage({channel,text:`<@${opts.mentionUserId}> ${escapeSlack(text)}`,thread_ts:opts.threadTs,mrkdwn:true,parse:'none',link_names:false,unfurl_links:false,unfurl_media:false});
+    if(!opts.threadTs||!/^\d{1,20}\.\d{1,10}$/.test(opts.threadTs))throw Error('THREAD_DESTINATION_REQUIRED');
+    const r=await this.web.chat.postMessage({channel,text:`<@${opts.mentionUserId}> ${escapeSlack(text)}`,thread_ts:opts.threadTs,reply_broadcast:false,mrkdwn:true,parse:'none',link_names:false,unfurl_links:false,unfurl_media:false});
     if(!r.ts)throw Error('SLACK_OUTCOME_UNCERTAIN');return r.ts;
   }
   async resolveDot(name:string,userId?:string){
@@ -15,6 +16,7 @@ export class SlackClient implements SlackPort {
     do{const r=await this.web.users.list({limit:200,cursor});for(const u of r.members||[])if(!u.deleted&&u.id&&[u.name,u.profile?.display_name,u.profile?.real_name].includes(name))matches.push({userId:u.id,name});cursor=r.response_metadata?.next_cursor||undefined;}while(cursor);
     if(matches.length!==1)throw Error('DOT_NAME_AMBIGUOUS_OR_MISSING: configure a verified userId');return matches[0]!;
   }
+  async threadExists(channel:string,threadTs:string){const r=await this.web.conversations.replies({channel,ts:threadTs,limit:1});return r.messages?.some(m=>m.ts===threadTs&&(!m.thread_ts||m.thread_ts===threadTs))===true;}
   async humanMessage(channel:string,threadTs:string,ts:string){
     const r=await this.web.conversations.replies({channel,ts:threadTs,oldest:ts,latest:ts,inclusive:true,limit:10});
     return r.messages?.find(m=>m.ts===ts);

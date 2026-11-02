@@ -11,7 +11,7 @@ export interface Config {
 export interface Source { kind: 'human' | 'bot' | 'local'; userId: string; channel: string; ts: string; threadTs: string; eventId: string }
 export interface Session { id: string; threadId: string; project: string; cwd?: string; channel: string; threadTs?: string; createdAt: string }
 export interface Work { id: string; eventId: string; request: CommandEnvelope; source: Source; status: 'queued'|'executing'|'completed'|'failed'|'uncertain'; createdAt: string; error?: string; resultRef?: {sessionId?:string;threadId?:string;turnId?:string} }
-export interface Delivery { id: string; sessionId?: string; channel: string; threadTs?: string; root: boolean; text: string; status: 'queued'|'sending'|'sent'|'uncertain'|'failed'; attempts: number; nextAttemptAt: number; ts?: string; error?: string }
+export interface Delivery { id: string; origin?: Source; sessionId?: string; channel: string; threadTs?: string; root: boolean; text: string; status: 'queued'|'sending'|'sent'|'uncertain'|'failed'; attempts: number; nextAttemptAt: number; ts?: string; error?: string }
 export interface Pending {
   id: string; rpcId: string|number; epoch: string; sessionId: string; threadId: string; turnId: string;
   method: string; kind: 'command'|'file'|'input'|'unsupported'; status: 'pending'|'responding'|'resolved'|'stale'|'expired'|'local-required';
@@ -27,5 +27,6 @@ export interface Backend {
 export interface SlackPort {
   post(channel: string, text: string, options: { threadTs?: string; mentionUserId: string; deliveryId: string }): Promise<string>;
   resolveDot(name: string, userId?: string): Promise<{userId: string; name: string}>;
+  threadExists(channel: string, threadTs: string): Promise<boolean>;
   humanMessage(channel: string, threadTs: string, ts: string): Promise<any>;
 }

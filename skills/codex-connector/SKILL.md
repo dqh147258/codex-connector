@@ -11,7 +11,7 @@ Use the installed local CLI, not Slack tokens, raw RPC, shell bridges, or sessio
 
 Use the known connector `sessionId`, or the exact shared Codex `threadId` supplied by the user/hosting runtime. Never guess a current-session environment variable, choose the latest session, or inspect Codex rollout/session files. If no reliable ID is available, ask which explicit session to bind. `session.attach` rejoins the supported shared daemon; it does not seize an unrelated standalone TUI.
 
-A connector handle maps to one configured output-channel thread. Do not override channel/mention targets. Obtain the configured project alias from the owner if unknown.
+A connector handle maps to one fixed Slack channel/thread. Slack-origin create/attach binds the calling thread; local/Skill first binding uses an already-existing thread in the configured output channel. No command may create a channel-top post. Do not override channel/mention targets. Obtain the configured project alias from the owner if unknown.
 
 ## CLI
 
@@ -23,9 +23,9 @@ codex-connector command --name session.attach --params-file bind.json
 codex-connector status
 ```
 
-`bind.json` contains `{"threadId":"EXPLICIT_THREAD_ID","project":"PROJECT_ALIAS"}`. The command returns an internal work `id`, not immediate execution success. Read `status`, locate that exact work ID, and wait only while it is queued/executing. On completion, its `resultRef.sessionId` identifies the binding. Do not choose the most recently created session. Stop on failed/uncertain status and report the error; never retry uncertain side effects automatically.
+`bind.json` contains `{"threadId":"EXPLICIT_THREAD_ID","project":"PROJECT_ALIAS","outputThreadTs":"EXISTING_SLACK_ROOT_TIMESTAMP"}`. The command returns an internal work `id`, not immediate execution success. Read `status`, locate that exact work ID, and wait only while it is queued/executing. On completion, its `resultRef.sessionId` identifies the binding. Do not choose the most recently created session. Stop on failed/uncertain status and report the error; never retry uncertain side effects automatically.
 
-To create a separate shared session, use `session.create` with `{"project":"PROJECT_ALIAS","title":"Purpose"}` and correlate the work/resultRef in the same way. This does not change the identity of the current conversation.
+To create a separate shared session, use `session.create` with `{"project":"PROJECT_ALIAS","title":"Purpose","outputThreadTs":"EXISTING_SLACK_ROOT_TIMESTAMP"}` and correlate the work/resultRef in the same way. This does not change the identity of the current conversation.
 
 Send explicit progress/replies:
 
@@ -48,3 +48,5 @@ If direct loopback HTTP is blocked by this Codex runtime, report the exact const
 ## Uncertainty
 
 Default shared-session takeover is version/capability dependent. Inspect `capabilities` and report unsupported or disconnected state; never claim an independent replacement session is the user's existing one. `recover` and startup/service configuration are operator actions, not routine Skill steps. Do not invoke them automatically.
+
+For first local/Skill binding, ask the owner for an existing Slack thread root timestamp; `outputThreadTs` is verified readable in the configured output channel before a new Codex session is created. Missing/unreadable roots fail with `THREAD_DESTINATION_REQUIRED` / `THREAD_DESTINATION_UNVERIFIED`. Existing bindings are never moved by this parameter. Bound `session.reply` remains supported. Local commands without a binding/origin do not emit Slack messages. Never invent a thread timestamp or use a channel ID as one.

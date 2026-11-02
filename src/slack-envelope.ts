@@ -7,9 +7,10 @@ const keysOnly = (v: Record<string, unknown>, keys: string[]) => Object.keys(v).
  * Ordinary legacy rich_text remains display-only. An explicit plain_text section
  * must agree with the entire fallback, even when that fallback is already valid.
  */
-export function parseSlackEnvelope(text: string, blocks: unknown, target: string, trustedBot: boolean): CommandEnvelope {
+export function parseSlackEnvelope(text: string, blocks: unknown, target: string, trustedBot: boolean, address?: string): CommandEnvelope {
+  const stripAddress=(value:string)=>{if(!address)return value;if(value.startsWith(address+'\n')||value.startsWith(address+' '))return value.slice(address.length+1);throw new ProtocolError('invalid_envelope','Use only the exact leading connector address.');};
   const candidate = trustedBot && Array.isArray(blocks) && blocks.some(b => object(b) && b.type === 'section' && object(b.text) && b.text.type === 'plain_text');
-  if (!candidate) return parseEnvelope(text, target);
+  if (!candidate) return parseEnvelope(stripAddress(text), target);
   const invalid = () => new ProtocolError('invalid_envelope', 'Structured command and fallback must agree exactly.');
   if (!Array.isArray(blocks) || blocks.length !== 1) throw invalid();
   const block: unknown = blocks[0];
@@ -21,5 +22,5 @@ export function parseSlackEnvelope(text: string, blocks: unknown, target: string
   // Only exact original text or CRLF/LF-to-one-space transport transformation.
   // No trim, HTML decoding, arbitrary whitespace collapse, or command extraction.
   if (content.text.length > 3000 || (text !== content.text && text !== content.text.replace(/\r\n/g, '\n').replace(/\n/g, ' '))) throw invalid();
-  return parseEnvelope(content.text, target);
+  return parseEnvelope(stripAddress(content.text), target);
 }

@@ -43,3 +43,11 @@ Discovery exposes all shared-visible metadata with manageability reasons. Sessio
 ## Tests versus evidence
 
 The automated suite uses fake transports and a pure Node executable fixture. The compiled CLI is tested across real authenticated loopback HTTP with an ambient-proxy trap. Windows/macOS parameter/template tests on Linux are not native execution evidence. See `RUNTIME-VERIFICATION.md` for actual CLI probes and unresolved runtime gates.
+
+## Reply destination and explicit address
+
+Every accepted Slack command response (including parser errors and ID conflicts) is durably routed to the event's own channel and `thread_ts`, or `ts` when the command itself is top-level. It never posts a channel-top fallback. New Slack session bindings use that origin thread. A command about an existing session returns to its caller while later session messages, approvals and input requests remain on the unchanged binding; the acknowledgement identifies that authorized bound destination.
+
+The sole optional transport address is one leading exact `<@CONNECTOR_SELF_USER_ID>` followed by one space or newline, with no other prefix. The identity comes from Slack auth.test, not command JSON. When an explicit plain_text block is present, the full raw fallback/block agreement is checked before removing the same exact address. After that address the entire unchanged strict envelope is required; prose gets same-thread usage guidance. Other mentions, repeated mentions and code fences do not execute. Fetched human approval evidence still requires the original strict envelope; no mention/block normalization is applied to it.
+
+Local/Skill `session.create` or a first `session.attach` requires `outputThreadTs` for an existing, readable root in configured `outputChannel`. This is checked before creating a Codex session; Slack-origin commands cannot override their destination with this parameter. Existing session bindings and bound Skill replies continue to work. Missing/unverified destinations fail closed; unbound local command output is not posted to Slack. On restart, persisted origins are retained. Old pending top-level or destinationless deliveries are marked failed, not silently rerouted. Channel revocation prevents delivery rather than choosing another channel.
