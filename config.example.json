@@ -1,9 +1,39 @@
 {
-  "teamId": "T_REPLACE",
-  "allowedUsers": ["U_REPLACE"],
-  "allowedChannels": ["C_REPLACE"],
-  "projects": { "demo": "/absolute/path/to/your/project" },
+  "version": 2,
+  "instanceId": "my-computer",
   "port": 17381,
-  "codexExecutable": "/absolute/path/to/codex",
-  "sandbox": "read-only"
+  "slack": {
+    "teamId": "T_REPLACE",
+    "inputChannel": "C_COMMANDS",
+    "outputChannel": "C_REPLIES",
+    "allowedHumans": [
+      "U_CARL"
+    ],
+    "approvalUsers": [
+      "U_CARL"
+    ],
+    "trustedBots": [
+      {
+        "botId": "B_DOT",
+        "userId": "U_DOT",
+        "appId": "A_DOT"
+      }
+    ],
+    "dot": {
+      "name": "your-dot-name",
+      "userId": "U_DOT"
+    }
+  },
+  "projects": {
+    "demo": "/absolute/path/to/project"
+  },
+  "backend": {
+    "executable": "/absolute/path/to/codex",
+    "expectedVersion": "0.166.0-alpha.1",
+    "autoStartDaemon": false
+  },
+  "approvalTimeoutSec": 300,
+  "sessionPolicy": {
+    "allowAllSharedSessions": false
+  }
 }

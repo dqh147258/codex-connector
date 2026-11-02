@@ -1,45 +1,43 @@
-# Protocol and verification notes
+# Protocol contract
 
-Research snapshot: 2026-11-01. This connector uses official app-server JSON messages, not TUI scraping or undocumented rollout files. App-server remains experimental and target CLI versions can differ; validate the locally installed version before production use.
+## Slack command transport
 
-## App-server subset
+Every command occupies the complete raw message text:
 
-- Spawn the configured executable with `app-server` over stdin/stdout (newline-delimited JSON messages; no `jsonrpc` field).
-- `initialize` with `clientInfo`, then `initialized`.
-- `thread/start` captures **`result.thread.id`**. Do not substitute `thread.sessionId`, which can identify the root of a fork tree.
-- Restart recovery resumes only an explicitly stored connector-owned thread ID with `thread/resume` and `excludeTurns: true`. No session directory inspection or “latest thread” lookup.
-- `turn/start` supplies typed text input; no shell invocation. FIFO begins another turn only after a terminal result and successful durable bookkeeping.
-- `item/completed` of type `agentMessage` is collected only for absent/final_answer phase. Reasoning, tool output, commentary and raw logs are not automatically shared.
-- `turn/completed` resolves/rejects the matching active thread/turn. Failed turns pause the queue. There is no automatic replay on disconnect or timeout.
-- Command/file approval requests receive `result: {decision: "decline"}`; other server-initiated interactive requests receive a protocol error and stop the affected turn. The owned app-server process is terminated on turn failure, preventing unconfirmed interruption from overlapping resumed work.
-- Legacy read-only/workspace-write mode sets sandbox policy explicitly. Explicit inherit mode sends **neither** legacy sandbox field and never changes approval policy. It does not claim named-profile discovery/selection support.
+```
+CODEX_CONNECTOR_COMMAND_BEGIN
+{"v":1,"id":"request-0001","target":"my-computer","command":"help","params":{}}
+CODEX_CONNECTOR_COMMAND_END
+```
 
-## Skill route
+The markers are ASCII words (no Slack angle-bracket escaping). Schema source: `src/protocol.ts`. It defines bounded parameters, applied defaults, examples, errors and permissions for generated help. Unknown keys, duplicate JSON keys, claimed actors, prototype keys, extra text, marker injection, unsupported version and wrong target are rejected. Transport identity comes only from Slack event metadata, not JSON.
 
-The shipped `skills/codex-connector/SKILL.md` instructs Codex to execute local CLI commands. CLI requests POST JSON to an authenticated loopback API. APIs operate only on preconfigured projects/channels and stored handles. Existing interactive sessions use explicit mailbox read/ack rather than forced injection.
+Events persist before acknowledgement. Command IDs are scoped to an authenticated principal; repeated exact requests execute once, conflicting reuse does not execute. The internal operation ID is separate and used as the backend clientUserMessageId. A bot cannot consume an unrelated human's approval-template ID.
 
-The integration suite executes the actual compiled CLI as a subprocess, crosses HTTP auth/JSON dispatch, creates a mapped fake Slack thread, sends UTF-8 text, reads an accepted fake Slack reply and acknowledges it. It proves the local route independent of real Codex. It **does not** prove that every Codex OS sandbox grants loopback access. No security policy is weakened to make the test pass.
+## Shared app-server
 
-## Verification performed
+The connector checks the configured CLI version, then uses `app-server proxy` with an optional explicitly configured socket. A local-only, default-off autoStartDaemon option may first call fixed `app-server daemon start` once with a15-second timeout; it is incompatible with an explicit socket. It never issues daemon stop/update or changes Codex updater policy. Official start may provision packages/manage the updater according to existing Codex settings. There is no fallback `app-server` process. StdIO messages use the generated protocol's newline-delimited objects, not shell text. Initialize opts into experimental APIs; model, reasoning, sandbox, approval policy and permission profiles are not overridden.
 
-- TypeScript strict typecheck/build.
-- Unit/integration tests with fake Slack and a pure Node mock of the app-server protocol.
-- Default-deny allowlists, bot/edit suppression, duplicate events, crash-window recovery, per-session serialization, revocation, HTTP auth/origin/Host checks, mailbox semantics, paused recovery, lock safety, storage-error rollback, shutdown waiting, literal-text CLI transport and policy-override omission.
-- Fake protocol: initialize/start/resume, final-only routing, inherited approval policy, approval/input fail-closed, subprocess failure/exit and secret environment stripping.
-- Windows launcher argument construction and shell-shim refusal tested on Linux, **not** native Windows process-tree/sandbox execution.
-- Independent review additionally exercised a real 30-second request timeout using a fake Node server (not Codex).
+Only these method families are reachable through typed command handlers: thread list/loaded/read/start/resume/items/turns; turn start/steer/interrupt; queue add/start. There is no caller-supplied RPC method. Discovered unsupported methods are negatively cached for the current connection; a fresh epoch may probe again. Session summaries omit rollout paths and raw tool content.
 
-Not performed: real Slack OAuth/socket/post round trip; real Codex invocation/auth/model turn; real Windows/macOS end-to-end; effective user permission-profile/proxy verification. No CI was created or triggered.
+`thread/resume` receives a captured explicit thread ID and `excludeTurns:true`. It rejoins shared sessions where supported. `canAcceptDirectInput !== true` fails closed. `steer` uses `expectedTurnId`, interrupt uses exact turn ID. `send` uses queue/add plus queue/start rather than turn/start, so an active shared turn is not implicitly steered by a check/start race. A rejected start leaves the accepted queue entry in place and reports that fact; no duplicate enqueue or fallback turn/start occurs. This depends on the supported queue API, with real-runtime acceptance still pending.
 
-## Official references
+Each proxy connection has a unique epoch. Handlers capture both child identity and epoch so delayed events from an old child cannot impersonate a new connection. Malformed/ambiguous responses become uncertainty, never success. Closing the connector only closes its proxy; shared daemon lifetime remains the owner's responsibility.
 
-- [Codex App Server](https://learn.chatgpt.com/docs/app-server)
-- [Codex CLI reference](https://learn.chatgpt.com/docs/cli/reference)
-- [Codex permissions](https://learn.chatgpt.com/docs/permissions)
-- [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
-- [Slack Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/)
-- [Slack Node SDK](https://docs.slack.dev/tools/node-slack-sdk/)
-- [Slack chat.postMessage](https://docs.slack.dev/reference/methods/chat.postMessage/)
-- [Slack rate limits](https://docs.slack.dev/apis/web-api/rate-limits/)
+## Requests and authority
 
-These are design references, not a claim of live end-to-end certification.
+Pending command/file approvals and nonsecret user questions receive fresh connector request IDs. All replies bind connector ID, epoch, session, turn and the original JSON-RPC callback. Only one reply can transition pending→responding. Server resolution notifications complete it. Disconnect/restart invalidates old callbacks.
+
+Remote approvals require fully displayed bounded scope. Secret/oversized/missing command or diff, unknown requests, stdin-specific approval, grantRoot expansion and secret input remain local-required. No session/global decisions or policy amendments are offered. Timeout declines command/file requests or interrupts the exact user-input turn; unknown unsupported requests are not answered by guessed schemas.
+
+A configured human may answer directly in the bound output thread. A dot may reference the actual human message using `humanMessageTs`; the connector fetches and validates the same-thread unedited human message and exact decision envelope. A quoted statement, actor field, inaccessible DM, or missing permission is not proof. Local owner-token clients cannot submit approval/input decisions.
+
+## Durable delivery
+
+Work inbox and Slack outbox are independent. Backend execution completion and response enqueue commit together. A Slack failure never retries the backend action. Each session's outbox preserves order even across rate backoff or uncertain deliveries; unrelated sessions can progress. Transient known rate limits may retry; network/unknown outcomes require local operator recovery. Exactly-once Slack delivery is not claimed.
+
+Discovery exposes all shared-visible metadata with manageability reasons. Session control defaults to configured project roots/subdirectories; a local-only allowAllSharedSessions opt-in can authorize other shared sessions without expanding readonly file roots. Only explicitly bound policy-authorized sessions produce automatic final-answer messages. Tool output/reasoning are excluded, known credential patterns withheld, long responses chunked and paced. Invalid/unbound/revoked mapping errors use the safe configured global destination rather than an old thread timestamp.
+
+## Tests versus evidence
+
+The automated suite uses fake transports and a pure Node executable fixture. The compiled CLI is tested across real authenticated loopback HTTP with an ambient-proxy trap. Windows/macOS parameter/template tests on Linux are not native execution evidence. See `RUNTIME-VERIFICATION.md` for actual CLI probes and unresolved runtime gates.

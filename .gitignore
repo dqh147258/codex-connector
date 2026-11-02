@@ -10,3 +10,10 @@ state.json
 state.json.*
 config.local.json
 *.token
+
+# Private daemon/service configuration (templates are separate)
+config.json
+service.env
+daemon.env
+daemon.lock
+*.pid

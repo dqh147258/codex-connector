@@ -1,79 +1,55 @@
 #!/usr/bin/env node
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { join, resolve } from 'node:path';
 import { SocketModeClient, LogLevel } from '@slack/socket-mode';
 import { home, loadConfig, readToken } from './config.js';
 import { Store } from './store.js';
 import { SlackClient } from './slack.js';
-import { AppServer } from './codex.js';
+import { SharedAppServer } from './codex.js';
 import { Connector } from './connector.js';
 import { apiServer } from './server.js';
 import { commandRequest } from './client.js';
-function flags(args: string[]) {
-  const out: Record<string, string> = {};
-  for (let i = 0; i < args.length; i += 2) {
-    const key = args[i], value = args[i + 1];
-    if (!key?.startsWith('--') || value === undefined) throw Error('Use --option value pairs');
-    out[key.slice(2)] = value;
-  }
-  return out;
+import { formatHelp, START_MARKER, END_MARKER, validateCommand } from './protocol.js';
+import { generateService } from './services.js';
+function options(args:string[]){const out:Record<string,string>={};for(let i=0;i<args.length;i+=2){const k=args[i],v=args[i+1];if(!k?.startsWith('--')||v===undefined)throw Error('Use --option value');out[k.slice(2)]=v;}return out;}
+async function start(){
+  const config=loadConfig(),token=readToken(),appToken=process.env.SLACK_APP_TOKEN,botToken=process.env.SLACK_BOT_TOKEN;
+  if(!appToken?.startsWith('xapp-')||!botToken?.startsWith('xoxb-'))throw Error('Slack app/bot tokens required only in daemon environment');
+  const store=new Store(home()),slack=new SlackClient(botToken),backend=new SharedAppServer(config.backend),connector=new Connector(config,store,backend,slack),server=apiServer(connector,token);
+  const socket=new SocketModeClient({appToken,logLevel:LogLevel.ERROR});let stopping=false;let stopTask:Promise<void>|undefined;let timer:NodeJS.Timeout|undefined;let tick=Promise.resolve();
+  const stop=()=>stopTask??=(async()=>{stopping=true;if(timer)clearInterval(timer);await socket.disconnect().catch(()=>{});await new Promise<void>(r=>server.close(()=>r()));await tick;await connector.close();store.close();})();
+  const onSignal=()=>{void stop().catch(()=>{console.error('Shutdown uncertain; inspect proxy and lock before restart.');process.exitCode=1;});};process.once('SIGINT',onSignal);process.once('SIGTERM',onSignal);
+  socket.on('message',async({body,ack}:any)=>{try{connector.accept(body);await ack();connector.pump();connector.flush();}catch{console.error('Event was not durably accepted; no acknowledgement. Check storage/queue.');}});
+  socket.on('error',()=>console.error('Slack connection error; reconnect remains active.'));
+  try{
+    const auth=await slack.web.auth.test();if(stopping)return;if(auth.team_id!==config.slack.teamId)throw Error('WORKSPACE_MISMATCH');connector.selfUserId=auth.user_id||'';connector.selfBotId=auth.bot_id||'';
+    await connector.initialize();if(stopping)return;await new Promise<void>((r,j)=>{server.once('error',j);server.listen(config.port,'127.0.0.1',r);});if(stopping)return;await socket.start();if(stopping){await socket.disconnect().catch(()=>{});return;}
+    timer=setInterval(()=>{tick=tick.then(async()=>{if(!backend.connected)await connector.reconnect();await connector.expire();connector.pump();connector.flush();}).catch(()=>console.error('Connector background operation unavailable; inspect status.'));},5000);
+    console.log(`Connector ${config.instanceId} online at127.0.0.1:${config.port}; shared backend connected=${backend.connected}. Use status for capability failures.`);
+  }catch{await stop();throw Error('Startup failed; check config, identities, tokens, port and network. Raw credentials/errors withheld.');}
 }
-const help = `codex-connector (Node 22+)\n  init\n  doctor\n  start                    Foreground daemon; Slack tokens in environment\n  create --project NAME --channel C123 [--session ID] [--mode mailbox|managed] [--title TEXT]\n  bind --project NAME --channel C123 --thread 123.456 --session ID\n  send --session ID --text TEXT     Send to mapped Slack thread\n  ask --session ID --text TEXT      Queue a Codex turn (managed) or mailbox message\n  read --session ID                Read unacknowledged mailbox messages\n  ack --session ID --jobs ID,ID     Mark mailbox messages handled\n  status [--session ID]\n  resolve --session ID --job ID     AFTER manual inspection, unblock WITHOUT replay\nUse --text-file PATH (or - for stdin) instead of --text for multiline content.\nCONNECTOR_HOME selects the config/state directory. No Slack tokens are needed for client commands.`;
-async function start() {
-  const config = loadConfig(), token = readToken();
-  const appToken = process.env.SLACK_APP_TOKEN, botToken = process.env.SLACK_BOT_TOKEN;
-  if (!appToken?.startsWith('xapp-') || !botToken?.startsWith('xoxb-')) throw Error('Set SLACK_APP_TOKEN and SLACK_BOT_TOKEN in the daemon environment');
-  const store = new Store(home());
-  const slack = new SlackClient(botToken), codex = new AppServer(config), connector = new Connector(config, store, slack, codex);
-  const socket = new SocketModeClient({ appToken, logLevel: LogLevel.ERROR });
-  const server = apiServer(connector, token);
-  let stopping = false;
-  const stop = async () => {
-    if (stopping) return; stopping = true;
-    const httpClosed = new Promise<void>((resolve, reject) => server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve()));
-    await socket.disconnect().catch(() => {}); await httpClosed; await connector.close(); store.close();
-  };
-  process.once('SIGINT', () => { void stop().catch(() => { console.error('Shutdown incomplete; retain daemon.lock and inspect local processes before restarting.'); process.exitCode = 1; }); }); process.once('SIGTERM', () => { void stop().catch(() => { console.error('Shutdown incomplete; retain daemon.lock and inspect local processes before restarting.'); process.exitCode = 1; }); });
-  socket.on('message', async ({ body, ack }: any) => {
-    try {
-      const id = await connector.accept(body);
-      await ack();
-      if (id) connector.pump(id);
-    } catch {
-      // No ack on storage/queue failure: Slack can retry. Never log message or credential payloads.
-      process.stderr.write('Slack event could not be durably accepted; check disk/queue health.\n');
-    }
-  });
-  socket.on('error', () => process.stderr.write('Slack connection error; SDK reconnect is active.\n'));
-  try {
-    const auth = await slack.web.auth.test();
-    if (auth.team_id !== config.teamId) throw Error('Bot token workspace does not match configured teamId');
-    await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
-    await socket.start(); connector.resumeQueues();
-    process.stdout.write(`codex-connector listening on 127.0.0.1:${config.port}; Socket Mode connected.\n`);
-  } catch { await stop(); throw Error('Daemon startup failed. Check configuration, workspace IDs, Slack credentials, port availability, and network access.'); }
-}
-async function main() {
-  const [command = 'help', ...args] = process.argv.slice(2);
-  if (['help', '--help', '-h'].includes(command)) { console.log(help); return; }
-  if (command === 'init') {
-    const dir = home(); mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const configPath = join(dir, 'config.json'), tokenPath = join(dir, 'api.token');
-    if (!existsSync(configPath)) writeFileSync(configPath, JSON.stringify({ teamId: 'T_REPLACE', allowedUsers: ['U_REPLACE'], allowedChannels: ['C_REPLACE'], projects: { demo: '/absolute/path/to/project' }, port: 17381, codexExecutable: '/absolute/path/to/codex', sandbox: 'read-only' }, null, 2), { mode: 0o600, flag: 'wx' });
-    if (!existsSync(tokenPath)) writeFileSync(tokenPath, randomBytes(32).toString('hex'), { mode: 0o600, flag: 'wx' });
-    chmodSync(tokenPath, 0o600); console.log(`Initialized ${dir}. Edit config.json; no credentials were printed.`); return;
+async function main(){
+  const [cmd='help',...args]=process.argv.slice(2),f=options(args);if(f.home)process.env.CONNECTOR_HOME=resolve(f.home);
+  if(cmd==='help'||cmd==='--help'){console.log(`codex-connector0.2\ninit | doctor | start [--home PATH] | status | command --name NAME --params JSON [--id ID] | envelope --name NAME --params JSON\nrecover --kind command|outbox --id ID [--observed-ts SLACK_TS] (local operator only)\nservice-template --platform linux|macos|windows --mode login|prelogin --user USER --node ABS --script ABS --cwd ABS [--home ABS]\n\n${formatHelp(f.command)}`);return;}
+  if(cmd==='init'){
+    const dir=home();mkdirSync(dir,{recursive:true,mode:0o700});
+    const config={version:2,instanceId:'my-computer',port:17381,slack:{teamId:'T_REPLACE',inputChannel:'C_REPLACE',outputChannel:'C_REPLACE',allowedHumans:['U_REPLACE'],approvalUsers:['U_REPLACE'],trustedBots:[{botId:'B_REPLACE',userId:'U_DOT',appId:'A_REPLACE'}],dot:{name:'YOUR_DOT_NAME',userId:'U_DOT'}},projects:{demo:'/absolute/project'},sessionPolicy:{allowAllSharedSessions:false},backend:{executable:'/absolute/codex',expectedVersion:'0.166.0-alpha.1',autoStartDaemon:false},approvalTimeoutSec:300};
+    if(!existsSync(join(dir,'config.json')))writeFileSync(join(dir,'config.json'),JSON.stringify(config,null,2),{mode:0o600,flag:'wx'});
+    if(!existsSync(join(dir,'api.token')))writeFileSync(join(dir,'api.token'),randomBytes(32).toString('hex'),{mode:0o600,flag:'wx'});
+    console.log(`Initialized private templates in${dir}. Existing files preserved; no service/Codex was started.`);return;
   }
-  if (command === 'doctor') {
-    const c = loadConfig(); readToken();
-    if (!existsSync(c.codexExecutable)) throw Error('Configured Codex executable does not exist');
-    console.log('Local configuration, project paths, token, and Codex executable path are valid. No Codex or Slack request was made.'); return;
-  }
-  if (command === 'start') { await start(); return; }
-  const f = flags(args), config = loadConfig(), token = readToken();
-  const text = f['text-file'] !== undefined ? readFileSync(f['text-file'] === '-' ? 0 : f['text-file'], 'utf8') : f.text;
-  const payload = { command: command === 'bind' ? 'create' : command, id: f.session, session: f.session, project: f.project, channel: f.channel, threadTs: f.thread, mode: command === 'bind' ? 'mailbox' : f.mode, title: f.title, text, jobIds: f.jobs?.split(','), jobId: f.job };
-  const result = await commandRequest(config.port, token, payload);
-  console.log(JSON.stringify(result, null, 2));
+  if(cmd==='service-template'){console.log(JSON.stringify(generateService({platform:f.platform as any,mode:f.mode as any,user:f.user,nodeExecutable:f.node||process.execPath,scriptPath:f.script||resolve('dist/src/cli.js'),workingDirectory:f.cwd||process.cwd(),configHome:home()}),null,2));return;}
+  if(cmd==='doctor'){const c=loadConfig();readToken();if(!existsSync(c.backend.executable))throw Error('Configured executable missing');console.log('Local configuration valid. Codex was not launched; shared connectivity is checked only when you start the server.');return;}
+  if(cmd==='start'){await start();return;}
+  const config=loadConfig();let payload:any;
+  if(cmd==='status')payload={action:'status'};
+  else if(cmd==='recover')payload={action:'recover',kind:f.kind,id:f.id,observedTs:f['observed-ts']};
+  else if(cmd==='command'||cmd==='envelope'){
+    const params=JSON.parse(f['params-file']?readFileSync(f['params-file']==='-'?0:f['params-file'],'utf8'):f.params||'{}');validateCommand(f.name!,params);
+    const envelope={v:1,id:f.id||randomUUID(),target:config.instanceId,command:f.name,params};
+    if(cmd==='envelope'){console.log(`${START_MARKER}\n${JSON.stringify(envelope)}\n${END_MARKER}`);return;}payload={action:'command',envelope};
+  }else throw Error('Unknown CLI command; use help');
+  console.log(JSON.stringify(await commandRequest(config.port,readToken(),payload),null,2));
 }
-main().catch(error => { console.error(error instanceof Error ? error.message : 'Connector failed'); process.exitCode = 1; });
+main().catch(e=>{console.error(e instanceof Error?e.message:'Connector failure');process.exitCode=1;});
