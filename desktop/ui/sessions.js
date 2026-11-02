@@ -36,16 +36,12 @@
   }
   function merge(previous, incoming) {
     if (!previous) return incoming;
-    const result = { ...previous, ...incoming };
+    // Keep one coherent observation: indexed history must not replace any
+    // runtime metadata (including unknown/null capability) from a loaded row.
+    const result = previous.loaded === true && incoming.loaded !== true
+      ? { ...previous }
+      : { ...previous, ...incoming };
     result.discoverySources = [...new Set([...(Array.isArray(previous.discoverySources) ? previous.discoverySources : []), ...(Array.isArray(incoming.discoverySources) ? incoming.discoverySources : [])])];
-    // A later stored-only page must not replace explicit runtime information from
-    // an earlier loaded page. All labels remain observations from this refresh.
-    if (previous.loaded === true && incoming.loaded !== true) {
-      result.loaded = true; result.status = previous.status;
-      result.canAcceptDirectInput = previous.canAcceptDirectInput;
-    }
-    if (previous.binding && !incoming.binding) result.binding = previous.binding;
-    if (previous.connectorSessionId && !incoming.connectorSessionId) result.connectorSessionId = previous.connectorSessionId;
     return result;
   }
   function render() {
