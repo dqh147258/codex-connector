@@ -1,149 +1,31 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { Connector } from '../src/connector.js';
 import { Store } from '../src/store.js';
-import type { Config, CodexPort, SlackPort } from '../src/types.js';
-import { apiServer } from '../src/server.js';
-import { chunks } from '../src/slack.js';
-import { codexLaunch } from '../src/codex.js';
-function fixture() {
-  const dir = mkdtempSync(join(tmpdir(), 'connector-test-'));
-  const store = new Store(dir);
-  const config: Config = { teamId: 'T1', allowedUsers: ['U1'], allowedChannels: ['C1'], projects: { repo: dir }, port: 17381, codexExecutable: '/not-executed/codex', sandbox: 'read-only' };
-  const posts: any[] = [], calls: string[] = [];
-  const slack: SlackPort = { async post(channel, text, threadTs) { posts.push({ channel, text, threadTs }); return '100.001'; } };
-  const codex: CodexPort = { async start() { return 'owned-codex-thread'; }, async run(_id, _cwd, text) { calls.push(text); return `Reply: ${text}`; }, async close() {} };
-  const connector = new Connector(config, store, slack, codex);
-  return { dir, store, config, posts, calls, slack, codex, connector, cleanup: async () => { await connector.close(); store.close(); rmSync(dir, { recursive: true, force: true }); } };
-}
-const event = (overrides: any = {}) => ({ team_id: 'T1', event_id: 'E1', event: { type: 'message', channel: 'C1', user: 'U1', text: '!codex new repo hello', ts: '100.100', ...overrides } });
-async function settled(f: ReturnType<typeof fixture>) {
-  for (let i = 0; i < 100 && f.store.state.jobs.some(j => ['queued', 'running'].includes(j.status)); i++) await new Promise(r => setTimeout(r, 5));
-}
-test('Slack root creates one durable managed session, reply is in its thread, duplicates ignored', async () => {
-  const f = fixture(); try {
-    const id = await f.connector.accept(event()); assert.ok(id); assert.equal(f.calls.length, 0);
-    assert.equal(f.store.state.jobs[0]?.text, 'hello');
-    assert.equal(await f.connector.accept(event()), undefined);
-    f.connector.pump(id); await settled(f);
-    assert.equal(f.calls.length, 1); assert.equal(f.posts[0].threadTs, '100.100');
-    assert.equal(f.store.state.sessions[0]?.codexThreadId, 'owned-codex-thread');
-  } finally { await f.cleanup(); }
-});
-test('wrong team, user, channel, bot, edit and unrelated messages never execute', async () => {
-  const f = fixture(); try {
-    for (const e of [event({ user: 'U2' }), event({ channel: 'C2' }), event({ bot_id: 'B1' }), event({ subtype: 'message_changed' }), event({ text: 'hello' }), { ...event(), team_id: 'T2' }]) assert.equal(await f.connector.accept(e), undefined);
-    assert.equal(f.store.state.jobs.length, 0); assert.equal(f.posts.length, 0);
-  } finally { await f.cleanup(); }
-});
-test('root event retry after mapping-only crash is recoverable', async () => {
-  const f = fixture(); try {
-    await f.connector.create({ id: 'slack-E1', mode: 'managed', channel: 'C1', project: 'repo', threadTs: '100.100' });
-    assert.equal(await f.connector.accept(event()), 'slack-E1');
-    assert.equal(f.store.state.jobs.length, 1);
-  } finally { await f.cleanup(); }
-});
-test('mailbox Skill create/send/read/ack never launches Codex', async () => {
-  const f = fixture(); try {
-    await f.connector.create({ id: 'my-session', channel: 'C1', project: 'repo' });
-    await f.connector.accept(event({ thread_ts: '100.001', text: 'next task' }));
-    f.connector.pump('my-session');
-    const inbox = f.connector.read('my-session'); assert.equal(inbox.length, 1);
-    await f.connector.send('my-session', 'response'); f.connector.ack('my-session', inbox.map(j => j.id));
-    assert.equal(f.connector.read('my-session').length, 0); assert.equal(f.calls.length, 0);
-    assert.equal(f.posts.at(-1).threadTs, '100.001');
-  } finally { await f.cleanup(); }
-});
-test('managed FIFO does not run turns concurrently', async () => {
-  const f = fixture(); let current = 0, max = 0;
-  f.codex.run = async (_id, _cwd, text) => { current++; max = Math.max(max, current); await new Promise(r => setTimeout(r, 15)); f.calls.push(text); current--; return text; };
-  try {
-    await f.connector.create({ id: 's', mode: 'managed', channel: 'C1', project: 'repo', threadTs: '100.1' });
-    f.connector.enqueue('s', 'one'); f.connector.enqueue('s', 'two'); f.connector.pump('s'); f.connector.pump('s');
-    await settled(f); assert.equal(max, 1); assert.deepEqual(f.calls, ['one', 'two']);
-  } finally { await f.cleanup(); }
-});
-test('failed or uncertain turn pauses queue without replay, resolve does not replay', async () => {
-  const f = fixture(); f.codex.run = async () => { throw Error('sensitive downstream failure'); };
-  try {
-    await f.connector.create({ id: 's', mode: 'managed', channel: 'C1', project: 'repo', threadTs: '100.1' });
-    const first = f.connector.enqueue('s', 'one'); f.connector.enqueue('s', 'two'); f.connector.pump('s');
-    await new Promise(r => setTimeout(r, 30)); assert.equal(first.status, 'failed'); assert.equal(f.store.state.jobs[1]?.status, 'queued');
-    assert.ok(!JSON.stringify(f.connector.status()).includes('sensitive')); assert.ok(!JSON.stringify(f.posts).includes('sensitive'));
-    f.connector.resolve('s', first.id); assert.equal(first.status, 'done'); assert.equal(f.store.state.jobs[1]?.status, 'queued');
-  } finally { await f.cleanup(); }
-});
-test('revoked channel blocks send, enqueue, and persisted queue execution', async () => {
-  const f = fixture(); try {
-    await f.connector.create({ id: 's', mode: 'managed', channel: 'C1', project: 'repo', threadTs: '100.1' });
-    f.connector.enqueue('s', 'one'); f.config.allowedChannels = [];
-    await assert.rejects(f.connector.send('s', 'text')); assert.throws(() => f.connector.enqueue('s', 'two'));
-    f.connector.resumeQueues(); await new Promise(r => setTimeout(r, 10)); assert.equal(f.posts.length, 0); assert.equal(f.calls.length, 0);
-  } finally { await f.cleanup(); }
-});
-test('thread binding cannot be reused by another session', async () => {
-  const f = fixture(); try {
-    await f.connector.create({ id: 's', channel: 'C1', project: 'repo', threadTs: '100.1' });
-    await assert.rejects(f.connector.create({ id: 't', channel: 'C1', project: 'repo', threadTs: '100.1' }));
-  } finally { await f.cleanup(); }
-});
-test('state lock prevents two writers and restart marks running as uncertain', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'connector-state-'));
-  const first = new Store(dir); assert.throws(() => new Store(dir));
-  first.state.jobs.push({ id: 'j', sessionId: 's', user: 'U1', text: 'x', ts: '', status: 'running' }); first.save(); first.close();
-  const second = new Store(dir); assert.equal(second.state.jobs[0]?.status, 'uncertain'); second.close(); rmSync(dir, { recursive: true });
-});
-test('local API rejects missing auth/browser origin and accepts authenticated commands', async () => {
-  const f = fixture(), token = 'a'.repeat(64), server = apiServer(f.connector, token);
-  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
-  const address = server.address(); assert.ok(address && typeof address !== 'string');
-  const url = `http://127.0.0.1:${address.port}/v1/command`;
-  try {
-    assert.equal((await fetch(url, { method: 'POST' })).status, 401);
-    const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
-    assert.equal((await fetch(url, { method: 'POST', headers: { ...headers, Origin: 'https://evil.test' }, body: '{}' })).status, 401);
-    assert.equal((await fetch(url, { method: 'POST', headers, body: JSON.stringify({ command: 'status' }) })).status, 200);
-    assert.equal((await fetch(url, { method: 'POST', headers, body: JSON.stringify({ command: 'send', session: 'missing', text: 'x' }) })).status, 400);
-  } finally { await new Promise<void>((r, j) => server.close(e => e ? j(e) : r())); await f.cleanup(); }
-});
-test('outbound escaping prevents mentions and chunks preserve Unicode', () => {
-  assert.deepEqual(chunks('<@U1> & hello'), ['&lt;@U1&gt; &amp; hello']);
-  assert.deepEqual(chunks('😀😀😀', 2), ['😀😀', '😀']);
-});
-test('cross-platform launcher never invokes a shell shim', () => {
-  assert.deepEqual(codexLaunch('/usr/bin/codex'), { executable: '/usr/bin/codex', args: ['app-server'] });
-  assert.equal(codexLaunch('C:\\Users\\Name\\codex.js').executable, process.execPath);
-  assert.throws(() => codexLaunch('C:\\Users\\Name\\codex.cmd'));
-});
-test('storage failure rolls back dedupe and fails closed until repaired restart', async () => {
-  const f = fixture();
-  try {
-    await f.connector.create({ id: 'bound', mode: 'managed', channel: 'C1', project: 'repo', threadTs: '100.1' });
-    const reply = event({ thread_ts: '100.1', text: 'must remain durable before acknowledgement' });
-    // Force a real persistence error without depending on the test user's Unix permissions.
-    const { mkdirSync } = await import('node:fs'); mkdirSync(join(f.dir, 'state.json.tmp'));
-    await assert.rejects(f.connector.accept(reply));
-    assert.equal(f.store.state.seen.E1, undefined); assert.equal(f.store.state.jobs.length, 0);
-    rmSync(join(f.dir, 'state.json.tmp'), { recursive: true });
-    for (let attempt = 0; attempt < 3; attempt++) {
-      // Repairs alone cannot make this unhealthy process accept or falsely ACK a retry.
-      await assert.rejects(f.connector.accept(reply));
-      assert.equal(f.store.state.seen.E1, undefined);
-      assert.equal(f.store.state.jobs.length, 0);
-      assert.equal(JSON.parse(readFileSync(join(f.dir, 'state.json'), 'utf8')).jobs.length, 0);
-    }
-  } finally { await f.cleanup(); }
-});
-test('shutdown waits for an in-flight Slack post before releasing state ownership', async () => {
-  const f = fixture(); let finish: (() => void) | undefined;
-  f.slack.post = async () => { await new Promise<void>(r => { finish = r; }); return '100.1'; };
-  await f.connector.create({ id: 's', mode: 'managed', channel: 'C1', project: 'repo', threadTs: '100.1' });
-  f.connector.enqueue('s', 'hello'); f.connector.pump('s');
-  while (!finish) await new Promise(r => setTimeout(r, 1));
-  let closed = false; const pending = f.connector.close().then(() => { closed = true; });
-  await new Promise(r => setTimeout(r, 10)); assert.equal(closed, false);
-  finish(); await pending; assert.equal(closed, true); await f.cleanup();
-});
+import { BackendError } from '../src/codex.js';
+import { fixture,ready,run,request,event,human,pending,waitFor,envelope } from './helpers.js';
+test('only exact configured dot metadata or human accepted; no self loop, edits, foreign team/channel',async()=>{const f=fixture();try{await f.connector.initialize();const r=request('capabilities');for(const e of [event(r,{bot_id:'BEVIL'}),event(r,{user:'UEVIL'}),event(r,{app_id:'AEVIL'}),event(r,{channel:'COTHER'}),event(r,{subtype:'message_changed'}),event(r,{user:'USELF'}),{...event(r),team_id:'T2'}])assert.equal(f.connector.accept(e),false);assert.equal(f.store.state.work.length,0);assert.equal(f.connector.accept(event(r)),true);assert.equal(f.backend.calls.length,0);}finally{await f.cleanup();}});
+test('durable command replay is principal-scoped and conflicting payload never executes',async()=>{const f=fixture();try{await f.connector.initialize();const r=request('capabilities',{},'constructor');const e=event(r);f.connector.accept(e);f.connector.accept(e);f.connector.accept(event(r));assert.equal(f.store.state.work.length,1);f.connector.accept(event(request('help',{},'constructor')));assert.equal(f.store.state.work.length,1);assert.match(f.store.state.outbox[0]!.text,/REQUEST_ID_CONFLICT/);}finally{await f.cleanup();}});
+test('create shared session and attach preexisting default session without overrides',async()=>{const f=fixture();try{const a=await ready(f);assert.ok(a.threadTs);assert.equal(f.posts[0].channel,'COUT');assert.equal(f.posts[0].mentionUserId,'UDOT');f.backend.threads.set('existing',{id:'existing',cwd:f.dir,canAcceptDirectInput:true,status:{type:'idle'}});await run(f,'session.attach',{threadId:'existing',project:'repo'});assert.equal(f.store.state.sessions.length,2);const resume=f.backend.calls.find(c=>c.method==='thread/resume')!;assert.deepEqual(resume.params,{threadId:'existing',excludeTurns:true});await run(f,'session.send',{sessionId:a.id,text:'hello'});assert.ok(f.backend.calls.some(c=>c.method==='thread/queue/start'&&c.params.threadId===a.threadId));}finally{await f.cleanup();}});
+test('busy/unmanageable sessions fail visibly; queue and steer use explicit supported methods',async()=>{const f=fixture();try{const s=await ready(f),t=f.backend.threads.get(s.threadId);t.canAcceptDirectInput=false;assert.equal((await run(f,'session.send',{sessionId:s.id,text:'x'})).error,'DIRECT_INPUT_UNAVAILABLE');t.canAcceptDirectInput=true;t.status={type:'active'};assert.equal((await run(f,'session.send',{sessionId:s.id,text:'x'})).error,'SESSION_BUSY_USE_STEER_OR_QUEUE');await run(f,'session.steer',{sessionId:s.id,turnId:'turn-1',text:'change'});assert.equal(f.backend.calls.at(-1)!.params.expectedTurnId,'turn-1');await run(f,'session.queue',{sessionId:s.id,text:'next',resume:true});assert.deepEqual(f.backend.calls.slice(-2).map(c=>c.method),['thread/queue/add','thread/queue/start']);}finally{await f.cleanup();}});
+test('only bound sessions final text forwarded, replay suppressed and reasoning omitted',async()=>{const f=fixture();try{const s=await ready(f);const p={threadId:s.threadId,turnId:'turn-1',item:{id:'answer',type:'agentMessage',phase:'final_answer',text:'FINAL'}};f.backend.emit('notification','item/completed',{...p,threadId:'unknown'},f.backend.epoch);f.backend.emit('notification','item/completed',{...p,item:{id:'reason',type:'reasoning',text:'PRIVATE'}},f.backend.epoch);f.backend.emit('notification','item/completed',p,f.backend.epoch);f.backend.emit('notification','item/completed',p,f.backend.epoch);await waitFor(()=>f.store.state.outbox.some(o=>o.text==='FINAL'));assert.equal(f.store.state.outbox.filter(o=>o.text==='FINAL').length,1);assert.ok(!JSON.stringify(f.store.state.outbox).includes('PRIVATE'));}finally{await f.cleanup();}});
+test('bot cannot approve; same template ID subsequently works for genuine human, even behind uncertain work',async()=>{const f=fixture();try{const s=await ready(f),p=await pending(f,s);const args={requestId:p.id,epoch:p.epoch,sessionId:s.id,turnId:p.turnId,decision:'accept'},r=request('approval.respond',args,'template-1');f.connector.accept(event(r));f.connector.pump();await waitFor(()=>f.store.state.work.some(w=>w.request.id==='template-1'&&w.status==='failed'));assert.equal(f.backend.responses.length,0);f.store.transaction(state=>{state.work.push({id:'old',eventId:'old',request:request('session.send',{sessionId:s.id,text:'unknown'}),source:{kind:'local',userId:'local',channel:'CIN',ts:'',threadTs:'',eventId:'old'},status:'uncertain',createdAt:''});});f.connector.accept(human(r,s.threadTs!));f.connector.pump();await waitFor(()=>f.backend.responses.length===1);assert.deepEqual(f.backend.responses[0],{id:101,result:{decision:'accept'}});assert.equal(f.store.state.pending[0]!.status,'responding');f.connector.accept(human(request('approval.respond',args),s.threadTs!));f.connector.pump();await new Promise(r=>setTimeout(r,10));assert.equal(f.backend.responses.length,1);}finally{await f.cleanup();}});
+test('wrong-thread, wrong-turn and stale epoch decisions never reach server',async()=>{const f=fixture();try{const s=await ready(f),p=await pending(f,s),args={requestId:p.id,epoch:p.epoch,sessionId:s.id,turnId:p.turnId,decision:'accept'};for(const [v,thread]of [[{...args,turnId:'wrong'},s.threadTs],[args,'999.1'],[{...args,epoch:'old'},s.threadTs]]as const){f.connector.accept(human(request('approval.respond',v),thread!));f.connector.pump();await new Promise(r=>setTimeout(r,10));}assert.equal(f.backend.responses.length,0);f.backend.connected=false;f.backend.emit('disconnect',f.backend.epoch);await waitFor(()=>f.store.state.pending[0]!.status==='stale');}finally{await f.cleanup();}});
+test('dot proof requires fetched authenticated same-thread exact human decision; no quoted actor claims',async()=>{const f=fixture();try{const s=await ready(f),p=await pending(f,s);const args={requestId:p.id,epoch:p.epoch,sessionId:s.id,turnId:p.turnId,decision:'decline'};f.slack.humanMessage=async()=>({user:'UHUMAN',ts:'200.1',thread_ts:s.threadTs,text:envelope(request('approval.respond',args))});f.connector.accept(event(request('approval.respond',{...args,humanMessageTs:'200.1'})));f.connector.pump();await waitFor(()=>f.backend.responses.length===1);assert.equal(f.backend.responses[0].result.decision,'decline');}finally{await f.cleanup();}});
+test('secret/oversized approval scope and secret question are local-only and not persisted',async()=>{for(const [params,method]of [[{command:'curl -H "Bearer secret-sensitive-value"'},'item/commandExecution/requestApproval'],[{command:'x'.repeat(13000)},'item/commandExecution/requestApproval'],[{questions:[{id:'password',isSecret:true,question:'SECRET_QUESTION'}]},'item/tool/requestUserInput']]as const){const f=fixture();try{const s=await ready(f),p=await pending(f,s,params,method);assert.equal(p.status,'local-required');assert.ok(!JSON.stringify(f.store.state).includes('secret-sensitive-value'));assert.ok(!JSON.stringify(f.store.state).includes('SECRET_QUESTION'));assert.equal(f.backend.responses.length,0);}finally{await f.cleanup();}}});
+test('user input exact questions and allowed options; expiry denies approval without autoaccept',async()=>{const f=fixture();try{const s=await ready(f),p=await pending(f,s,{questions:[{id:'q1',isSecret:false,isOther:false,question:'Pick',options:[{label:'A'},{label:'B'}]}]},'item/tool/requestUserInput');const args={requestId:p.id,epoch:p.epoch,sessionId:s.id,turnId:p.turnId,answers:{q1:['A']}};f.connector.accept(human(request('input.respond',args),s.threadTs!));f.connector.pump();await waitFor(()=>f.backend.responses.length===1);assert.deepEqual(f.backend.responses[0].result,{answers:{q1:{answers:['A']}}});f.store.transaction(st=>{st.pending[0]!.status='pending';st.pending[0]!.kind='command';st.pending[0]!.expiresAt=0;});await f.connector.expire();assert.equal(f.backend.responses.at(-1).result.decision,'decline');}finally{await f.cleanup();}});
+test('Slack delivery failure does not rerun Codex and same-session messages cannot overtake',async()=>{const f=fixture();try{const s=await ready(f);await waitFor(()=>f.store.state.outbox.every(o=>o.status==='sent'));f.slack.post=async()=>{throw Error('network uncertain');};await run(f,'session.send',{sessionId:s.id,text:'once'});await waitFor(()=>f.store.state.outbox.some(o=>o.status==='uncertain'));const calls=f.backend.calls.filter(c=>c.method==='thread/queue/start').length;await run(f,'session.reply',{sessionId:s.id,text:'later'});f.connector.flush();await new Promise(r=>setTimeout(r,10));assert.equal(f.backend.calls.filter(c=>c.method==='thread/queue/start').length,calls);assert.ok(f.store.state.outbox.find(o=>o.text==='later')?.status==='queued');}finally{await f.cleanup();}});
+test('rate limited first delivery blocks later same lane while unrelated lane can proceed',async()=>{const f=fixture();try{const s=await ready(f);await waitFor(()=>f.store.state.outbox.every(o=>o.status==='sent'));let attempts=0;f.slack.post=async()=>{attempts++;throw Object.assign(Error(),{code:'slack_webapi_rate_limited_error',retryAfter:60});};await run(f,'session.reply',{sessionId:s.id,text:'first'});await waitFor(()=>f.store.state.outbox.some(o=>o.nextAttemptAt>Date.now()));await run(f,'session.reply',{sessionId:s.id,text:'second'});f.connector.flush();await new Promise(r=>setTimeout(r,10));assert.equal(attempts,1);}finally{await f.cleanup();}});
+test('failed storage never ACKs retries and committed state remains unchanged',async()=>{const f=fixture();try{await f.connector.initialize();mkdirSync(join(f.dir,'state.json.tmp'));const e=event(request('capabilities'));assert.throws(()=>f.connector.accept(e));rmSync(join(f.dir,'state.json.tmp'),{recursive:true});for(let i=0;i<3;i++)assert.throws(()=>f.connector.accept(e));assert.equal(f.store.state.work.length,0);assert.equal(JSON.parse(readFileSync(join(f.dir,'state.json'),'utf8')).work.length,0);}finally{await f.cleanup();}});
+test('restart marks in-flight actions, deliveries and approvals uncertain/stale without replay',async()=>{const f=fixture();const s=await ready(f);await f.connector.close();f.store.transaction(st=>{st.work[0]!.status='executing';st.outbox[0]!.status='sending';st.pending.push({id:'p',rpcId:1,epoch:'e',sessionId:s.id,threadId:s.threadId,turnId:'t',method:'x',kind:'command',status:'pending',details:{},expiresAt:Date.now()+1000,decisions:[]});});f.store.close();const next=new Store(f.dir);assert.equal(next.state.work[0]!.status,'uncertain');assert.equal(next.state.outbox[0]!.status,'uncertain');assert.equal(next.state.pending[0]!.status,'stale');next.close();rmSync(f.dir,{recursive:true,force:true});});
+test('storage failure before execution/send stops scheduling without starving event loop',async()=>{for(const delivery of [false,true]){const f=fixture();try{await f.connector.initialize();if(delivery)f.store.transaction(s=>{s.outbox.push({id:'d',channel:'COUT',root:false,text:'x',status:'queued',attempts:0,nextAttemptAt:0});});else f.connector.accept(event(request('capabilities')));mkdirSync(join(f.dir,'state.json.tmp'));if(delivery)f.connector.flush();else f.connector.pump();await new Promise(r=>setTimeout(r,20));assert.equal(f.backend.calls.length,0);assert.equal(f.posts.length,0);rmSync(join(f.dir,'state.json.tmp'),{recursive:true});}finally{await f.cleanup();}}});
+test('new configured dot name does not reuse old resolved recipient; unchanged selector keeps stable ID',async()=>{const f=fixture();try{f.config.slack.dot={name:'new-dot'};f.store.transaction(s=>{s.dot={name:'renamed-old-dot',selector:'old-dot',userId:'UOLD'};});let received:any;f.slack.resolveDot=async(name,id)=>{received={name,id};return{userId:'UNEW',name};};await f.connector.initialize();assert.deepEqual(received,{name:'new-dot',id:undefined});await f.connector.initialize();assert.deepEqual(received,{name:'new-dot',id:'UNEW'});}finally{await f.cleanup();}});
+test('shared sensitive detector withholds GitHub/API/cloud credentials in approval details',async()=>{for(const secret of ['ghp_'+'A'.repeat(36),'sk-'+'a'.repeat(30),'AKIA'+'A'.repeat(16)]){const f=fixture();try{const s=await ready(f),p=await pending(f,s,{command:`curl -H 'Authorization: token ${secret}'`});assert.equal(p.status,'local-required');assert.ok(!JSON.stringify(f.store.state).includes(secret));}finally{await f.cleanup();}}});
+test('missing command/cwd or missing/empty file diff scope never offers remote acceptance',async()=>{for(const params of [{command:null},{cwd:null}]){const f=fixture();try{const s=await ready(f),p=await pending(f,s,params);assert.equal(p.status,'local-required');}finally{await f.cleanup();}}const f=fixture();try{const s=await ready(f);f.backend.emit('notification','item/started',{threadId:s.threadId,turnId:'turn-1',item:{id:'item-1',type:'fileChange',changes:[]}},f.backend.epoch);await new Promise(r=>setTimeout(r,5));const p=await pending(f,s,{},'item/fileChange/requestApproval');assert.equal(p.status,'local-required');}finally{await f.cleanup();}});
+test('uncertain control work pauses only mutations, not readonly inspection or pending decisions',async()=>{const f=fixture();try{const s=await ready(f);f.store.transaction(st=>{st.work.push({id:'uncertain',eventId:'u',request:request('session.send',{sessionId:s.id,text:'x'}),source:{kind:'local',userId:'local',channel:'CIN',threadTs:'',ts:'',eventId:'u'},status:'uncertain',createdAt:''});});assert.equal((await run(f,'session.info',{sessionId:s.id})).status,'completed');assert.equal((await run(f,'session.history',{sessionId:s.id,limit:3})).status,'completed');}finally{await f.cleanup();}});
+test('discovery includes project-external shared sessions with reasons; local opt-in controls them without expanding file roots',async()=>{const f=fixture();try{await f.connector.initialize();f.backend.threads.set('outside',{id:'outside',cwd:'/outside-project',canAcceptDirectInput:true,status:{type:'idle'}});const listed=await run(f,'session.list');assert.equal(listed.status,'completed');assert.ok(f.store.state.outbox.some(o=>o.text.includes('outside')));assert.ok(f.store.state.outbox.some(o=>o.text.includes('SESSION_SCOPE_NOT_ALLOWED')));assert.equal((await run(f,'session.attach',{threadId:'outside'})).error,'SESSION_SCOPE_NOT_ALLOWED');f.config.sessionPolicy={allowAllSharedSessions:true};assert.equal((await run(f,'session.attach',{threadId:'outside'})).status,'completed');const bound=f.store.state.sessions.find(s=>s.threadId==='outside')!;assert.equal(bound.project,'@shared');assert.equal((await run(f,'session.send',{sessionId:bound.id,text:'allowed control'})).status,'completed');await assert.rejects(f.connector.files.read('@shared','anything'));f.config.sessionPolicy.allowAllSharedSessions=false;assert.equal((await run(f,'session.info',{sessionId:bound.id})).error,'SESSION_SCOPE_REVOKED');}finally{await f.cleanup();}});
+test('project subdirectory sessions are controllable without granting arbitrary file roots',async()=>{const f=fixture();try{mkdirSync(join(f.dir,'src'));await f.connector.initialize();f.backend.threads.set('subdir',{id:'subdir',cwd:join(f.dir,'src'),canAcceptDirectInput:true,status:{type:'idle'}});assert.equal((await run(f,'session.attach',{threadId:'subdir',project:'repo'})).status,'completed');assert.equal(f.store.state.sessions[0]!.project,'repo');}finally{await f.cleanup();}});
+test('project session scope resolves symlinks before accepting subdirectory control',async()=>{const f=fixture();const {mkdtempSync,symlinkSync}=await import('node:fs');const {tmpdir}=await import('node:os');const outside=mkdtempSync(join(tmpdir(),'outside-session-'));try{symlinkSync(outside,join(f.dir,'link'),process.platform==='win32'?'junction':'dir');await f.connector.initialize();f.backend.threads.set('escape',{id:'escape',cwd:join(f.dir,'link'),canAcceptDirectInput:true,status:{type:'idle'}});assert.equal((await run(f,'session.attach',{threadId:'escape',project:'repo'})).error,'THREAD_PROJECT_MISMATCH');assert.equal((await run(f,'session.attach',{threadId:'escape'})).error,'SESSION_SCOPE_NOT_ALLOWED');assert.equal(f.store.state.sessions.length,0);f.config.sessionPolicy={allowAllSharedSessions:true};assert.equal((await run(f,'session.attach',{threadId:'escape'})).status,'completed');}finally{await f.cleanup();rmSync(outside,{recursive:true,force:true});}});
+test('send race uses queue admission, keeps accepted entry if start rejected, never implicitly steers',async()=>{const f=fixture();try{const s=await ready(f),original=f.backend.rpc.bind(f.backend);f.backend.rpc=async(method,params)=>{if(method==='thread/queue/start'){f.backend.calls.push({method,params});throw new BackendError('RPC_REJECTED');}return original(method,params);};const w=await run(f,'session.send',{sessionId:s.id,text:'one input'});assert.equal(w.status,'completed');assert.equal(f.backend.calls.filter(c=>c.method==='thread/queue/add').length,1);assert.ok(!f.backend.calls.some(c=>c.method==='turn/start'||c.method==='turn/steer'));assert.ok(f.store.state.outbox.some(o=>o.text.includes('Message remains queued')));}finally{await f.cleanup();}});
+test('missing queue submission ID is uncertain and never starts an unrelated queued item',async()=>{for(const command of ['session.send','session.queue']){const f=fixture();try{const s=await ready(f),original=f.backend.rpc.bind(f.backend);f.backend.rpc=async(method,params)=>method==='thread/queue/add'?{queuedSubmission:{}}:original(method,params);const w=await run(f,command,{sessionId:s.id,text:'x',...(command==='session.queue'?{resume:true}:{})});assert.equal(w.status,'uncertain');assert.ok(!f.backend.calls.some(c=>c.method==='thread/queue/start'));}finally{await f.cleanup();}}});

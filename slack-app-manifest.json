@@ -1,9 +1,32 @@
 {
-  "display_information": { "name": "Codex Connector", "description": "Private local Codex session and Slack thread bridge", "background_color": "#1d252c" },
-  "features": { "bot_user": { "display_name": "Codex Connector", "always_online": false } },
-  "oauth_config": { "scopes": { "bot": ["chat:write", "channels:history", "groups:history"] } },
+  "display_information": {
+    "name": "Codex Connector",
+    "description": "Private shared Codex daemon control with exact human approval",
+    "background_color": "#1d252c"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Codex Connector",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "chat:write",
+        "channels:history",
+        "groups:history",
+        "users:read"
+      ]
+    }
+  },
   "settings": {
-    "event_subscriptions": { "bot_events": ["message.channels", "message.groups"] },
+    "event_subscriptions": {
+      "bot_events": [
+        "message.channels",
+        "message.groups"
+      ]
+    },
     "socket_mode_enabled": true,
     "org_deploy_enabled": false
   }

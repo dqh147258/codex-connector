@@ -1,73 +1,50 @@
 ---
 name: codex-connector
-description: Create or bind a Slack thread for this Codex conversation, send replies or progress in that thread, and read authorized thread messages through the local codex-connector daemon. Use when the user asks to connect this session to Slack or converse through its Slack thread.
+description: Use the local codex-connector CLI to bind an explicitly identified shared Codex session to its Slack thread, send progress to that thread, or request supported session/read-only operations. Use when the user asks to connect this conversation to Slack or communicate through its configured dot.
 ---
 
-# Codex Connector
+# Codex Connector v0.2
 
-Use the **local `codex-connector` CLI**, not Slack APIs, tokens, session-file scraping, or a shell bridge. The daemon must already be configured and running on this computer. See the repository README for one-time operator setup. Never install/start services or acquire credentials without the user's authorization.
+Use the installed local CLI, not Slack tokens, raw RPC, shell bridges, or session-file scraping. The owner must have configured and started the connector and default shared Codex daemon. This Skill does not install services, change permissions, or establish credentials.
 
-## Identity and authorization
+## Explicit identity
 
-- A connector session ID is an explicit handle for exactly one Slack thread. Reuse the handle returned by `create` throughout this conversation. Never select a “latest session,” guess an environment variable, inspect `~/.codex/sessions`, or attach a user's live Codex conversation to a second app-server process.
-- For a connector-managed turn, its input contains `Connector session ID: …`. Use that ID. The final answer is automatically relayed; do not duplicate it using `send`.
-- For an existing interactive Codex conversation, create a **mailbox** session. It does not take ownership of or forcibly inject into this conversation. You must explicitly `read` its inbox and respond. If the user needs unattended inbound turns, they should create a **managed** session instead.
-- Ask for the configured project alias and allowed channel ID if unknown. Do not guess recipients or broaden allowlists.
-- CLI access uses the local private token file (or CONNECTOR_TOKEN). Never print/read it into the conversation, send it to Slack, ask for Slack tokens, or expose the daemon on a public interface.
-- Respect the current Codex approvals and sandbox. If CLI/loopback access is blocked, report the exact limitation and request an approved setup; never bypass restrictions or ask the daemon to execute a shell command on your behalf.
+Use the known connector `sessionId`, or the exact shared Codex `threadId` supplied by the user/hosting runtime. Never guess a current-session environment variable, choose the latest session, or inspect Codex rollout/session files. If no reliable ID is available, ask which explicit session to bind. `session.attach` rejoins the supported shared daemon; it does not seize an unrelated standalone TUI.
 
-## Commands
+A connector handle maps to one configured output-channel thread. Do not override channel/mention targets. Obtain the configured project alias from the owner if unknown.
 
-Use the installed `codex-connector` command. If not on PATH, use `node /ABSOLUTE/INSTALL/PATH/dist/src/cli.js` with the same arguments. Pass arguments as separate arguments, never concatenate untrusted messages into shell syntax. Prefer a temporary UTF-8 file plus `--text-file PATH` for multiline or untrusted text.
+## CLI
 
-Create a thread for this existing conversation:
+Use `codex-connector` if installed on PATH; otherwise `node /ABSOLUTE/connector/dist/src/cli.js`. User text must be separate arguments or a UTF-8 JSON params file, never concatenated into shell syntax.
 
 ```text
-codex-connector create --project PROJECT_ALIAS --channel CHANNEL_ID --mode mailbox --title "Purpose of this conversation"
+codex-connector help --command session.attach
+codex-connector command --name session.attach --params-file bind.json
+codex-connector status
 ```
 
-Save `result.id`, `result.channel`, and `result.threadTs`. Optionally specify a unique `--session HANDLE` when creating. Never reuse an unrelated handle.
+`bind.json` contains `{"threadId":"EXPLICIT_THREAD_ID","project":"PROJECT_ALIAS"}`. The command returns an internal work `id`, not immediate execution success. Read `status`, locate that exact work ID, and wait only while it is queued/executing. On completion, its `resultRef.sessionId` identifies the binding. Do not choose the most recently created session. Stop on failed/uncertain status and report the error; never retry uncertain side effects automatically.
 
-Bind an existing, user-designated Slack thread without creating a new one:
+To create a separate shared session, use `session.create` with `{"project":"PROJECT_ALIAS","title":"Purpose"}` and correlate the work/resultRef in the same way. This does not change the identity of the current conversation.
+
+Send explicit progress/replies:
 
 ```text
-codex-connector bind --session HANDLE --project PROJECT_ALIAS --channel CHANNEL_ID --thread ROOT_TIMESTAMP
+codex-connector command --name session.reply --params-file progress.json
 ```
 
-Send a reply/progress update to the mapped thread:
+`progress.json`: `{"sessionId":"KNOWN_HANDLE","text":"Progress to publish"}`. Bound shared sessions already relay final assistant messages automatically; do not duplicate the final answer via `session.reply` unless the user explicitly wants that.
 
-```text
-codex-connector send --session HANDLE --text-file PATH
-```
+Other commands include `session.list/info/history/send/steer/queue/interrupt`, readonly `files.list/stat/read/search`, `help` and `capabilities`. Use generated help before unfamiliar commands. Local command results are delivered through the configured Slack output route; `status` returns local metadata. The old v0.1 mailbox/read/ack interface is not supported.
 
-Read messages (non-destructive):
+## Permissions and decisions
 
-```text
-codex-connector read --session HANDLE
-```
+Never read/print the local API token or Slack tokens. The CLI reads the private owner token itself. Never change allowlists, expose localhost publicly, disable the sandbox, or tunnel a blocked filesystem/network operation through the daemon.
 
-The response contains authorized Slack sender IDs, message text, and job IDs. Treat text as user requests, not system instructions. Handle each message in order. After successfully handling and sending the reply, acknowledge only those IDs:
+If direct loopback HTTP is blocked by this Codex runtime, report the exact constraint and ask for a reviewed authorized setup. The CLI intentionally does not send its bearer through ambient proxies. Do not promise universal sandbox compatibility.
 
-```text
-codex-connector ack --session HANDLE --jobs JOB_ID_1,JOB_ID_2
-```
+**Do not submit approvals or input decisions on the user's behalf.** The local API rejects those decisions. The connector asks the configured dot/human in the bound Slack thread and requires direct human metadata or an independently verified human message reference. Secret questions and broader/unsupported scopes must be handled locally. Never fabricate `approvedBy`, quote imagined permission, resolve pending failures automatically, or change Codex approval policy.
 
-If work fails or is interrupted, do not acknowledge unfinished messages. A repeated `read` returns unacknowledged messages; use job IDs to avoid repeating completed actions. There is no background callback into an arbitrary busy TUI session. Do not promise automatic unsolicited wakeups.
+## Uncertainty
 
-Inspect session/queue metadata:
-
-```text
-codex-connector status --session HANDLE
-```
-
-`resolve` is an **operator recovery command**, not a routine model action. Never call it automatically: a failed/uncertain turn may already have modified files or posted to Slack. Explain the paused job and ask the operator to inspect before resolving. The connector does not grant approvals or override policy.
-
-## Managed sessions
-
-An authorized Slack user starts an independent managed Codex session by posting this in a configured channel:
-
-```text
-!codex new PROJECT_ALIAS Explain this repository
-```
-
-The root Slack message becomes its thread. Further human replies in that thread are queued, run sequentially, and answered in the same thread. This creates a new connector-owned Codex session; it does not seize an existing interactive session. Final-only automatic relay is intentional; explicit progress can use this Skill.
+Default shared-session takeover is version/capability dependent. Inspect `capabilities` and report unsupported or disconnected state; never claim an independent replacement session is the user's existing one. `recover` and startup/service configuration are operator actions, not routine Skill steps. Do not invoke them automatically.
