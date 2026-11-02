@@ -5,6 +5,7 @@ export interface Config {
     trustedBots: { botId: string; userId: string; appId: string }[]; dot: { name: string; userId?: string } };
   projects: Record<string, string>;
   sessionPolicy?: { allowAllSharedSessions: boolean };
+  filePolicy?: { allowAbsolutePaths: boolean };
   backend: { executable: string; socketPath?: string; expectedVersion?: string; autoStartDaemon?: boolean };
   approvalTimeoutSec: number;
 }

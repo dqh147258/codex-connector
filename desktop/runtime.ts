@@ -5,6 +5,7 @@ import { isAbsolute, join } from 'node:path';
 import type { Config } from '../src/types.js';
 import { commandRequest } from '../src/client.js';
 import { codexLaunch } from '../src/codex.js';
+import { sessionListParams } from './ipc-policy.js';
 const exec = promisify(execFile);
 export type RuntimeSnapshot={state:'stopped'|'starting'|'running'|'stopping'|'failed';owned:boolean;backend?:Record<string,unknown>;lastError?:string};
 export function desktopChildEnvironment(home:string,tokens:{appToken:string;botToken:string},base:NodeJS.ProcessEnv=process.env):NodeJS.ProcessEnv{
@@ -36,6 +37,25 @@ export class DesktopRuntime {
       this.backend={connected:c.connected,version:c.version,expectedVersion:c.expectedVersion,lastFailure:c.lastFailure,daemonStart:c.daemonStart,unsupportedMethods:c.unsupportedMethods};
     }catch{if(this.child===child)this.lastError='STATUS_UNAVAILABLE';}
     return this.snapshot();
+  }
+  async listSessions(value:unknown):Promise<{sessions:Record<string,unknown>[];nextCursor:string|null;scope?:unknown}>{
+    const params=sessionListParams(value);
+    if(this.state!=='running'||!this.child||!this.config)throw Error('SESSION_SERVER_NOT_RUNNING');
+    const child=this.child;
+    let response:any;
+    try{
+      const token=readFileSync(join(this.home,'api.token'),'utf8').trim();
+      response=await commandRequest(this.config.port,token,{action:'sessions',params});
+    }catch{throw Error('SESSIONS_UNAVAILABLE');}
+    if(this.child!==child||this.state!=='running')throw Error('SESSION_LIST_STALE');
+    const result=response?.ok===true?response.result:null;
+    if(!result||!Array.isArray(result.sessions)||result.sessions.length>200||!(result.nextCursor===null||(typeof result.nextCursor==='string'&&result.nextCursor.length>0&&result.nextCursor.length<=2048)))throw Error('INVALID_SESSION_RESPONSE');
+    const fields=['id','name','cwd','project','manageable','reason','canAcceptDirectInput','status','model','reasoningEffort','source','connectorSessionId','loaded','discoverySources','binding'];
+    const sessions=result.sessions.map((item:unknown)=>{
+      if(!item||typeof item!=='object'||Array.isArray(item)||typeof (item as any).id!=='string'||!(item as any).id||(item as any).id.length>512)throw Error('INVALID_SESSION_RESPONSE');
+      return Object.fromEntries(fields.filter(k=>Object.hasOwn(item,k)).map(k=>[k,(item as Record<string,unknown>)[k]]));
+    });
+    return{sessions,nextCursor:result.nextCursor,...(result.scope===undefined?{}:{scope:result.scope})};
   }
   stop():Promise<RuntimeSnapshot>{
     if(this.stopping)return this.stopping;

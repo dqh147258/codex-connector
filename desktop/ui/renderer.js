@@ -43,6 +43,7 @@
       const active = button.dataset.view === view; button.classList.toggle('active', active);
       if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
     }
+    window.dispatchEvent(new CustomEvent('connector:view', { detail: { view } }));
     window.scrollTo?.(0, 0);
   }
   function markDirty() { dirty = true; revision++; text('dirty-label', '有修改尚未保存'); }
@@ -50,7 +51,7 @@
     if (!config) return;
     editingConfig = clone(config);
     const slack = config.slack || {}, backend = config.backend || {};
-    originalProject = Object.keys(config.projects || {})[0] || 'demo';
+    originalProject = Object.keys(config.projects || {})[0] || '';
     originalDot = slack.dot?.userId || slack.trustedBots?.[0]?.userId || '';
     const bot = slack.trustedBots?.find(b => b.userId === originalDot) || slack.trustedBots?.[0] || {};
     const values = {
@@ -62,11 +63,17 @@
       'expected-version': backend.expectedVersion || '', 'socket-path': backend.socketPath || ''
     };
     for (const [id, value] of Object.entries(values)) $(id).value = String(value);
+    $('allow-absolute-paths').checked = config.filePolicy?.allowAbsolutePaths === true;
+    updateProjectRequirements();
     $('allow-all-sessions').checked = config.sessionPolicy?.allowAllSharedSessions === true;
     $('auto-start-daemon').checked = backend.autoStartDaemon === true;
     const extraProjects = Math.max(0, Object.keys(config.projects || {}).length - 1), extraBots = Math.max(0, (slack.trustedBots || []).length - 1);
     text('preserved-settings', extraProjects || extraBots ? `这份配置另有 ${extraProjects} 个项目、${extraBots} 个可信 bot，保存时会保留。此处仅编辑上面显示的项目与 dot。` : '默认只开放你选择的项目。需要时可以导入包含多个项目的现有配置。');
     dirty = false; revision++; text('dirty-label', '配置尚未修改');
+  }
+  function updateProjectRequirements() {
+    const required = !$('allow-absolute-paths').checked;
+    $('project-alias').required = required; $('project-path').required = required;
   }
   const ids = value => value.split(/[\s,，]+/).map(s => s.trim()).filter(Boolean);
   function formConfig() {
@@ -77,12 +84,16 @@
     const userId = $('dot-user-id').value.trim();
     c.slack.dot = { name: $('dot-name').value.trim(), userId };
     c.slack.trustedBots = [...(c.slack.trustedBots || []).filter(b => b.userId !== originalDot), { userId, botId: $('dot-bot-id').value.trim(), appId: $('dot-app-id').value.trim() }];
-    const alias = $('project-alias').value.trim();
+    const alias = $('project-alias').value.trim(), projectPath = $('project-path').value.trim();
+    const allowAbsolutePaths = $('allow-absolute-paths').checked;
+    if (Boolean(alias) !== Boolean(projectPath)) throw new Error('项目别名和目录必须同时填写；启用绝对路径读取后才可同时留空。');
+    if (!alias && !allowAbsolutePaths) throw new Error('请填写项目别名和目录，或在本机明确启用绝对路径只读访问。');
     if (['__proto__', 'prototype', 'constructor'].includes(alias)) throw new Error('这个项目别名是保留名称，请换一个名称。');
     c.projects = { ...(c.projects || {}) };
-    if (originalProject && alias !== originalProject && Object.hasOwn(c.projects, alias)) throw new Error('这个项目别名已被另一项目使用，请换一个名称。');
+    if (alias && originalProject && alias !== originalProject && Object.hasOwn(c.projects, alias)) throw new Error('这个项目别名已被另一项目使用，请换一个名称。');
     if (originalProject && alias !== originalProject) delete c.projects[originalProject];
-    c.projects[alias] = $('project-path').value.trim();
+    if (alias) c.projects[alias] = projectPath;
+    c.filePolicy = { allowAbsolutePaths };
     c.sessionPolicy = { allowAllSharedSessions: $('allow-all-sessions').checked };
     c.backend = { ...(c.backend || {}), executable: $('codex-path').value.trim(), autoStartDaemon: $('auto-start-daemon').checked };
     const version = $('expected-version').value.trim(), socketPath = $('socket-path').value.trim();
@@ -249,6 +260,7 @@
     populate(result.config); markDirty(); $('import-notice').hidden = false; go('setup'); notice('已载入配置预览；检查后保存才会应用，原文件保持不变。');
   }));
   $('browse-codex-button').addEventListener('click', () => task('browse-codex', ['browse-codex-button'], async () => { const result = await invoke('choosePath', { kind: 'executable' }); if (result?.path) { $('codex-path').value = result.path; markDirty(); } }));
+  $('allow-absolute-paths').addEventListener('change', updateProjectRequirements);
   $('browse-project-button').addEventListener('click', () => task('browse-project', ['browse-project-button'], async () => { const result = await invoke('choosePath', { kind: 'project' }); if (result?.path) { $('project-path').value = result.path; markDirty(); } }));
   $('probe-codex-button').addEventListener('click', () => task('probe', ['probe-codex-button'], async () => {
     const executable = $('codex-path').value.trim(); if (!executable) throw new Error('请先选择 Codex 程序。');

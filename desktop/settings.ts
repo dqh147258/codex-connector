@@ -19,13 +19,14 @@ function keys(value: unknown, allowed: readonly string[], required: readonly str
 }
 function safeConfig(raw: unknown): Config {
   try { if (JSON.stringify(raw).length > MAX_FILE) fail('SETTINGS_TOO_LARGE'); } catch { return fail('INVALID_SETTINGS'); }
-  keys(raw, ['version','instanceId','port','slack','projects','sessionPolicy','backend','approvalTimeoutSec'], ['version','instanceId','port','slack','projects','backend','approvalTimeoutSec']);
+  keys(raw, ['version','instanceId','port','slack','projects','sessionPolicy','filePolicy','backend','approvalTimeoutSec'], ['version','instanceId','port','slack','projects','backend','approvalTimeoutSec']);
   keys(raw.slack, ['teamId','inputChannel','outputChannel','allowedHumans','approvalUsers','trustedBots','dot'], ['teamId','inputChannel','outputChannel','allowedHumans','approvalUsers','trustedBots','dot']);
   keys(raw.slack.dot, ['name','userId'], ['name']);
   if (!Array.isArray(raw.slack.trustedBots) || raw.slack.trustedBots.length > 100) fail('INVALID_SETTINGS');
   for (const bot of raw.slack.trustedBots as unknown[]) keys(bot, ['botId','userId','appId'], ['botId','userId','appId']);
   keys(raw.backend, ['executable','socketPath','expectedVersion','autoStartDaemon'], ['executable']);
   if (raw.backend.expectedVersion !== undefined && (typeof raw.backend.expectedVersion !== 'string' || raw.backend.expectedVersion.length > 120)) fail('INVALID_SETTINGS');
+  if (raw.filePolicy !== undefined) keys(raw.filePolicy, ['allowAbsolutePaths'], ['allowAbsolutePaths']);
   if (raw.sessionPolicy !== undefined) keys(raw.sessionPolicy, ['allowAllSharedSessions'], ['allowAllSharedSessions']);
   record(raw.projects);
   if (Object.keys(raw.projects).length > 100) fail('INVALID_SETTINGS');
@@ -85,7 +86,7 @@ export function importConfigPreview(path: string): Config {
 export class DesktopSettings {
   readonly homeDir: string;
   constructor(homeDir: string, private readonly cipher: SecretCipher) { this.homeDir=privateHome(homeDir); }
-  defaultConfig(): Config { return { version:2,instanceId:'my-computer',port:17381,slack:{teamId:'',inputChannel:'',outputChannel:'',allowedHumans:[],approvalUsers:[],trustedBots:[],dot:{name:'',userId:''}},projects:{project:''},sessionPolicy:{allowAllSharedSessions:false},backend:{executable:'',autoStartDaemon:false},approvalTimeoutSec:300 }; }
+  defaultConfig(): Config { return { version:2,instanceId:'my-computer',port:17381,slack:{teamId:'',inputChannel:'',outputChannel:'',allowedHumans:[],approvalUsers:[],trustedBots:[],dot:{name:'',userId:''}},projects:{project:''},sessionPolicy:{allowAllSharedSessions:false},filePolicy:{allowAbsolutePaths:false},backend:{executable:'',autoStartDaemon:false},approvalTimeoutSec:300 }; }
   readConfig(): Config {
     if(!existsSync(join(this.homeDir,'config.json')))return this.defaultConfig();
     return importConfigPreview(join(this.homeDir,'config.json'));

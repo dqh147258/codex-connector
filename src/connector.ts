@@ -18,7 +18,7 @@ export class Connector {
   readonly files:ReadonlyFiles;
   selfUserId='';selfBotId='';
   constructor(readonly config:Config,readonly store:Store,readonly backend:Backend,readonly slack:SlackPort,private postIntervalMs=1100){
-    this.files=new ReadonlyFiles(config.projects);
+    this.files=new ReadonlyFiles(config.projects,{},config.filePolicy?.allowAbsolutePaths===true);
     backend.on('notification',(method,params,epoch)=>this.event(()=>this.notification(method,params,epoch)));
     backend.on('request',request=>this.event(()=>this.serverRequest(request)));
     backend.on('disconnect',epoch=>this.event(()=>this.disconnected(epoch)));
@@ -40,7 +40,7 @@ export class Connector {
     }catch{/* Server remains usable for help/files/status. No independent fallback. */}
     this.pump();this.flush();
   }
-  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],fileTools:'readonly configured roots',approvalAuthority:'direct configured humans or verified same-thread human envelope; bots alone cannot approve',serviceManagement:'local template generation only'};}
+  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:'direct configured humans or verified same-thread human envelope; bots alone cannot approve',serviceManagement:'local template generation only'};}
   private authorizeEvent(body:any):Source|undefined{
     const e=body?.event,s=this.config.slack;
     if(body?.team_id!==s.teamId||typeof body.event_id!=='string'||!e||e.type!=='message'||!['',undefined,'bot_message'].includes(e.subtype)||typeof e.text!=='string'||typeof e.user!=='string'||typeof e.ts!=='string'||!this.validTimestamp(e.ts)||(e.thread_ts!==undefined&&!this.validTimestamp(e.thread_ts)))return;
@@ -166,17 +166,32 @@ export class Connector {
     const queued=await this.backend.rpc('thread/queue/add',{threadId:s.threadId,input,clientUserMessageId:w.id});const queuedId=this.queuedId(queued);
     try{return{queued,started:await this.backend.rpc('thread/queue/start',{threadId:s.threadId,queuedSubmissionId:queuedId})};}catch(e){if(codeOf(e)==='RPC_OUTCOME_UNCERTAIN')throw e;return{queued,startError:codeOf(e),note:'Message remains queued. Shared client may have become active; no fallback steering or duplicate enqueue.'};}
   }
+  async sessionPage(params:unknown={}){if(!params||typeof params!=='object'||Array.isArray(params)||Object.keys(params).some(k=>!['limit','cursor'].includes(k)))throw new ConnectorError('INVALID_SESSION_QUERY');return this.list(validateCommand('session.list',params));}
   private async list(p:any){
     let cursor:{stored?:string;loaded?:string;storedDone?:boolean;loadedDone?:boolean}={};
     if(p.cursor){try{cursor=JSON.parse(Buffer.from(p.cursor,'base64url').toString());if(!cursor||Array.isArray(cursor)||typeof cursor!=='object'||['storedDone','loadedDone'].some(k=>(cursor as any)[k]!==undefined&&typeof(cursor as any)[k]!=='boolean')||Object.keys(cursor).some(k=>!['stored','loaded','storedDone','loadedDone'].includes(k))||['stored','loaded'].some(k=>(cursor as any)[k]!==undefined&&typeof(cursor as any)[k]!=='string'))throw Error();}catch{throw new ConnectorError('INVALID_CURSOR');}}
     const roots=p.project?[this.project(p.project)]:undefined,limit=p.limit||50;
     const stored=cursor.storedDone?{data:[],nextCursor:null}:await this.backend.rpc('thread/list',{limit,cursor:cursor.stored,useStateDbOnly:true});
     const loaded=cursor.loadedDone?{data:[],nextCursor:null}:await this.backend.rpc('thread/loaded/list',{limit,cursor:cursor.loaded});
-    const byId=new Map<string,any>((stored.data||[]).filter((t:any)=>!roots||this.validCwd(t.cwd)&&roots.some(root=>this.within(root,t.cwd))).map((t:any)=>[t.id,t]));
-    for(const id of loaded.data||[]){try{const r=await this.backend.rpc('thread/read',{threadId:id,includeTurns:false});if(!roots||this.validCwd(r.thread.cwd)&&roots.some(root=>this.within(root,r.thread.cwd)))byId.set(id,r.thread);}catch{/* A disappearing or uninspectable thread is not asserted manageable. */}}
+    if(!Array.isArray(stored.data)||!Array.isArray(loaded.data)||stored.data.length>limit||loaded.data.length>limit)throw new ConnectorError('INVALID_SESSION_PAGE');
+    const byId=new Map<string,{thread:any;loaded:boolean|null;sources:string[];unavailable?:boolean}>();
+    const visible=(t:any)=>!roots||this.validCwd(t?.cwd)&&roots.some(root=>this.within(root,t.cwd));
+    for(const t of stored.data){if(!t||typeof t.id!=='string'||!t.id||t.id.length>512)throw new ConnectorError('INVALID_SESSION_PAGE');if(visible(t))byId.set(t.id,{thread:t,loaded:null,sources:['indexed-history']});}
+    const unresolvedLoadedIds:string[]=[];
+    for(const id of loaded.data){
+      if(typeof id!=='string'||!id||id.length>512)throw new ConnectorError('INVALID_SESSION_PAGE');
+      const previous=byId.get(id),sources=[...new Set([...(previous?.sources||[]),'loaded'])];
+      try{const r=await this.backend.rpc('thread/read',{threadId:id,includeTurns:false});if(!r?.thread||r.thread.id!==id)throw Error('Invalid thread metadata');if(visible(r.thread))byId.set(id,{thread:r.thread,loaded:true,sources});else byId.delete(id);}
+      catch{unresolvedLoadedIds.push(id);if(!roots||previous)byId.set(id,{thread:previous?.thread||{id},loaded:true,sources,unavailable:true});}
+    }
     const next=stored.nextCursor||loaded.nextCursor?Buffer.from(JSON.stringify({stored:stored.nextCursor||undefined,loaded:loaded.nextCursor||undefined,storedDone:!stored.nextCursor,loadedDone:!loaded.nextCursor})).toString('base64url'):null;
-    return{sessions:[...byId.values()].map(t=>this.threadSummary(t)),nextCursor:next,scope:'all shared-daemon visible metadata by default; control policy is separate from readonly file roots; standalone --no-daemon and unsupported inputs are not guaranteed manageable'};
+    const sessions=[...byId.values()].map(row=>{
+      const summary=this.threadSummary(row.thread),binding=this.store.state.sessions.find(s=>s.threadId===summary.id&&this.authorizedSession(s));
+      return{...summary,...(row.unavailable?{manageable:null,reason:'METADATA_UNAVAILABLE',canAcceptDirectInput:null,status:{type:'unknown'}}:{}),loaded:row.loaded,discoverySources:row.sources,binding:binding?{channel:binding.channel,threadTs:binding.threadTs}:null};
+    });
+    return{sessions,nextCursor:next,unresolvedLoadedIds,pageLimitPerSource:limit,scope:'Current shared-daemon loaded IDs plus indexed interactive history (default thread/list sources); each source is separately paginated, so one page can contain up to twice the limit. Stored-only rows do not prove unloaded status. Metadata failures remain unknown. No resume, content preload, filesystem history scan, or control-policy filtering. Separate CODEX_HOME, standalone --no-daemon and other servers are not guaranteed visible.'};
   }
+
   private async attachOrCreate(p:any,create:boolean,source:Source){
     if(source.kind!=='local'&&p.outputThreadTs)throw new ConnectorError('SLACK_ORIGIN_REQUIRED');
     let destination=this.originDestination(source);

@@ -14,6 +14,7 @@ export function apiServer(connector:Connector,token:string){return createServer(
     if(req.method!=='POST'||req.url!=='/v1/command'){res.writeHead(404);res.end('{"error":"Not found"}');return;}
     const body=await jsonBody(req);let result;
     if(body.action==='status')result=connector.status();
+    else if(body.action==='sessions'&&Object.keys(body).every(k=>['action','params'].includes(k)))result=await connector.sessionPage(body.params??{});
     else if(body.action==='recover'&&['command','outbox'].includes(body.kind)&&typeof body.id==='string'){connector.recover(body.kind,body.id,body.observedTs);result={recovered:body.id};}
     else if(body.action==='command'){const envelope=parseEnvelope(`${START_MARKER}\n${JSON.stringify(body.envelope)}\n${END_MARKER}`,connector.config.instanceId);result=connector.local(envelope);}
     else throw Error('UNKNOWN_ACTION');

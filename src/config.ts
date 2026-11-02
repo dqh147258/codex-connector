@@ -14,7 +14,8 @@ export function parseConfig(raw: unknown): Config {
   if (!Array.isArray(s.trustedBots) || s.trustedBots.some(b => !/^B[A-Z0-9]+$/.test(b.botId) || !/^U[A-Z0-9]+$/.test(b.userId) || !/^A[A-Z0-9]+$/.test(b.appId))) throw Error('trustedBots need exact botId/userId/appId');
   if (s.trustedBots.some(b => s.approvalUsers.includes(b.userId))) throw Error('A trusted bot cannot be an approval human');
   if (!s.dot || typeof s.dot.name !== 'string' || !s.dot.name.trim() || (s.dot.userId && !/^U[A-Z0-9]+$/.test(s.dot.userId))) throw Error('Set dot name and optional stable userId');
-  if (!c.projects || !Object.keys(c.projects).length) throw Error('Configure explicit project aliases');
+  if(c.filePolicy !== undefined && (!c.filePolicy || typeof c.filePolicy!=='object' || Array.isArray(c.filePolicy) || !Object.hasOwn(c.filePolicy,'allowAbsolutePaths') || typeof c.filePolicy.allowAbsolutePaths!=='boolean' || Object.keys(c.filePolicy).some(k=>k!=='allowAbsolutePaths')))throw Error('Invalid local filePolicy');
+  if (!c.projects || typeof c.projects !== 'object' || Array.isArray(c.projects) || (!Object.keys(c.projects).length && c.filePolicy?.allowAbsolutePaths !== true)) throw Error('Configure explicit project aliases unless absolute file access is locally enabled');
   for (const [key, value] of Object.entries(c.projects)) {
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(key) || typeof value !== 'string' || !isAbsolute(value)) throw Error('Projects require aliases and absolute directories');
     const real = realpathSync(value);

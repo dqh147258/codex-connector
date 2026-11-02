@@ -1,0 +1,7 @@
+#view-sessions > .inline-note { margin-bottom: 18px; }
+#sessions-list { margin-top: 20px; }
+#sessions-list .section-heading { flex-wrap: wrap; }
+#sessions-list .section-heading > div { min-width: 0; max-width: 100%; }
+#sessions-list h2 { overflow-wrap: anywhere; }
+#sessions-list .badge { white-space: normal; max-width: 100%; line-height: 1.7; }
+#sessions-list .detail-list dd { min-width: 0; }

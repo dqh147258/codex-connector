@@ -51,3 +51,11 @@ Every accepted Slack command response (including parser errors and ID conflicts)
 The sole optional transport address is one leading exact `<@CONNECTOR_SELF_USER_ID>` followed by one space or newline, with no other prefix. The identity comes from Slack auth.test, not command JSON. When an explicit plain_text block is present, the full raw fallback/block agreement is checked before removing the same exact address. After that address the entire unchanged strict envelope is required; prose gets same-thread usage guidance. Other mentions, repeated mentions and code fences do not execute. Fetched human approval evidence still requires the original strict envelope; no mention/block normalization is applied to it.
 
 Local/Skill `session.create` or a first `session.attach` requires `outputThreadTs` for an existing, readable root in configured `outputChannel`. This is checked before creating a Codex session; Slack-origin commands cannot override their destination with this parameter. Existing session bindings and bound Skill replies continue to work. Missing/unverified destinations fail closed; unbound local command output is not posted to Slack. On restart, persisted origins are retained. Old pending top-level or destinationless deliveries are marked failed, not silently rerouted. Channel revocation prevents delivery rather than choosing another channel.
+
+## 文件与会话只读查询
+
+文件命令保留 `{root:"项目别名",path:"相对路径"}`，新增省略 `root` 的原生绝对路径模式，例如 `files.list {"path":"/Volumes/Code/My/Skills","limit":20}`。仅本地 `filePolicy.allowAbsolutePaths:true` 生效，默认关闭；远程参数不能启用。完整边界见 [READONLY-FILES.md](READONLY-FILES.md)。
+
+`session.list` 每次分别读取最多 `limit` 条 indexed interactive history 与 loaded ID，合并可达 `2*limit`。`nextCursor` 为复合不透明游标；跨页按 ID 去重。`loaded:true` 只说明本轮服务观察，stored-only `loaded:null` 不证明当前未加载。读取 loaded 元数据失败保留 ID / `METADATA_UNAVAILABLE` / unknown，不擅自 resume。`binding` 仅返回仍授权的既有映射。不同服务、CODEX_HOME 或 `--no-daemon` 的独立进程不保证可见。
+
+桌面使用认证 loopback API `action:"sessions",params:{limit,cursor}`，仅返回元数据，不经过模型命令队列、不发送 Slack、不隐式绑定。

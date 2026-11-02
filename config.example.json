@@ -32,6 +32,9 @@
     "autoStartDaemon": false
   },
   "approvalTimeoutSec": 300,
+  "filePolicy": {
+    "allowAbsolutePaths": false
+  },
   "sessionPolicy": {
     "allowAllSharedSessions": false
   }

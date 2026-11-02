@@ -11,7 +11,7 @@
 - 全消息精确起止标记 + JSON；命令、参数、目标实例、重复 ID 均校验。没有任意 shell / RPC 透传。
 - 输入频道与输出频道分离；dot 可按名称唯一解析，保存稳定 user ID。更改名称选择会重新解析，不会继续偷偷 mention 旧对象。
 - 共享会话发现、绑定、创建、信息/文本历史、发送、显式 steer/queue/interrupt；按能力报告无法管理的例外。
-- 只读项目文件 `list/stat/read/search`，限制根目录、路径、文件类型、秘密内容和输出量。
+- 只读文件 `list/stat/read/search`：兼容项目别名；可在本地明确启用绝对路径读取，无需项目别名。保留 OS 权限、敏感路径/内容和输出量限制，默认关闭全系统只读。
 - 审批/输入精确绑定 **requestId + epoch + sessionId + turnId**；过期、重启、重复、错线程拒绝；不自动批准。
 - 持久命令 inbox 与独立 outbox；发送失败不会重跑 Codex；同一会话输出保序。
 - Linux / macOS / Windows 的登录/登录前启动**模板生成**，不自动安装、不提权、不保存系统登录密码。
@@ -40,7 +40,7 @@ node dist/src/cli.js init
 - `slack.inputChannel`：接收 dot 指令；`outputChannel`：输出和人类决定的目标频道。bot 必须被邀请进两个频道。
 - `trustedBots`：精确的 dot 元数据 ID；只填可信 bot。`allowedHumans` / `approvalUsers` 填 Carl 的真实 Slack 用户 ID，不是名字。
 - `dot.name`：选择 dot 名称；可同时指定已确认 `dot.userId` 解决重名。输出只 mention 已解析的 ID，不把名称拼成 `@` 文本。
-- `projects`：项目别名→绝对路径。这些根目录限制只读文件工具；默认会话控制允许根目录及其子目录，发现操作则列出共享 daemon 全部可见会话并给出限制原因。
+- `projects`：项目别名→绝对路径。默认这些根目录限制只读文件工具；本地启用 `filePolicy.allowAbsolutePaths` 后可省略文件命令的 `root` 并传原生绝对 `path`（可用 `projects:{}`），详见[只读文件](docs/READONLY-FILES.md)；默认会话控制允许根目录及其子目录，发现操作则列出共享 daemon 全部可见会话并给出限制原因。
 - `sessionPolicy.allowAllSharedSessions`：仅可在本机配置的显式开关，默认 `false`。设为 `true` 后允许绑定同账户共享 daemon 中项目根以外的会话；**不会扩大 files.* 的 roots**，也不覆盖原会话沙箱。Slack 不能更改此开关。
 - `backend.executable`：原生 Codex 可执行文件，或 npm 包的绝对 `bin/codex.js`。Windows 不支持 `.cmd/.bat` shell shim。
 - `backend.expectedVersion`：可选的显式版本门槛，**默认省略，不限制 Codex 版本号**；只有你主动填写时才要求完全匹配。已有配置不会被自动修改；要取消旧门槛，删除该字段并重启。连接器仍报告实际版本、检查协议能力；省略不等于保证所有版本兼容。当前历史 schema 证据来自 `0.166.0-alpha.1`，不是默认安装要求。
@@ -105,7 +105,7 @@ node dist/src/cli.js help --command session.create
 
 ## 3. 绑定已有默认会话
 
-1. `session.list {"limit":20}` 默认发现全部共享可见会话，返回 `manageable` / `reason`；可加 `project` 过滤。有 `nextCursor` 就继续分页，不能把第一页当全部。
+1. `session.list {"limit":20}` 分别分页读取共享 daemon 当前 loaded ID 与已索引交互历史（不扫描会话文件），返回 `manageable` / `reason`；可加 `project` 过滤。每来源最多 `limit` 条，合并后可达两倍；有 `nextCursor` 就继续分页，不能把第一页当全部。`loaded:true` 是读取时已加载观察，stored-only 为未知而非断言未加载；元数据不可读仍保留 ID，并标记 `METADATA_UNAVAILABLE`。桌面「会话列表」可只读刷新/逐页加载、去重，不自动恢复或读取内容。
 2. 选定明确的 `threadId`，发送 `session.attach {"threadId":"...","project":"demo"}`。对于项目外会话，先由操作者在本机启用 `sessionPolicy.allowAllSharedSessions` 并重启，再用 `session.attach {"threadId":"..."}`；无需把外部目录加入文件工具 roots。
 3. 返回 `sessionId`。首次 Slack 绑定使用发起命令的原 Thread（顶层命令用该消息自身作为根），并在其中 mention dot；已有绑定不会移动。本地/Skill 首次绑定需要 `outputThreadTs` 指定配置输出频道内可读取的已有 Thread。
 4. 用同一 `sessionId` 发送后续命令：

@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 const invoke = (channel, value) => ipcRenderer.invoke(channel, value);
 contextBridge.exposeInMainWorld('connector', Object.freeze({
   snapshot: () => invoke('desktop:snapshot'),
+  listSessions: value => invoke('desktop:listSessions', value),
   saveConfig: value => invoke('desktop:saveConfig', value),
   saveCredentials: value => invoke('desktop:saveCredentials', value),
   savePreferences: value => invoke('desktop:savePreferences', value),

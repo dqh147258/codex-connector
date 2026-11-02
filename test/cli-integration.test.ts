@@ -20,6 +20,9 @@ test('real CLI↔authenticated API command+status, ambient proxy bypass, no remo
     const status=await cli('status');assert.equal(status.sessions.length,1);assert.equal(proxyHits,0);
     const url=`http://127.0.0.1:${address.port}/v1/command`,headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json'};
     assert.equal((await fetch(url,{method:'POST'})).status,401);
+    const discovered=await fetch(url,{method:'POST',headers,body:JSON.stringify({action:'sessions',params:{limit:20}})});assert.equal(discovered.status,200);assert.equal((await discovered.json() as any).result.sessions.length,1);
+    assert.equal((await fetch(url,{method:'POST',headers,body:JSON.stringify({action:'sessions',params:{command:'session.create'}})})).status,400);
+    assert.equal((await fetch(url,{method:'POST',headers,body:JSON.stringify({action:'sessions',params:{},envelope:{}})})).status,400);
     assert.equal((await fetch(url,{method:'POST',headers:{...headers,Origin:'https://evil.invalid'},body:'{}'})).status,401);
     const wrongHost=await new Promise<number|undefined>((r,j)=>{const q=httpRequest(url,{method:'POST',headers:{...headers,Host:'evil.invalid'}},response=>{response.resume();response.on('end',()=>r(response.statusCode));});q.on('error',j);q.end('{}');});assert.equal(wrongHost,401);
     assert.equal((await fetch(url,{method:'POST',headers,body:JSON.stringify({action:'command',envelope:{v:1,id:'a',target:'test',command:'approval.respond',params:{requestId:'r',epoch:'e',sessionId:'s',turnId:'t',decision:'accept'}}})})).status,400);
