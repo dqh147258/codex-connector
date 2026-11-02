@@ -5,6 +5,7 @@ import { Store } from './store.js';
 import { ReadonlyFiles, FileAccessError, containsSensitiveContent } from './files.js';
 import { parseEnvelope, validateCommand, ProtocolError, formatHelp, COMMANDS, START_MARKER, END_MARKER, type CommandEnvelope } from './protocol.js';
 import { BackendError } from './codex.js';
+import { parseSlackEnvelope } from './slack-envelope.js';
 import type { Backend, Config, Delivery, Pending, Session, SlackPort, Source, State, Work } from './types.js';
 export class ConnectorError extends Error { constructor(readonly code:string){super(code);} }
 const codeOf=(e:unknown)=>e instanceof ConnectorError||e instanceof BackendError||e instanceof FileAccessError ? e.code : 'OPERATION_FAILED';
@@ -55,7 +56,7 @@ export class Connector {
     if(Object.hasOwn(this.store.state.seenEvents,source.eventId))return true;
     if(!body.event.text.startsWith(START_MARKER))return false;
     let request:CommandEnvelope;
-    try{request=parseEnvelope(body.event.text,this.config.instanceId);}catch(e){this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,`Command rejected: ${e instanceof ProtocolError?e.code:'invalid_envelope'}. Use the generated help envelope exactly.`);});return true;}
+    try{request=parseSlackEnvelope(body.event.text,body.event.blocks,this.config.instanceId,source.kind==='bot');}catch(e){this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,`Command rejected: ${e instanceof ProtocolError?e.code:'invalid_envelope'}. Use the generated help envelope exactly.`);});return true;}
     if(source.channel!==this.config.slack.inputChannel&&!decisionCommands.has(request.command))return false;
     this.record(request,source);return true;
   }

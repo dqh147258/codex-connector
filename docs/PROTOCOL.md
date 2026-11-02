@@ -2,7 +2,7 @@
 
 ## Slack command transport
 
-Every command occupies the complete raw message text:
+The canonical envelope occupies the complete raw message text:
 
 ```
 CODEX_CONNECTOR_COMMAND_BEGIN
@@ -11,6 +11,8 @@ CODEX_CONNECTOR_COMMAND_END
 ```
 
 The markers are ASCII words (no Slack angle-bracket escaping). Schema source: `src/protocol.ts`. It defines bounded parameters, applied defaults, examples, errors and permissions for generated help. Unknown keys, duplicate JSON keys, claimed actors, prototype keys, extra text, marker injection, unsupported version and wrong target are rejected. Transport identity comes only from Slack event metadata, not JSON.
+
+Authenticated trusted bots may alternatively preserve that exact envelope in one strictly validated section/plain_text block when fallback text is identical or has only CRLF/LF replaced by one space. An explicit plain_text command block must agree even when fallback text is already canonical; extra blocks/fields or conflicting commands reject. Ordinary rich_text display blocks do not supply commands. This narrow transport adapter does not relax the envelope parser and is never used for human decisions or fetched human evidence. See [transport boundaries](DESKTOP.md#slack-传输兼容边界) for the full schema and live-verification limitation.
 
 Events persist before acknowledgement. Command IDs are scoped to an authenticated principal; repeated exact requests execute once, conflicting reuse does not execute. The internal operation ID is separate and used as the backend clientUserMessageId. A bot cannot consume an unrelated human's approval-template ID.
 

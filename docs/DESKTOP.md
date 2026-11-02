@@ -42,3 +42,13 @@ Draft PR 的同仓限定路径触发两个标准 macOS runner（arm64/x64），�
 **预览构建未签名、未公证，不代表已满足 macOS 分发安全要求。** 不提供关闭 Gatekeeper 或降低系统保护的步骤；正式便捷分发需所有者提供正常签名/公证配置。托盘、系统登录项、Keychain、真实 Slack、共享会话及睡眠唤醒仍需目标机器验收，不能由纯 mock 测试或打包成功代替。
 
 依据：[Electron 安全检查清单](https://www.electronjs.org/docs/latest/tutorial/security/)、[safeStorage](https://www.electronjs.org/docs/latest/api/safe-storage)、[系统登录项 API](https://www.electronjs.org/docs/latest/api/app#appsetloginitemsettingssettings-macos-windows)、[内置 Node 模式](https://www.electronjs.org/docs/latest/api/environment-variables#electron_run_as_node)。
+
+## Slack 传输兼容边界
+
+原有命令仍要求完整消息内开始/结束标记独占行；不搜索引用、代码块或自然语言中的命令。普通旧消息可继续使用严格 `event.text`，Slack 自动生成的 rich_text 仅用于显示。若存在显式 section/plain_text 命令 block，则无论 fallback 是否已经有效，都必须验证完整结构和文本一致性；不能利用相互矛盾的两个命令来源。
+
+仅在已经校验工作区、频道和完整 bot 身份的消息中，如果 `event.text` 因换行传输而不符合 envelope 格式，可使用**唯一一个** `section` / `plain_text` block 保留的原文。该 block 必须本身通过同一严格解析；仅允许可选 `block_id` 和布尔 `emoji`，不能有 accessory、fields 或其他 block。fallback text 必须逐字等于 block 原文，或逐字等于其将每个换行替换为一个空格的结果；不 trim、不合并任意空白、不解码 HTML、不猜测 JSON。block 上限 3,000 字符。人类审批及服务器查询到的人类审批证据不使用此兼容路径。
+
+这一边界有合成事件回归测试。现场不同 Slack 读取接口曾显示不同的换行投影，尚未取得原始 Socket Mode 事件证明，因此不把此次增强描述成已确认的现场根因修复；安装新版后仍需只读 `capabilities` 验证。
+
+依据：[Slack section block](https://docs.slack.dev/reference/block-kit/blocks/section-block/)、[plain_text 对象](https://docs.slack.dev/reference/block-kit/composition-objects/text-object/)。
