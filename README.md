@@ -39,8 +39,8 @@ node dist/src/cli.js init
 - `projects`：项目别名→绝对路径。这些根目录限制只读文件工具；默认会话控制允许根目录及其子目录，发现操作则列出共享 daemon 全部可见会话并给出限制原因。
 - `sessionPolicy.allowAllSharedSessions`：仅可在本机配置的显式开关，默认 `false`。设为 `true` 后允许绑定同账户共享 daemon 中项目根以外的会话；**不会扩大 files.* 的 roots**，也不覆盖原会话沙箱。Slack 不能更改此开关。
 - `backend.executable`：原生 Codex 可执行文件，或 npm 包的绝对 `bin/codex.js`。Windows 不支持 `.cmd/.bat` shell shim。
-- `backend.expectedVersion`：显式版本门槛。当前 schema 证据来自 `0.166.0-alpha.1`，并不等于该 alpha 的完整集成已通过。换版本需重新核对协议。
-- `backend.autoStartDaemon`：默认 `false`。由本机操作者设为 `true`，可在版本检查通过后调用一次官方 `app-server daemon start`，再连接proxy；15秒超时、失败只报告、不重复启动。不能与显式socketPath同时使用。官方start可能按Codex现有配置准备daemon包/管理更新器，连接器不修改其自动更新策略；不会显式执行stop/update或提权。
+- `backend.expectedVersion`：可选的显式版本门槛，**默认省略，不限制 Codex 版本号**；只有你主动填写时才要求完全匹配。已有配置不会被自动修改；要取消旧门槛，删除该字段并重启。连接器仍报告实际版本、检查协议能力；省略不等于保证所有版本兼容。当前历史 schema 证据来自 `0.166.0-alpha.1`，不是默认安装要求。
+- `backend.autoStartDaemon`：默认 `false`。由本机操作者设为 `true`，可在版本探测（以及配置了显式门槛时的匹配检查）后调用一次官方 `app-server daemon start`，再连接proxy；15秒超时、失败只报告、不重复启动。不能与显式socketPath同时使用。官方start可能按Codex现有配置准备daemon包/管理更新器，连接器不修改其自动更新策略；不会显式执行stop/update或提权。
 - `backend.socketPath`：可选；通常省略，由 **Codex 自己**选择默认共享 socket，连接器不猜路径。
 
 **共享 daemon 必须在同一非管理员 OS 账户下可用。** 默认需要先启动；可由操作者选择上述冷启动开关，再结合系统启动模板。连接器从不自动执行 `daemon stop`，不抢占 `--no-daemon` 独立进程，不读 rollout/session 文件。若默认 daemon 不可用，`capabilities` 显示失败，仍可用 help/只读文件工具；不会假装接管成功。

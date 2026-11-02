@@ -1,6 +1,6 @@
 # Cold-start option added in0.2
 
-`backend.autoStartDaemon` defaults to false. The local operator may set it to true to run fixed `codex app-server daemon start` once after version verification, before connecting the shared proxy. Timeout 15 seconds; no retry storm, stop/update call or elevation. Do not combine it with explicit `socketPath`. Official Codex start can provision its daemon package/manage its updater according to the existing Codex settings; this connector does not alter update policy. On failure capabilities reports the outcome and the server stays available for help/status. Actual startup on each OS still needs validation.
+`backend.autoStartDaemon` defaults to false. The local operator may set it to true to run fixed `codex app-server daemon start` once after version probing (and matching only when optional expectedVersion is explicitly configured), before connecting the shared proxy. Timeout 15 seconds; no retry storm, stop/update call or elevation. Do not combine it with explicit `socketPath`. Official Codex start can provision its daemon package/manage its updater according to the existing Codex settings; this connector does not alter update policy. On failure capabilities reports the outcome and the server stays available for help/status. Actual startup on each OS still needs validation.
 
 Without this option, the shared daemon must already be available under the same nonprivileged account. Connector autostart alone is not full cold-boot readiness.
 

@@ -29,7 +29,6 @@
   },
   "backend": {
     "executable": "/absolute/path/to/codex",
-    "expectedVersion": "0.166.0-alpha.1",
     "autoStartDaemon": false
   },
   "approvalTimeoutSec": 300,

@@ -63,7 +63,7 @@ notes=f'''# Codex Connector {args.tag} — macOS 首轮实测预发布
 
 ## 边界与验收
 自动化使用 Node.js22 构建、严格类型检查和 mock/fake 测试；不运行真实 Codex、不连接 Slack、不安装服务、不发布 npm。
-当前协议证据来自 Codex 0.166.0-alpha.1；不同版本须验证共享 proxy/queue 能力。`sessionPolicy.allowAllSharedSessions` 和 `backend.autoStartDaemon` 都默认false，只由本机操作者选择；前者不扩大文件根，后者遵循 Codex 自身daemon/updater策略，不能与显式socketPath组合。
+默认不填写 `backend.expectedVersion`，因此不限制 Codex 版本号；只在主动填写时要求完全匹配。已有配置需由用户删除该字段并重启，程序不会自动改写。实际版本仍会报告，共享 proxy/queue 接口不兼容仍明确报错；历史协议证据来自 Codex 0.166.0-alpha.1，并非默认安装要求。`sessionPolicy.allowAllSharedSessions` 和 `backend.autoStartDaemon` 都默认false，只由本机操作者选择；前者不扩大文件根，后者遵循 Codex 自身daemon/updater策略，不能与显式socketPath组合。
 
 **真实 macOS、Slack、活动共享会话接管、跨客户端审批及睡眠唤醒仍未验收。** 合并/Actions成功不代表这些已验证。请先用可丢弃测试会话检查 help→capabilities→list→attach→send→人工审批，再测试重连；不要批量绑定生产会话或发送真实秘密。详见完整配置指南和 docs/RUNTIME-VERIFICATION.md。\n'''
 (out/'RELEASE-NOTES.zh-CN.md').write_text(notes)

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { createServer,request as httpRequest } from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join,resolve } from 'node:path';
 import { apiServer } from '../src/server.js';
 import { fixture,waitFor } from './helpers.js';
@@ -23,4 +24,18 @@ test('real CLI↔authenticated API command+status, ambient proxy bypass, no remo
     const wrongHost=await new Promise<number|undefined>((r,j)=>{const q=httpRequest(url,{method:'POST',headers:{...headers,Host:'evil.invalid'}},response=>{response.resume();response.on('end',()=>r(response.statusCode));});q.on('error',j);q.end('{}');});assert.equal(wrongHost,401);
     assert.equal((await fetch(url,{method:'POST',headers,body:JSON.stringify({action:'command',envelope:{v:1,id:'a',target:'test',command:'approval.respond',params:{requestId:'r',epoch:'e',sessionId:'s',turnId:'t',decision:'accept'}}})})).status,400);
   }finally{await new Promise<void>(r=>proxy.close(()=>r()));await new Promise<void>(r=>server.close(()=>r()));await f.cleanup();}
+});
+
+test('init and example omit default version pin without rewriting an existing explicit pin',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'connector-init-no-pin-'));
+  try {
+    const cli=()=>exec(process.execPath,[resolve('dist/src/cli.js'),'init','--home',dir]);
+    await cli();
+    const path=join(dir,'config.json'),config=JSON.parse(readFileSync(path,'utf8'));
+    assert.equal(Object.hasOwn(config.backend,'expectedVersion'),false);
+    assert.equal(Object.hasOwn(JSON.parse(readFileSync('config.example.json','utf8')).backend,'expectedVersion'),false);
+    config.backend.expectedVersion='operator-chosen-version';writeFileSync(path,JSON.stringify(config));
+    await cli();
+    assert.equal(JSON.parse(readFileSync(path,'utf8')).backend.expectedVersion,'operator-chosen-version');
+  } finally {rmSync(dir,{recursive:true,force:true});}
 });

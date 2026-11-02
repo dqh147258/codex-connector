@@ -78,7 +78,7 @@ SLACK_BOT_TOKEN=xoxb-替换为自己的令牌
 | `slack.trustedBots` | **dot** 的 `botId: B…`、`userId: U…`、`appId: A…`；三者都必须匹配，不是新建 connector 的 ID |
 | `projects` | 项目别名到现存本机目录绝对路径，例如 `{"demo":"/Users/carl/work/demo"}` |
 | `backend.executable` | 实际 Codex 原生程序或 npm 的 `bin/codex.js` 绝对路径 |
-| `backend.expectedVersion` | 当前协议证据版本为 `0.166.0-alpha.1`；不同版本不能仅改字符串就当作兼容 |
+| `backend.expectedVersion` | 可选，默认不填，因此不限制版本号；只有主动填写才要求完全匹配。已有配置删除该字段并重启即可取消旧门槛，实际版本与接口错误仍会报告 |
 
 ### 找到频道与 dot 的 ID
 
@@ -124,12 +124,11 @@ node -e 'console.log(require("node:fs").realpathSync(process.argv[1]))' "$(comma
 "sessionPolicy": { "allowAllSharedSessions": false },
 "backend": {
   "executable": "/替换为真实绝对路径/codex",
-  "expectedVersion": "0.166.0-alpha.1",
   "autoStartDaemon": false
 }
 ```
 
-**默认共享 daemon 要已在同一普通账户下可用。** 如果你明确希望 connector 冷启动时帮忙启动它，可在本机把 `autoStartDaemon` 改成 `true`：版本匹配后会调用一次官方 `app-server daemon start`，超时 15 秒，不会主动 stop/update 或提权；但官方启动本身可能准备 daemon 包、管理已有 updater，受你现有 Codex 设置影响。不能同时指定 `socketPath`；通常省略 socketPath，让 Codex 选默认共享 socket。
+**默认共享 daemon 要已在同一普通账户下可用。** 如果你明确希望 connector 冷启动时帮忙启动它，可在本机把 `autoStartDaemon` 改成 `true`：版本探测后（仅主动填写 expectedVersion 时额外检查匹配）会调用一次官方 `app-server daemon start`，超时 15 秒，不会主动 stop/update 或提权；但官方启动本身可能准备 daemon 包、管理已有 updater，受你现有 Codex 设置影响。不能同时指定 `socketPath`；通常省略 socketPath，让 Codex 选默认共享 socket。
 
 `projects` 同时限定默认可控会话位置与只读文件根。只有你明确要管理项目根以外的同账户共享会话时，才在本机启用 `allowAllSharedSessions:true`；它**不扩大 files.* 的只读根、不取消原会话沙箱**。不要把整个 home 配成项目根来规避限制。
 

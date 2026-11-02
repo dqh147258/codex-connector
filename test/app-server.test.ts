@@ -41,6 +41,16 @@ test('shared proxy version/initialize handshake, fixed transport, optional socke
     assert.ok(f.readLog().filter(x => x.kind === 'message').every(x => !Object.keys(x.value.params || {}).some(k => ['sandbox', 'sandboxPolicy', 'approvalPolicy', 'permissions', 'model', 'effort'].includes(k))));
   } finally { await f.close(); }
 });
+test('omitted expectedVersion accepts a different reported version and keeps diagnostics', async () => {
+  const f = setup({ version: '9.8.7-preview.2' });
+  try {
+    await f.server.connect();
+    assert.equal(f.server.connected, true);
+    assert.equal(f.server.capabilities().version, '9.8.7-preview.2');
+    assert.equal(f.server.capabilities().expectedVersion, null);
+    assert.deepEqual(f.readLog().filter(x => x.kind === 'launch').map(x => x.args), [['--version'], ['app-server', 'proxy']]);
+  } finally { await f.close(); }
+});
 test('version mismatch fails before proxy launch and never falls back to standalone app-server', async () => {
   const f = setup({ expectedVersion: 'different-version' });
   try {
