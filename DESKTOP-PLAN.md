@@ -1,6 +1,6 @@
 # Electron desktop implementation plan
 
-Status: desktop implementation and local automated QA complete; independent security review passed. Both native macOS arm64/x64 build, bundled runtime and mock-UI screenshot jobs passed at commit 43960e6; the narrow Slack block-transport compatibility delta requires its own CI rebuild. Live Slack/shared-session, Keychain and login-item acceptance remain pending. No Codex is used to implement this application.
+Status: desktop implementation and native macOS arm64/x64 preview builds passed at commit 3903ada. The operator’s main-branch WebSocket proxy fix bd79e3d is now integrated while preserving the desktop UI and strict Slack transport adapter; local typecheck and 123 tests pass, refreshed macOS packaging is pending. Operator-reported live checks are recorded separately from automated fixture tests. Activity/approval, Keychain and login-item acceptance remain pending. No Codex is used to implement this application.
 
 ## Goal
 Turn the existing connector into a desktop application for ordinary users: guided local setup, clear Slack identity lookup, private credential storage, observable connection tests, start/stop/diagnostics and explicit login startup. Preserve the reviewed server protocol, permissions and durable state model.

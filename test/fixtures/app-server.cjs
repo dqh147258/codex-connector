@@ -1,5 +1,7 @@
 // Local-only shared app-server protocol fixture. NOT Codex. No network or models.
-const { createInterface } = require('node:readline');
+const { Server } = require('node:http');
+const { Duplex } = require('node:stream');
+const { WebSocketServer } = require('ws');
 const { appendFileSync } = require('node:fs');
 const args = process.argv.slice(2);
 const record = value => { if (process.env.CONNECTOR_FIXTURE_LOG) appendFileSync(process.env.CONNECTOR_FIXTURE_LOG, JSON.stringify(value) + '\n'); };
@@ -11,11 +13,11 @@ if (args.length === 1 && args[0] === '--version') {
 if(args.join(' ')==='app-server daemon start'){if(process.env.CONNECTOR_FIXTURE_DAEMON_FAIL)process.exit(40);if(process.env.CONNECTOR_FIXTURE_DAEMON_DELAY){setTimeout(()=>{process.stdout.write('started-or-already-running\n');process.exit(0);},200);return;}process.stdout.write('started-or-already-running\n');process.exit(0);}
 if (args[0] !== 'app-server' || args[1] !== 'proxy' || (args.length !== 2 && !(args.length === 4 && args[2] === '--sock'))) process.exit(91);
 if (process.env.SLACK_APP_TOKEN || process.env.SLACK_BOT_TOKEN || process.env.CONNECTOR_TOKEN) process.exit(92);
-const reply = value => process.stdout.write(JSON.stringify(value) + '\n');
+let socket;
+const reply = value => socket.send(JSON.stringify(value));
 const forbidden = ['sandbox', 'sandboxPolicy', 'approvalPolicy', 'permissions', 'config', 'model', 'effort'];
 let initialized = false, turnSequence = 0;
-const lines = createInterface({ input: process.stdin });
-lines.on('line', line => {
+const message = line => {
   let m; try { m = JSON.parse(line); } catch { process.exit(93); }
   record({ kind: 'message', value: m });
   if (m.jsonrpc) process.exit(94);
@@ -29,7 +31,13 @@ lines.on('line', line => {
   if (forbidden.some(key => Object.hasOwn(m.params || {}, key))) process.exit(97);
   if (m.params?.threadId === 'fixture-timeout') return;
   if (m.params?.threadId === 'fixture-exit') process.exit(23);
-  if (m.params?.threadId === 'fixture-malformed') { process.stdout.write('not-json\n'); return; }
+  if (m.params?.threadId === 'fixture-malformed') { socket.send('not-json'); return; }
+  if (m.params?.threadId === 'fixture-binary') { socket.send(Buffer.from('{}')); return; }
+  if (m.params?.threadId === 'fixture-oversized') { socket.send(' '.repeat(8 * 1024 * 1024 + 1)); return; }
+  if (m.params?.threadId === 'fixture-fragmented') {
+    const response = JSON.stringify({ id:m.id, result:{ thread:{ id:'fragmented-thread' } } });
+    socket.send(response.slice(0,10),{fin:false});socket.ping('fixture');socket.send(response.slice(10),{fin:true});return;
+  }
   if (m.params?.threadId === 'fixture-missing-result') { reply({ id: m.id }); return; }
   if (m.params?.threadId === 'fixture-both-result-error') { reply({ id: m.id, result: {}, error: { code: -32603, message: 'conflicting outcome' } }); return; }
   if (m.params?.threadId === 'fixture-invalid-id') { reply({ id: { invalid: m.id }, result: {} }); return; }
@@ -52,5 +60,19 @@ lines.on('line', line => {
   }
   if (m.method === 'turn/steer' || m.method === 'turn/interrupt') { reply({ id: m.id, result: {} }); return; }
   reply({ id: m.id, error: { code: -32601, message: 'Unknown fixture method' } });
+};
+// The real CLI proxy tunnels the WebSocket HTTP upgrade and frames over stdio.
+// No TCP listener is needed for this fixture.
+const server = new Server();
+const wss = new WebSocketServer({ noServer:true, perMessageDeflate:false });
+server.on('upgrade',(request,stream,head)=>{
+  record({kind:'upgrade',host:request.headers.host,upgrade:request.headers.upgrade});
+  if(args[3]==='/fixture/reject-upgrade') { stream.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');return; }
+  wss.handleUpgrade(request,stream,head,connection=>{
+    socket=connection;
+    socket.on('message',(data,isBinary)=>{if(isBinary)process.exit(98);message(data.toString());});
+    socket.on('error',()=>process.exit(99));
+    socket.on('close',()=>{record({kind:'proxyClosed'});process.exit(0);});
+  });
 });
-lines.on('close', () => { record({ kind: 'proxyClosed' }); process.exit(0); });
+server.emit('connection',Duplex.from({readable:process.stdin,writable:process.stdout}));
