@@ -1,6 +1,6 @@
 # Codex Connector server redesign plan
 
-Status: implementation and local fake integration complete; independent final review/publication in progress. Real shared-daemon takeover acceptance remains blocked by this execution environment. Work uses handwritten TypeScript and local fake tests; Codex is **not** used to implement code. Separate capability research may invoke an isolated Codex app-server only under the user's testing authorization.
+Status: implementation and local fake integration complete; published as Draft PR #1 (https://github.com/dqh147258/codex-connector/pull/1), awaiting live acceptance. No merge.
 
 ## Required outcome
 
@@ -17,6 +17,6 @@ A least-privilege Windows/Linux/macOS background server receives strict, authent
 
 ## Runtime evidence / limits
 
-Installed research CLI: `0.166.0-alpha.1`. Its generated schema uses thread sandbox `read-only` (not the old implementation's `readOnly`), exposes shared-session rejoin on `thread/resume`, `canAcceptDirectInput`, and queue APIs. Shared-daemon launch currently fails in this execution environment (`package link escapes its root`); isolated thread creation also fails a sandbox-helper directory check. These are unresolved runtime acceptance gates, not a reason to disable protections. Existing user sessions and the protected `/home/agent/.codex/sessions` path are not accessed.
+Installed research CLI: `0.166.0-alpha.1`. Its generated schema uses thread sandbox `read-only` (not the old implementation's `readOnly`), exposes shared-session rejoin on `thread/resume`, `canAcceptDirectInput`, and queue APIs. Shared-daemon launch currently fails in this execution environment (`package link escapes its root`); isolated thread creation also fails a sandbox-helper directory check. These are unresolved runtime acceptance gates, not a reason to disable protections. Existing user sessions and existing private session storage are not accessed.
 
 Real Slack credentials, paid model turns, real user-session mutation, native Windows/macOS end-to-end validation, and service activation remain outside this implementation run. Any unproven shared-session behavior will be labeled unverified rather than claimed as passed.

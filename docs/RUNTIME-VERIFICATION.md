@@ -2,7 +2,7 @@
 
 ## Allowed test scope
 
-The user explicitly permitted starting Codex **to test app-server capabilities**, not to implement/write this connector. A separate research worker used isolated test configuration and no paid model turns. Implementation and all repository tests use handwritten TypeScript and a pure Node fixture. No real user sessions were modified. The protected `/home/agent/.codex/sessions` path was not read directly or through APIs.
+The user explicitly permitted starting Codex **to test app-server capabilities**, not to implement/write this connector. A separate research worker used isolated test configuration and no paid model turns. Implementation and all repository tests use handwritten TypeScript and a pure Node fixture. No real user sessions were modified. Existing private session storage was not read directly or through APIs.
 
 ## Observed installed CLI
 
