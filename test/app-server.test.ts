@@ -38,8 +38,36 @@ test('shared proxy version/initialize handshake, fixed transport, optional socke
     assert.deepEqual((await f.server.rpc('thread/turns/list', { threadId: 'shared-thread-1', limit: 10 })).data, []);
     const launches = f.readLog().filter(x => x.kind === 'launch'); assert.equal(launches.length, 2);
     assert.deepEqual(launches[0].args, ['--version']); assert.deepEqual(launches[1].args, ['app-server', 'proxy', '--sock', '/fixture/explicit-control.sock']);
+    assert.deepEqual(f.readLog().filter(x => x.kind === 'upgrade'), [{kind:'upgrade',host:'localhost',upgrade:'websocket'}]);
     assert.ok(f.readLog().filter(x => x.kind === 'message').every(x => !Object.keys(x.value.params || {}).some(k => ['sandbox', 'sandboxPolicy', 'approvalPolicy', 'permissions', 'model', 'effort'].includes(k))));
   } finally { await f.close(); }
+});
+test('proxy WebSocket framing reassembles fragmented responses and handles interleaved ping', async () => {
+  const f = setup();
+  try {
+    await f.server.connect();
+    assert.equal((await f.server.rpc('thread/read', {threadId:'fixture-fragmented'})).thread.id, 'fragmented-thread');
+    assert.equal((await f.server.rpc('thread/list', {})).data[0].id, 'shared-thread-1');
+  } finally { await f.close(); }
+});
+test('rejected WebSocket upgrade never reports a connected backend or sends initialize', async () => {
+  const f = setup({socketPath:'/fixture/reject-upgrade'});
+  try {
+    await assert.rejects(f.server.connect(), errorCode('PROXY_TRANSPORT_FAILED'));
+    assert.equal(f.server.connected, false);
+    assert.equal(f.readLog().filter(x => x.kind === 'message').length, 0);
+  } finally { await f.close(); }
+});
+test('binary and oversized WebSocket messages disconnect without retrying the RPC', async () => {
+  for (const threadId of ['fixture-binary','fixture-oversized']) {
+    const f = setup();
+    try {
+      await f.server.connect();
+      await assert.rejects(f.server.rpc('thread/read', {threadId}), errorCode('RPC_OUTCOME_UNCERTAIN'));
+      assert.equal(f.server.connected, false);
+      assert.equal(f.readLog().filter(x => x.kind === 'message' && x.value.params?.threadId === threadId).length, 1);
+    } finally { await f.close(); }
+  }
 });
 test('omitted expectedVersion accepts a different reported version and keeps diagnostics', async () => {
   const f = setup({ version: '9.8.7-preview.2' });

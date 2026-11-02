@@ -1,6 +1,8 @@
 import { EventEmitter } from 'node:events';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createInterface } from 'node:readline';
+import { Duplex } from 'node:stream';
+import type { Socket } from 'node:net';
+import WebSocket from 'ws';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import type { Backend, Config } from './types.js';
@@ -13,7 +15,7 @@ export function codexLaunch(path: string, args: string[]) {
 }
 export class SharedAppServer extends EventEmitter implements Backend {
   epoch = ''; connected = false;
-  private child?: ChildProcessWithoutNullStreams; private connecting?: Promise<void>; private counter = 0;
+  private child?: ChildProcessWithoutNullStreams; private socket?: WebSocket; private connecting?: Promise<void>; private counter = 0;
   private pending = new Map<number, {resolve:(x:any)=>void;reject:(e:Error)=>void;timer:NodeJS.Timeout}>();
   private unsupported = new Set<string>(); private version = ''; private lastFailure = ''; private stopped = false; private daemonStartAttempted=false; private daemonStartResult='not-requested';
   constructor(private config: Config['backend'], private timeoutMs = 30000) { super(); }
@@ -24,7 +26,7 @@ export class SharedAppServer extends EventEmitter implements Backend {
   }
   private async open() {
     try {
-      const previous = this.child; this.child = undefined; previous?.stdin.end(); previous?.kill();
+      const previous = this.child; this.child = undefined; this.socket?.terminate(); this.socket = undefined; previous?.stdin.end(); previous?.kill();
       const versionCommand = codexLaunch(this.config.executable, ['--version']);
       const env = {...process.env}; delete env.SLACK_APP_TOKEN; delete env.SLACK_BOT_TOKEN; delete env.CONNECTOR_TOKEN;
       const v = await runFile(versionCommand.file, versionCommand.args, { env, timeout:10000, maxBuffer:4096, shell:false, windowsHide:true });
@@ -44,18 +46,36 @@ export class SharedAppServer extends EventEmitter implements Backend {
       const epoch = randomUUID(); this.epoch = epoch;
       child.stderr.on('data', () => {}); // Never leak raw local errors or credentials.
       child.stdin.on('error', () => { if(this.child===child) this.disconnect('PROXY_WRITE_FAILED'); });
-      createInterface({input:child.stdout}).on('line', line => {
+      // The official proxy is a byte tunnel to a WebSocket endpoint, not the
+      // newline-delimited JSON transport used by an independent stdio server.
+      const stream = Duplex.from({readable:child.stdout,writable:child.stdin});
+      const socket = new WebSocket('ws://localhost/', {
+        // ws/http accept a Duplex here; no TCP connection is made.
+        createConnection: () => stream as Socket,
+        handshakeTimeout:this.timeoutMs, maxPayload:8*1024*1024, perMessageDeflate:false,
+      }); this.socket = socket;
+      // Reject HTTP failures before Node tries to keep this non-TCP stream alive.
+      socket.on('unexpected-response', (_request,response) => { response.destroy(); socket.terminate(); });
+      socket.on('error', () => { if(this.child===child) this.disconnect('PROXY_TRANSPORT_FAILED'); });
+      socket.on('close', () => { if(this.child===child) this.disconnect('PROXY_DISCONNECTED'); });
+      socket.on('message', (data, isBinary) => {
         if(this.child!==child || this.epoch!==epoch) return;
-        if (line.length > 8*1024*1024) { this.disconnect('PROTOCOL_LIMIT'); child.kill(); return; }
-        try { this.message(JSON.parse(line),epoch); } catch { this.disconnect('INVALID_PROTOCOL'); child.kill(); }
+        try { if(isBinary)throw new BackendError('INVALID_PROTOCOL'); this.message(JSON.parse(data.toString()),epoch); }
+        catch { this.disconnect('INVALID_PROTOCOL'); socket.terminate(); child.kill(); }
       });
       child.on('error', () => { if(this.child===child) this.disconnect('PROXY_START_FAILED'); });
-      child.on('close', () => { if (this.child === child) { this.child = undefined; this.disconnect('PROXY_DISCONNECTED'); } });
+      child.on('close', () => { socket.terminate(); if (this.child === child) { this.child = undefined; this.disconnect('PROXY_DISCONNECTED'); } });
+      await new Promise<void>((resolve,reject)=>{
+        socket.once('open',resolve);
+        socket.once('error',()=>reject(new BackendError('PROXY_TRANSPORT_FAILED')));
+        socket.once('close',()=>reject(new BackendError('PROXY_DISCONNECTED')));
+      });
+      if(this.stopped)throw new BackendError('BACKEND_STOPPED');
       await this.request('initialize', {clientInfo:{name:'codex_connector',title:'Codex Connector',version:'0.2.0'},capabilities:{experimentalApi:true}});
       await this.write({method:'initialized',params:{}}); this.connected = true; this.lastFailure = ''; this.unsupported.clear();
     } catch (e) {
       this.lastFailure = e instanceof BackendError ? e.code : 'SHARED_DAEMON_UNAVAILABLE';
-      this.child?.kill(); throw new BackendError(this.lastFailure);
+      this.socket?.terminate(); this.child?.kill(); throw new BackendError(this.lastFailure);
     }
   }
   private disconnect(code: string) {
@@ -65,8 +85,8 @@ export class SharedAppServer extends EventEmitter implements Backend {
   }
   private write(message: unknown): Promise<void> {
     return new Promise((resolve,reject) => {
-      if (!this.child?.stdin.writable) { reject(new BackendError('BACKEND_UNAVAILABLE')); return; }
-      this.child.stdin.write(JSON.stringify(message)+'\n', e => e ? reject(new BackendError('RPC_OUTCOME_UNCERTAIN')) : resolve());
+      if (this.socket?.readyState !== WebSocket.OPEN) { reject(new BackendError('BACKEND_UNAVAILABLE')); return; }
+      this.socket.send(JSON.stringify(message), e => e ? reject(new BackendError('RPC_OUTCOME_UNCERTAIN')) : resolve());
     });
   }
   private request(method: string, params: unknown): Promise<any> {
@@ -95,6 +115,7 @@ export class SharedAppServer extends EventEmitter implements Backend {
   async close() {
     this.stopped=true;if(this.connecting)await this.connecting.catch(()=>{});const child=this.child;this.disconnect('STOPPED');if(!child)return;
     // End only this proxy connection. Never daemon stop, process-name kills, or shared-turn interruption.
+    this.socket?.close();
     child.stdin.end();
     await new Promise<void>((resolve,reject)=>{
       const timer=setTimeout(()=>{ child.kill(); const force=setTimeout(()=>reject(new BackendError('PROXY_CLOSE_UNCONFIRMED')),2000);child.once('close',()=>{clearTimeout(force);resolve();}); },2000);

@@ -17,7 +17,7 @@ async function start(){
   const config=loadConfig(),token=readToken(),appToken=process.env.SLACK_APP_TOKEN,botToken=process.env.SLACK_BOT_TOKEN;
   if(!appToken?.startsWith('xapp-')||!botToken?.startsWith('xoxb-'))throw Error('Slack app/bot tokens required only in daemon environment');
   const store=new Store(home()),slack=new SlackClient(botToken),backend=new SharedAppServer(config.backend),connector=new Connector(config,store,backend,slack),server=apiServer(connector,token);
-  const socket=new SocketModeClient({appToken,logLevel:LogLevel.ERROR});let stopping=false;let stopTask:Promise<void>|undefined;let timer:NodeJS.Timeout|undefined;let tick=Promise.resolve();
+  const socket=new SocketModeClient({appToken,logLevel:LogLevel.ERROR});let stopping=false;let stopTask:Promise<void>|undefined;let timer:NodeJS.Timeout|undefined;let tick:Promise<void>|undefined;
   const stop=()=>stopTask??=(async()=>{stopping=true;if(timer)clearInterval(timer);await socket.disconnect().catch(()=>{});await new Promise<void>(r=>server.close(()=>r()));await tick;await connector.close();store.close();})();
   const onSignal=()=>{void stop().catch(()=>{console.error('Shutdown uncertain; inspect proxy and lock before restart.');process.exitCode=1;});};process.once('SIGINT',onSignal);process.once('SIGTERM',onSignal);
   socket.on('message',async({body,ack}:any)=>{try{connector.accept(body);await ack();connector.pump();connector.flush();}catch{console.error('Event was not durably accepted; no acknowledgement. Check storage/queue.');}});
@@ -25,7 +25,7 @@ async function start(){
   try{
     const auth=await slack.web.auth.test();if(stopping)return;if(auth.team_id!==config.slack.teamId)throw Error('WORKSPACE_MISMATCH');connector.selfUserId=auth.user_id||'';connector.selfBotId=auth.bot_id||'';
     await connector.initialize();if(stopping)return;await new Promise<void>((r,j)=>{server.once('error',j);server.listen(config.port,'127.0.0.1',r);});if(stopping)return;await socket.start();if(stopping){await socket.disconnect().catch(()=>{});return;}
-    timer=setInterval(()=>{tick=tick.then(async()=>{if(!backend.connected)await connector.reconnect();await connector.expire();connector.pump();connector.flush();}).catch(()=>console.error('Connector background operation unavailable; inspect status.'));},5000);
+    timer=setInterval(()=>{if(stopping||tick)return;tick=(async()=>{if(!backend.connected)await connector.reconnect();await connector.expire();connector.pump();connector.flush();})().catch(()=>console.error('Connector background operation unavailable; inspect status.')).finally(()=>{tick=undefined;});},5000);
     console.log(`Connector ${config.instanceId} online at127.0.0.1:${config.port}; shared backend connected=${backend.connected}. Use status for capability failures.`);
   }catch{await stop();throw Error('Startup failed; check config, identities, tokens, port and network. Raw credentials/errors withheld.');}
 }

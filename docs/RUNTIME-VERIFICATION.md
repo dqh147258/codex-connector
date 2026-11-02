@@ -1,5 +1,21 @@
 # Runtime capability evidence — 2026-11-02
 
+## Local macOS verification after the proxy transport fix
+
+The operator requested that the already-configured local app be made runnable. Read-only checks confirmed valid Slack bot authentication, the configured workspace, and dot's exact bot/user/app identity. An exited connector had left a stale lock; its PID and the unused API port were verified before removing that lock.
+
+The invoking Codex environment inherited a `CODEX_HOME` for a separate proxy installation. Clearing that override for this connector launch let the official CLI select the ordinary user's existing shared daemon. No daemon restart, update, socket permission change, or session policy change was needed.
+
+- Installed CLI: `0.165.0`; running shared app-server: `0.166.0`.
+- The official `app-server proxy` is a raw byte tunnel, **not** a newline-delimited JSON server. Sending JSON lines did not initialize it. An HTTP WebSocket upgrade returned `101 Switching Protocols`.
+- The corrected connector performs the WebSocket upgrade over the same official proxy's stdin/stdout, then exchanges JSON RPC messages in text frames. It retains the RPC allowlist, credential filtering, and bounded message size.
+- The corrected backend completed `initialize` / `initialized` against the existing daemon. Read-only `thread/loaded/list` returned 21 IDs at verification time; `thread/list` returned metadata and a pagination cursor. No session content is included in this report.
+- The local fixture now requires the real HTTP upgrade and WebSocket framing. Regression checks cover fragmented responses with interleaved ping, rejected upgrades, binary/oversized messages, disconnect/reconnect, and proxy shutdown without a lingering WebSocket close timer.
+- Slack Socket Mode started successfully; both configured channels passed read-only history access checks. The fixed connector runs as a detached background process with private logs. Its authenticated local API returned `connected:true` and `lastFailure:null` on `127.0.0.1:17381`.
+- The background maintenance loop now skips overlapping ticks instead of accumulating reconnect retries that could delay shutdown. `npm test` passed all 77 tests.
+
+No paid model turn, session attachment, steering, interruption, human approval, or Slack message was sent during these checks. Those remain separate acceptance gates. The evidence below records the earlier restricted-environment investigation and its historical blockers.
+
 ## Allowed test scope
 
 The user explicitly permitted starting Codex **to test app-server capabilities**, not to implement/write this connector. A separate research worker used isolated test configuration and no paid model turns. Implementation and all repository tests use handwritten TypeScript and a pure Node fixture. No real user sessions were modified. Existing private session storage was not read directly or through APIs.
@@ -39,10 +55,10 @@ Only the configured official shared proxy transport is used. The default-off loc
 
 ## Outstanding acceptance gates
 
-1. On the user's normal machine, same-account default daemon/proxy connectivity and supported version.
+1. Same-account default daemon/proxy connectivity on native Windows and other untested environments; local macOS connectivity passed as recorded above.
 2. Discovery/attach/send/steer/queue/interrupt against an explicitly authorized real test session.
 3. Approval/user-input replay and resolution with two clients, including version-specific protected-human flows.
-4. Actual Slack bot source metadata, dot name resolution/mention, and human-message-reference fetch permissions.
+4. Actual Slack command event delivery, output mentions, and human-message-reference fetch permissions; local authentication, dot identity resolution, Socket Mode connection, and channel history access passed.
 5. Native Windows/macOS process lifecycle and service startup; Windows S4U limitations may require login startup instead.
 
 No broad claim that “all default sessions are controllable” is made before these gates pass.

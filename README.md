@@ -2,7 +2,7 @@
 
 这是一次**共享 daemon 架构重构**：不再只管理连接器自己启动的独立 app-server。连接器使用官方 `codex app-server proxy` 接入当前账户的默认共享 daemon；列出、显式绑定并管理它可见的会话。一个绑定会话对应一个输出 Slack thread，所有输出 `@` 配置并验证过的 dot 用户 ID。
 
-> **当前是待实机验收的 Draft 实现，不是“已经验证能接管所有会话”。** 编码没有启动 Codex；授权的独立能力探测确认了 CLI/schema，但此受限环境无法访问共享 daemon 的受保护运行目录，因此没有完成真实活动会话的接管/审批回放。完整证据和阻塞见 [runtime report](docs/RUNTIME-VERIFICATION.md)。不存在静默切回独立会话、关闭沙箱或修改受保护目录的降级路线。
+> **已在 macOS 实机验证共享 daemon 的 WebSocket 握手和只读会话发现，Slack 凭据与 dot 身份核验通过。** 真实活动会话的发送、接管和审批回放仍待专项验收，不代表所有会话均可管理。完整证据与验收范围见 [runtime report](docs/RUNTIME-VERIFICATION.md)。
 
 ## 已实现的边界
 
@@ -66,6 +66,8 @@ node dist/src/cli.js start
 ```
 
 令牌只放本机私有环境，不发给 dot、不写入 Git。`doctor` 不启动 Codex。实际 `start` 会检查 `--version`，按本机可选开关确保官方共享daemon启动，再启动 **proxy 客户端**；不是用 Codex写代码，也不是静默创建独立 app-server。没有真实 Slack 凭据时不要声称已连通。
+
+如果从另一个 Codex/代理环境启动，检查继承的 `CODEX_HOME` 是否对应目标共享 daemon。macOS/Linux 使用普通账户默认目录时，可运行 `env -u CODEX_HOME node --env-file="$HOME/.codex-connector/service.env" dist/src/cli.js start`；使用自定义 Codex 目录时应保留或显式设置对应的 `CODEX_HOME`。官方 `proxy` 只转发字节，连接器在其 stdio 管道上执行 WebSocket 握手和帧编解码。
 
 ## 2. dot 发指令：整条消息必须是这个格式
 
@@ -169,6 +171,6 @@ npm run typecheck
 npm test
 ```
 
-测试使用 fake Slack、fake shared-daemon protocol，包含严格消息边界、身份、重放、文件逃逸、审批错配/过期/敏感范围、断连、不确定状态、outbox、真实 CLI 本地 HTTP 及三系统模板。实机 Windows/macOS、真实 Slack socket/mention/读取权限、实际默认活动会话接管和跨客户端审批回放尚未验收。未添加或触发 CI 工作流。
+测试使用 fake Slack、采用真实 WebSocket 帧的 fake shared-daemon protocol，包含严格消息边界、身份、重放、文件逃逸、审批错配/过期/敏感范围、断连、不确定状态、outbox、真实 CLI 本地 HTTP 及三系统模板。已在 macOS 验证真实 Slack Socket Mode、频道读取和默认共享 daemon 的只读会话发现；Windows、Slack 指令收发/mention、实际活动会话接管和跨客户端审批回放尚未验收。未添加或触发 CI 工作流。
 
 详细：[实现计划](PLAN.md) · [安全边界](docs/SECURITY.md) · [协议说明](docs/PROTOCOL.md) · [实际能力证据](docs/RUNTIME-VERIFICATION.md)
