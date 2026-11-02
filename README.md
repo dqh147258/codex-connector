@@ -2,7 +2,7 @@
 
 这是一次**共享 daemon 架构重构**：不再只管理连接器自己启动的独立 app-server。连接器使用官方 `codex app-server proxy` 接入当前账户的默认共享 daemon；列出、显式绑定并管理它可见的会话。一个绑定会话对应一个输出 Slack thread，所有输出 `@` 配置并验证过的 dot 用户 ID。
 
-> **当前是待实机验收的 Draft 实现，不是“已经验证能接管所有会话”。** 编码没有启动 Codex；授权的独立能力探测确认了 CLI/schema，但此受限环境无法访问共享 daemon 的受保护运行目录，因此没有完成真实活动会话的接管/审批回放。完整证据和阻塞见 [runtime report](docs/RUNTIME-VERIFICATION.md)。不存在静默切回独立会话、关闭沙箱或修改受保护目录的降级路线。
+> **用户上传的本机验证记录报告：已在 macOS 实机验证共享 daemon 的 WebSocket 握手和只读会话发现，Slack 凭据与 dot 身份核验通过。** 真实活动会话的发送、接管和审批回放仍待专项验收，不代表所有会话均可管理。完整证据与验收范围见 [runtime report](docs/RUNTIME-VERIFICATION.md)。
 
 ## 已实现的边界
 
@@ -15,6 +15,10 @@
 - 审批/输入精确绑定 **requestId + epoch + sessionId + turnId**；过期、重启、重复、错线程拒绝；不自动批准。
 - 持久命令 inbox 与独立 outbox；发送失败不会重跑 Codex；同一会话输出保序。
 - Linux / macOS / Windows 的登录/登录前启动**模板生成**，不自动安装、不提权、不保存系统登录密码。
+
+## 桌面预览界面
+
+Electron 桌面包装正在独立 Draft PR 中验收：图形向导、私密令牌、身份查询、连接诊断与登录启动。桌面包自带 Node/运行依赖，不要求普通用户 npm ci；与下方 CLI 源码安装不同。见 [桌面指南](docs/DESKTOP.md)。未签名/未公证及真实主机验收限制仍适用。
 
 ## 1. 安装和配置
 
@@ -67,9 +71,11 @@ node dist/src/cli.js start
 
 令牌只放本机私有环境，不发给 dot、不写入 Git。`doctor` 不启动 Codex。实际 `start` 会检查 `--version`，按本机可选开关确保官方共享daemon启动，再启动 **proxy 客户端**；不是用 Codex写代码，也不是静默创建独立 app-server。没有真实 Slack 凭据时不要声称已连通。
 
+如果从另一个 Codex/代理环境启动，检查继承的 `CODEX_HOME` 是否对应目标共享 daemon。macOS/Linux 使用普通账户默认目录时，可运行 `env -u CODEX_HOME node --env-file="$HOME/.codex-connector/service.env" dist/src/cli.js start`；使用自定义 Codex 目录时应保留或显式设置对应的 `CODEX_HOME`。官方 `proxy` 只转发字节，连接器在其 stdio 管道上执行 WebSocket 握手和帧编解码。
+
 ## 2. dot 发指令：整条消息必须是这个格式
 
-标记使用纯 ASCII 单词，避免 Slack `<`/`>` 转义。**不带代码围栏、@前缀、额外说明或重复标记。** 以下代码块只是文档展示，实际发送不要包括反引号：
+标记使用纯 ASCII 单词，避免 Slack `<`/`>` 转义。**不带代码围栏、额外说明或重复标记。** 可选地址仅为开头精确的 Connector 自身 `<@USER_ID>` 加一个空格或换行；之后仍必须是完整严格 envelope。 以下代码块只是文档展示，实际发送不要包括反引号：
 
 ```text
 CODEX_CONNECTOR_COMMAND_BEGIN
@@ -95,13 +101,13 @@ node dist/src/cli.js help --command session.create
 | 审批/输入 | `approval.list/respond`、`input.respond` |
 | 文件只读 | `files.list/stat/read/search` |
 
-`session.reply` 仅向已绑定输出 thread 发进度，不调用模型。文件工具没有写入、删除、执行命令能力；服务管理也不在远程命令清单中。
+`session.reply` 不调用模型；本地/Skill 调用向已有绑定 thread 发进度，Slack 调用则回复调用者所在 thread，不修改会话绑定。文件工具没有写入、删除、执行命令能力；服务管理也不在远程命令清单中。
 
 ## 3. 绑定已有默认会话
 
 1. `session.list {"limit":20}` 默认发现全部共享可见会话，返回 `manageable` / `reason`；可加 `project` 过滤。有 `nextCursor` 就继续分页，不能把第一页当全部。
 2. 选定明确的 `threadId`，发送 `session.attach {"threadId":"...","project":"demo"}`。对于项目外会话，先由操作者在本机启用 `sessionPolicy.allowAllSharedSessions` 并重启，再用 `session.attach {"threadId":"..."}`；无需把外部目录加入文件工具 roots。
-3. 返回 `sessionId`，连接器在配置的输出频道创建 thread 并 mention dot。
+3. 返回 `sessionId`。首次 Slack 绑定使用发起命令的原 Thread（顶层命令用该消息自身作为根），并在其中 mention dot；已有绑定不会移动。本地/Skill 首次绑定需要 `outputThreadTs` 指定配置输出频道内可读取的已有 Thread。
 4. 用同一 `sessionId` 发送后续命令：
 
 ```json
@@ -169,6 +175,12 @@ npm run typecheck
 npm test
 ```
 
-测试使用 fake Slack、fake shared-daemon protocol，包含严格消息边界、身份、重放、文件逃逸、审批错配/过期/敏感范围、断连、不确定状态、outbox、真实 CLI 本地 HTTP 及三系统模板。实机 Windows/macOS、真实 Slack socket/mention/读取权限、实际默认活动会话接管和跨客户端审批回放尚未验收。未添加或触发 CI 工作流。
+测试使用 fake Slack、采用真实 WebSocket 帧的 fake shared-daemon protocol，包含严格消息边界、身份、重放、文件逃逸、审批错配/过期/敏感范围、断连、不确定状态、outbox、真实 CLI 本地 HTTP 及三系统模板。用户上传的本机记录报告已在 macOS 验证真实 Slack Socket Mode、频道读取和默认共享 daemon 的只读会话发现；Windows、Slack 指令收发/mention、实际活动会话接管和跨客户端审批回放尚未验收。此处本机记录不包含 CI；当前桌面预览另有 macOS arm64/x64 Actions 构建与 mock 测试。
 
 详细：[实现计划](PLAN.md) · [安全边界](docs/SECURITY.md) · [协议说明](docs/PROTOCOL.md) · [实际能力证据](docs/RUNTIME-VERIFICATION.md)
+
+### 群聊回复不会刷到频道顶层
+
+命令成功、失败和格式错误都回复发起命令的原 Thread；顶层命令以该消息自身建立回复 Thread。异步 Codex 输出/审批继续留在既有会话绑定，后续从别的 Thread 查询不会偷偷改绑。找不到有效目的 Thread 时拒绝发送，不回退到群聊顶层。
+
+本地/Skill 新建或首次绑定时，在参数中提供 `outputThreadTs`（配置输出频道中已存在的 Slack Thread 根时间戳）；Connector 验证可读取后才启动新 Codex 会话。已有绑定仍可直接 `session.reply`。完整边界见 [协议说明](docs/PROTOCOL.md#reply-destination-and-explicit-address)。

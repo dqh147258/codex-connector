@@ -2,7 +2,7 @@
 
 ## Slack command transport
 
-Every command occupies the complete raw message text:
+The canonical envelope occupies the complete raw message text:
 
 ```
 CODEX_CONNECTOR_COMMAND_BEGIN
@@ -12,11 +12,13 @@ CODEX_CONNECTOR_COMMAND_END
 
 The markers are ASCII words (no Slack angle-bracket escaping). Schema source: `src/protocol.ts`. It defines bounded parameters, applied defaults, examples, errors and permissions for generated help. Unknown keys, duplicate JSON keys, claimed actors, prototype keys, extra text, marker injection, unsupported version and wrong target are rejected. Transport identity comes only from Slack event metadata, not JSON.
 
+Authenticated trusted bots may alternatively preserve that exact envelope in one strictly validated section/plain_text block when fallback text is identical or has only CRLF/LF replaced by one space. An explicit plain_text command block must agree even when fallback text is already canonical; extra blocks/fields or conflicting commands reject. Ordinary rich_text display blocks do not supply commands. This narrow transport adapter does not relax the envelope parser and is never used for human decisions or fetched human evidence. See [transport boundaries](DESKTOP.md#slack-传输兼容边界) for the full schema and live-verification limitation.
+
 Events persist before acknowledgement. Command IDs are scoped to an authenticated principal; repeated exact requests execute once, conflicting reuse does not execute. The internal operation ID is separate and used as the backend clientUserMessageId. A bot cannot consume an unrelated human's approval-template ID.
 
 ## Shared app-server
 
-The connector checks the configured CLI version, then uses `app-server proxy` with an optional explicitly configured socket. A local-only, default-off autoStartDaemon option may first call fixed `app-server daemon start` once with a15-second timeout; it is incompatible with an explicit socket. It never issues daemon stop/update or changes Codex updater policy. Official start may provision packages/manage the updater according to existing Codex settings. There is no fallback `app-server` process. StdIO messages use the generated protocol's newline-delimited objects, not shell text. Initialize opts into experimental APIs; model, reasoning, sandbox, approval policy and permission profiles are not overridden.
+The connector checks the configured CLI version, then uses `app-server proxy` with an optional explicitly configured socket. A local-only, default-off autoStartDaemon option may first call fixed `app-server daemon start` once with a15-second timeout; it is incompatible with an explicit socket. It never issues daemon stop/update or changes Codex updater policy. Official start may provision packages/manage the updater according to existing Codex settings. There is no fallback `app-server` process. The official proxy is a raw byte tunnel: the connector performs an HTTP WebSocket upgrade over its stdio pipes and sends JSON RPC objects as bounded WebSocket text frames, not newline-delimited stdio or shell text. Initialize opts into experimental APIs; model, reasoning, sandbox, approval policy and permission profiles are not overridden.
 
 Only these method families are reachable through typed command handlers: thread list/loaded/read/start/resume/items/turns; turn start/steer/interrupt; queue add/start. There is no caller-supplied RPC method. Discovered unsupported methods are negatively cached for the current connection; a fresh epoch may probe again. Session summaries omit rollout paths and raw tool content.
 
@@ -41,3 +43,11 @@ Discovery exposes all shared-visible metadata with manageability reasons. Sessio
 ## Tests versus evidence
 
 The automated suite uses fake transports and a pure Node executable fixture. The compiled CLI is tested across real authenticated loopback HTTP with an ambient-proxy trap. Windows/macOS parameter/template tests on Linux are not native execution evidence. See `RUNTIME-VERIFICATION.md` for actual CLI probes and unresolved runtime gates.
+
+## Reply destination and explicit address
+
+Every accepted Slack command response (including parser errors and ID conflicts) is durably routed to the event's own channel and `thread_ts`, or `ts` when the command itself is top-level. It never posts a channel-top fallback. New Slack session bindings use that origin thread. A command about an existing session returns to its caller while later session messages, approvals and input requests remain on the unchanged binding; the acknowledgement identifies that authorized bound destination.
+
+The sole optional transport address is one leading exact `<@CONNECTOR_SELF_USER_ID>` followed by one space or newline, with no other prefix. The identity comes from Slack auth.test, not command JSON. When an explicit plain_text block is present, the full raw fallback/block agreement is checked before removing the same exact address. After that address the entire unchanged strict envelope is required; prose gets same-thread usage guidance. Other mentions, repeated mentions and code fences do not execute. Fetched human approval evidence still requires the original strict envelope; no mention/block normalization is applied to it.
+
+Local/Skill `session.create` or a first `session.attach` requires `outputThreadTs` for an existing, readable root in configured `outputChannel`. This is checked before creating a Codex session; Slack-origin commands cannot override their destination with this parameter. Existing session bindings and bound Skill replies continue to work. Missing/unverified destinations fail closed; unbound local command output is not posted to Slack. On restart, persisted origins are retained. Old pending top-level or destinationless deliveries are marked failed, not silently rerouted. Channel revocation prevents delivery rather than choosing another channel.

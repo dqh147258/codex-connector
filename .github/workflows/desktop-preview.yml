@@ -1,0 +1,77 @@
+name: Desktop macOS preview build
+on:
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'scripts/desktop-ui-smoke.cjs'
+      - 'src/**'
+      - 'test/**'
+      - 'package*.json'
+      - 'tsconfig.json'
+      - '.github/workflows/desktop-preview.yml'
+permissions:
+  contents: read
+concurrency:
+  group: desktop-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  macos:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      ARCH: ${{ matrix.arch }}
+      REVIEWED_HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts
+      - run: node node_modules/electron/install.js
+      - run: npm run typecheck
+      - run: npm test
+      - name: Native sandboxed renderer smoke with fixture-only IPC
+        run: node_modules/.bin/electron scripts/desktop-ui-smoke.cjs
+      - name: Build unsigned preview, never publish
+        run: npm exec electron-builder -- --mac dmg zip --"$ARCH" --publish never
+      - name: Verify native bundled runtime without Slack, Codex, credentials or services
+        run: |
+          APP=$(find desktop-dist -maxdepth 2 -name 'Codex Connector.app' -type d -print -quit)
+          test -n "$APP"
+          ELECTRON_RUN_AS_NODE=1 "$APP/Contents/MacOS/Codex Connector" "$APP/Contents/Resources/app.asar/dist/src/cli.js" help > /dev/null
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,os,subprocess
+          actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          assert actual==os.environ['REVIEWED_HEAD']
+          Path('desktop-dist/BUILD-INFO.json').write_text(json.dumps({'sourceCommit':actual,'arch':os.environ['ARCH'],'runId':os.environ['GITHUB_RUN_ID'],'unsigned':True},indent=2)+'\n')
+          files=[p for p in Path('desktop-dist').iterdir() if p.suffix in ('.dmg','.zip')]
+          assert len(files)==2 and all(0<p.stat().st_size<400*1024*1024 for p in files)
+          with open('desktop-dist/SHA256SUMS','w') as f:
+            for p in sorted(files): f.write(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: codex-connector-macos-${{ matrix.arch }}-unsigned-preview
+          path: |
+            desktop-dist/*.dmg
+            desktop-dist/*.zip
+            desktop-dist/SHA256SUMS
+            desktop-dist/BUILD-INFO.json
+            desktop-preview/*.png
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
