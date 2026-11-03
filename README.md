@@ -75,7 +75,7 @@ node dist/src/cli.js start
 
 ## 2. dot 发指令：整条消息必须是这个格式
 
-标记使用纯 ASCII 单词，避免 Slack `<`/`>` 转义。**不带代码围栏、额外说明或重复标记。** 可选地址仅为开头精确的 Connector 自身 `<@USER_ID>` 加一个空格或换行；之后仍必须是完整严格 envelope。 以下代码块只是文档展示，实际发送不要包括反引号：
+标记使用纯 ASCII 单词，避免 Slack `<`/`>` 转义。**不带代码围栏、额外说明或重复标记。** 可选地址为开头精确的 Connector 自身 `<@USER_ID>` 加一个空格、LF 或 CRLF；已认证 bot 还兼容同一 ID 的 `<@USER_ID|显示名>` 和 `&lt;@USER_ID&gt;` 地址表示，显示名不参与授权。之后仍必须是完整严格 envelope，详见 [协议边界](docs/PROTOCOL.md)。 以下代码块只是文档展示，实际发送不要包括反引号：
 
 ```text
 CODEX_CONNECTOR_COMMAND_BEGIN

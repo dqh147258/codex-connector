@@ -5,7 +5,7 @@ import { Store } from './store.js';
 import { ReadonlyFiles, FileAccessError, containsSensitiveContent } from './files.js';
 import { parseEnvelope, validateCommand, ProtocolError, formatHelp, COMMANDS, START_MARKER, END_MARKER, type CommandEnvelope } from './protocol.js';
 import { BackendError } from './codex.js';
-import { parseSlackEnvelope } from './slack-envelope.js';
+import { parseSlackEnvelope, isSlackAddressed, SlackTransportError, SLACK_TRANSPORT_REVISION } from './slack-envelope.js';
 import type { Backend, Config, Delivery, Pending, Session, SlackPort, Source, State, Work } from './types.js';
 export class ConnectorError extends Error { constructor(readonly code:string){super(code);} }
 const codeOf=(e:unknown)=>e instanceof ConnectorError||e instanceof BackendError||e instanceof FileAccessError ? e.code : 'OPERATION_FAILED';
@@ -40,7 +40,7 @@ export class Connector {
     }catch{/* Server remains usable for help/files/status. No independent fallback. */}
     this.pump();this.flush();
   }
-  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:'direct configured humans or verified same-thread human envelope; bots alone cannot approve',serviceManagement:'local template generation only'};}
+  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:'direct configured humans or verified same-thread human envelope; bots alone cannot approve',serviceManagement:'local template generation only'};}
   private authorizeEvent(body:any):Source|undefined{
     const e=body?.event,s=this.config.slack;
     if(body?.team_id!==s.teamId||typeof body.event_id!=='string'||!e||e.type!=='message'||!['',undefined,'bot_message'].includes(e.subtype)||typeof e.text!=='string'||typeof e.user!=='string'||typeof e.ts!=='string'||!this.validTimestamp(e.ts)||(e.thread_ts!==undefined&&!this.validTimestamp(e.thread_ts)))return;
@@ -54,11 +54,10 @@ export class Connector {
   accept(body:any):boolean{
     this.store.assertHealthy();const source=this.authorizeEvent(body);if(!source)return false;
     if(Object.hasOwn(this.store.state.seenEvents,source.eventId))return true;
-    const mention=this.selfUserId?`<@${this.selfUserId}>`:'';const addressed=Boolean(mention&&body.event.text.startsWith(mention));
-    let text=body.event.text;if(addressed&&(text.startsWith(mention+'\n')||text.startsWith(mention+' ')))text=text.slice(mention.length+1);
-    if(!text.startsWith(START_MARKER)&&!addressed)return false;
+    const mention=this.selfUserId?`<@${this.selfUserId}>`:'';const addressed=Boolean(mention&&isSlackAddressed(body.event.text,mention,source.kind==='bot'));
+    if(!body.event.text.startsWith(START_MARKER)&&!addressed)return false;
     let request:CommandEnvelope;
-    try{request=parseSlackEnvelope(body.event.text,body.event.blocks,this.config.instanceId,source.kind==='bot',addressed?mention:undefined);}catch(e){this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,`Command rejected: ${e instanceof ProtocolError?e.code:'invalid_envelope'}. Use the generated help envelope exactly.`,undefined,source);});return true;}
+    try{request=parseSlackEnvelope(body.event.text,body.event.blocks,this.config.instanceId,source.kind==='bot',addressed?mention:undefined);}catch(e){this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,`Command rejected: ${e instanceof ProtocolError?e.code:'invalid_envelope'}. Transport ${SLACK_TRANSPORT_REVISION}: ${e instanceof SlackTransportError?e.stage:'envelope'}. Use the generated help envelope exactly.`,undefined,source);});return true;}
     if(source.channel!==this.config.slack.inputChannel&&!decisionCommands.has(request.command)){this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,'Command rejected: COMMAND_CHANNEL_NOT_ALLOWED. Use the configured command channel; no session operation executed.',undefined,source);});return true;}
     this.record(request,source);return true;
   }

@@ -61,8 +61,14 @@ Draft PR 的同仓限定路径触发两个标准 macOS runner（arm64/x64），�
 
 原有命令仍要求完整消息内开始/结束标记独占行；不搜索引用、代码块或自然语言中的命令。普通旧消息可继续使用严格 `event.text`，Slack 自动生成的 rich_text 仅用于显示。若存在显式 section/plain_text 命令 block，则无论 fallback 是否已经有效，都必须验证完整结构和文本一致性；不能利用相互矛盾的两个命令来源。
 
-仅在已经校验工作区、频道和完整 bot 身份的消息中，如果 `event.text` 因换行传输而不符合 envelope 格式，可使用**唯一一个** `section` / `plain_text` block 保留的原文。该 block 必须本身通过同一严格解析；仅允许可选 `block_id` 和布尔 `emoji`，不能有 accessory、fields 或其他 block。fallback text 必须逐字等于 block 原文，或逐字等于其将每个换行替换为一个空格的结果；不 trim、不合并任意空白、不解码 HTML、不猜测 JSON。block 上限 3,000 字符。人类审批及服务器查询到的人类审批证据不使用此兼容路径。
+仅在已经校验工作区、频道和完整 bot 身份的消息中，如果 `event.text` 因换行传输而不符合 envelope 格式，可使用**唯一一个** `section` / `plain_text` block 保留的原文。该 block 必须本身通过同一严格解析；仅允许可选 `block_id` 和布尔 `emoji`，不能有 accessory、fields 或其他 block。仅开头自身地址允许下述有限表示标准化；此后 fallback text 必须逐字等于 block 原文，或逐字等于其将每个换行替换为一个空格的结果。不 trim、不合并任意空白、不解码 JSON 正文中的 HTML、不猜测 JSON。block 上限 3,000 字符。人类审批及服务器查询到的人类审批证据不使用此兼容路径。
 
 这一边界有合成事件回归测试。现场不同 Slack 读取接口曾显示不同的换行投影，尚未取得原始 Socket Mode 事件证明，因此不把此次增强描述成已确认的现场根因修复；安装新版后仍需只读 `capabilities` 验证。
 
 依据：[Slack section block](https://docs.slack.dev/reference/block-kit/blocks/section-block/)、[plain_text 对象](https://docs.slack.dev/reference/block-kit/composition-objects/text-object/)。
+
+### 自身 @ 地址兼容
+
+`self-address-v2` 对已认证 bot 支持自身 `<@USER_ID>`、`<@USER_ID|显示名>` 和 `&lt;@USER_ID&gt;` 三种开头地址。ID 必须等于 auth.test 返回的 Connector 自身 user ID；显示名不授予权限。只替换完整地址 token，随后要求一个空格、LF 或 CRLF 以及严格 envelope。额外说明、其他 ID、重复 @ 或 block 正文不一致仍拒绝。人类消息只保留原 canonical 地址支持，查询到的审批证据不做这种转换。
+
+可用无 @ 的 `capabilities` 检查 `slackTransport.revision` 和 `connectorUserId`；错误只含固定阶段，不回显原始消息。此变更有合成回归测试，实际 Socket Mode 传输仍需安装后验收。绝对路径读取开关仍仅能由操作者在本地确认，未添加 Slack 开启命令。
