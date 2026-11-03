@@ -11,6 +11,7 @@ export class Store {
       this.value = existsSync(join(dir, 'state.json')) ? JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')) : empty();
       if (this.value.version !== 2 || !Array.isArray(this.value.sessions) || !this.value.seenEvents || typeof this.value.seenEvents!=='object' || Array.isArray(this.value.seenEvents) || !this.value.seenNotifications || typeof this.value.seenNotifications!=='object' || Array.isArray(this.value.seenNotifications) || !Array.isArray(this.value.work) || !Array.isArray(this.value.outbox) || !Array.isArray(this.value.pending)) throw Error('State v2 required; never overwrite old state. Back it up and migrate explicitly.');
       this.transaction(s => {
+        if(s.results!==undefined){if(!Array.isArray(s.results))throw Error('Invalid result snapshot state');s.results=s.results.filter(r=>r.expiresAt>Date.now()).slice(-10);}
         for (const w of s.work) if (w.status === 'executing') { w.status = 'uncertain'; w.error = 'Restart during execution; never auto-replay'; }
         for (const o of s.outbox) if (o.status === 'sending') { o.status = 'uncertain'; o.error = 'Delivery may have occurred; inspect Slack before recovery'; }
         for (const p of s.pending) if (['pending','responding'].includes(p.status)) p.status = 'stale';

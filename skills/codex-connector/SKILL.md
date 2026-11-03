@@ -1,52 +1,65 @@
 ---
 name: codex-connector
-description: Use the local codex-connector CLI to bind an explicitly identified shared Codex session to its Slack thread, send progress to that thread, or request supported session/read-only operations. Use when the user asks to connect this conversation to Slack or communicate through its configured dot.
+description: Use the local Codex Connector CLI to bind an explicitly identified shared Codex session to an existing Slack thread, publish progress, or request supported session and read-only file operations. Use for local Codex-to-Slack work, not for sending connector commands as dot in Slack.
 ---
 
-# Codex Connector v0.2
+# Local Codex Connector
 
-Use the installed local CLI, not Slack tokens, raw RPC, shell bridges, or session-file scraping. The owner must have configured and started the connector and default shared Codex daemon. This Skill does not install services, change permissions, or establish credentials.
+Use the installed local CLI against the owner's already configured connector. This skill does not install software/services, start a replacement Codex server, establish credentials, or authorize additional session actions. For dot's Slack transport, use the separate `dot-slack-connector` skill.
 
-## Explicit identity
+## Identify the exact session and destination
 
-Use the known connector `sessionId`, or the exact shared Codex `threadId` supplied by the user/hosting runtime. Never guess a current-session environment variable, choose the latest session, or inspect Codex rollout/session files. If no reliable ID is available, ask which explicit session to bind. `session.attach` rejoins the supported shared daemon; it does not seize an unrelated standalone TUI.
+Distinguish the shared Codex `threadId`, connector binding `sessionId`, Slack root timestamp `outputThreadTs`, and active `turnId`. They are not interchangeable.
 
-A connector handle maps to one fixed Slack channel/thread. Slack-origin create/attach binds the calling thread; local/Skill first binding uses an already-existing thread in the configured output channel. No command may create a channel-top post. Do not override channel/mention targets. Obtain the configured project alias from the owner if unknown.
+Use a reliable ID supplied by the user, hosting runtime, or supported discovery. Never guess a current-session environment variable, choose the latest session, infer identity from a matching title, or read Codex rollout/session files. If the request refers to “this conversation” but its exact thread ID is unavailable, ask for it rather than binding another session.
 
-## CLI
+A new local binding requires an **existing, readable Slack thread root in the configured output channel**. Ask for its exact timestamp if unknown. A channel ID or message permalink is not a timestamp. The connector verifies the destination before creating a new session. `outputThreadTs` does not move an existing binding. No connector command creates a channel-top post.
 
-Use `codex-connector` if installed on PATH; otherwise `node /ABSOLUTE/connector/dist/src/cli.js`. User text must be separate arguments or a UTF-8 JSON params file, never concatenated into shell syntax.
+## Use the actual CLI
 
-```text
+Use `codex-connector` if installed on PATH, otherwise `node /ABSOLUTE/connector/dist/src/cli.js`. Use `--home /ABSOLUTE/PRIVATE_CONFIG` consistently if the owner configured a non-default home. `help` works without launching Codex. The CLI reads its private local API credential itself; never read, print or copy it.
+
+```sh
 codex-connector help --command session.attach
-codex-connector command --name session.attach --params-file bind.json
 codex-connector status
+codex-connector command --name session.attach --params-file bind.json --id bind-request-0001
 ```
 
-`bind.json` contains `{"threadId":"EXPLICIT_THREAD_ID","project":"PROJECT_ALIAS","outputThreadTs":"EXISTING_SLACK_ROOT_TIMESTAMP"}`. The command returns an internal work `id`, not immediate execution success. Read `status`, locate that exact work ID, and wait only while it is queued/executing. On completion, its `resultRef.sessionId` identifies the binding. Do not choose the most recently created session. Stop on failed/uncertain status and report the error; never retry uncertain side effects automatically.
+`bind.json` is UTF-8 JSON:
 
-To create a separate shared session, use `session.create` with `{"project":"PROJECT_ALIAS","title":"Purpose","outputThreadTs":"EXISTING_SLACK_ROOT_TIMESTAMP"}` and correlate the work/resultRef in the same way. This does not change the identity of the current conversation.
-
-Send explicit progress/replies:
-
-```text
-codex-connector command --name session.reply --params-file progress.json
+```json
+{"threadId":"thread-demo","project":"demo","outputThreadTs":"1700000000.000001"}
 ```
 
-`progress.json`: `{"sessionId":"KNOWN_HANDLE","text":"Progress to publish"}`. Bound shared sessions already relay final assistant messages automatically; do not duplicate the final answer via `session.reply` unless the user explicitly wants that.
+All example IDs, aliases, timestamps and paths are illustrative. Replace them with verified values. Put user text in a JSON params file, not shell concatenation. `--params-file -` reads JSON from stdin. For a genuinely different action, use a new command ID; a retry of the same action must retain its ID and exact content.
 
-Other commands include `session.list/info/history/send/steer/queue/interrupt`, readonly `files.list/stat/read/search`, `help` and `capabilities`. Use generated help before unfamiliar commands. Local command results are delivered through the configured Slack output route; `status` returns local metadata. The old v0.1 mailbox/read/ack interface is not supported.
+`command` returns acceptance with an internal work `id`, **not execution or Slack delivery success**. Read `status` and correlate that exact work ID. While queued/executing, continue checking for completion without resubmitting. A completed create/attach exposes `resultRef.sessionId` and `threadId`; do not select the newest binding. `resultRef` is metadata, not the full result body. Correlate outbox state separately before claiming a message was delivered. Failed or uncertain operations require inspection, not automatic replay or `recover`.
 
-## Permissions and decisions
+Local queries with no binding/Slack origin do not gain an output destination, and `status` is not a generic full-result mailbox. Do not invent `mailbox`, `read`, `ack`, `sessions` or other CLI subcommands. If the user needs discovery details unavailable through their current CLI flow, use an authorized desktop/Slack discovery route or ask for the explicit ID.
 
-Never read/print the local API token or Slack tokens. The CLI reads the private owner token itself. Never change allowlists, expose localhost publicly, disable the sandbox, or tunnel a blocked filesystem/network operation through the daemon.
+## Bind, create, publish and control
 
-If direct loopback HTTP is blocked by this Codex runtime, report the exact constraint and ask for a reviewed authorized setup. The CLI intentionally does not send its bearer through ambient proxies. Do not promise universal sandbox compatibility.
+Read generated `help --command NAME` before unfamiliar parameters. Examples of command plus params-file content:
 
-**Do not submit approvals or input decisions on the user's behalf.** The local API rejects those decisions. The connector asks the configured dot/human in the bound Slack thread and requires direct human metadata or an independently verified human message reference. Secret questions and broader/unsupported scopes must be handled locally. Never fabricate `approvedBy`, quote imagined permission, resolve pending failures automatically, or change Codex approval policy.
+- `session.attach`: the binding JSON above. Omit `project` only for an explicit discovered thread allowed by the owner's local session policy.
+- `session.create`: `{"project":"demo","title":"Review project","outputThreadTs":"1700000000.000001"}`. This creates a **separate** shared session, not the current conversation.
+- `session.reply`: `{"sessionId":"session-demo","text":"Repository inspection is complete."}`. Publishes to the fixed binding without invoking the model. Bound sessions already relay final assistant messages; avoid duplicate final replies.
+- `session.info`: `{"sessionId":"session-demo"}`. Inspect current metadata and recent turn IDs before control.
+- `session.send`: `{"sessionId":"session-demo","text":"Explain the repository without editing files."}` for supported idle input.
+- `session.queue`: `{"sessionId":"session-demo","text":"Next, summarize the findings.","resume":false}`. Queues without automatically starting it.
+- `session.steer`: `{"sessionId":"session-demo","turnId":"turn-demo","text":"Focus on tests first."}`. Only the exact active turn.
+- `session.interrupt`: `{"sessionId":"session-demo","turnId":"turn-demo"}`. Only when stopping that turn is authorized.
 
-## Uncertainty
+Attach success is not proof of direct-input support. Check `canAcceptDirectInput`, current capability errors and connection state. Never silently replace an unavailable shared session with an independent one. A send/queue can succeed in enqueueing but fail to start; do not enqueue the same message again after `startError` or an uncertain RPC outcome.
 
-Default shared-session takeover is version/capability dependent. Inspect `capabilities` and report unsupported or disconnected state; never claim an independent replacement session is the user's existing one. `recover` and startup/service configuration are operator actions, not routine Skill steps. Do not invoke them automatically.
+`session.list` accepts `view:loaded|active|history|all`, optional `project`, `limit` and returned opaque `cursor`. Local/desktop defaults are `all`, 50 per source; Slack defaults are `loaded`, at most 10 per source. `active` uses fresh metadata for a loaded page, not historical active labels. Page counts are not global counts; empty filtered pages can still have a continuation. Never infer idle from unknown metadata. Do not decode, invent or reuse cursors across filters.
 
-For first local/Skill binding, ask the owner for an existing Slack thread root timestamp; `outputThreadTs` is verified readable in the configured output channel before a new Codex session is created. Missing/unreadable roots fail with `THREAD_DESTINATION_REQUIRED` / `THREAD_DESTINATION_UNVERIFIED`. Existing bindings are never moved by this parameter. Bound `session.reply` remains supported. Local commands without a binding/origin do not emit Slack messages. Never invent a thread timestamp or use a channel ID as one.
+Observation subscriptions and compact `result.page`/`result.next` handles belong to the authenticated Slack actor and originating channel/thread. They are not a local API shortcut or transferable bearer credentials. Do not send local subscription commands to impersonate dot.
+
+## Read-only files and approval boundaries
+
+`files.list/stat/read/search` use a configured `root` alias plus relative `path`. An absolute `path` without `root` requires the owner's **local** `filePolicy.allowAbsolutePaths` opt-in, disabled by default. Both modes remain read-only, subject to OS permissions, symlink/device/secret exclusions and bounded output. Do not change settings, enlarge roots, or route a blocked local operation through the connector to evade restrictions. All-shared-session control does not enable absolute file access.
+
+The local API rejects `approval.respond` and `input.respond`. Relay the need for a decision through the bound Slack workflow; do not fabricate permission, approve your own actions, change approval policy, or forward secrets. Unknown, sensitive, broad or incomplete requests require the original local UI. Only current, exact requests can be answered; stale requests cannot be revived.
+
+`status`/capabilities distinguish connectivity and method support. `doctor` only checks local configuration, token availability and executable existence. If loopback access is blocked, report the exact constraint; the CLI intentionally avoids ambient HTTP proxies for its bearer token. Do not expose localhost publicly, disable a sandbox, scrape protected files, install services or invoke `recover` as an automatic fallback.

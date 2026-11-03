@@ -5,9 +5,9 @@ export function chunks(text:string,limit=2800):string[]{const out:string[]=[];le
 export class SlackClient implements SlackPort {
   readonly web:WebClient;
   constructor(token:string){this.web=new WebClient(token,{logLevel:LogLevel.ERROR,retryConfig:{retries:0},rejectRateLimitedCalls:true});}
-  async post(channel:string,text:string,opts:{threadTs?:string;mentionUserId:string;deliveryId:string}){
+  async post(channel:string,text:string,opts:{threadTs?:string;mentionUserId?:string;deliveryId:string}){
     if(!opts.threadTs||!/^\d{1,20}\.\d{1,10}$/.test(opts.threadTs))throw Error('THREAD_DESTINATION_REQUIRED');
-    const r=await this.web.chat.postMessage({channel,text:`<@${opts.mentionUserId}> ${escapeSlack(text)}`,thread_ts:opts.threadTs,reply_broadcast:false,mrkdwn:true,parse:'none',link_names:false,unfurl_links:false,unfurl_media:false});
+    const r=await this.web.chat.postMessage({channel,text:`${opts.mentionUserId?`<@${opts.mentionUserId}> `:''}${escapeSlack(text)}`,thread_ts:opts.threadTs,reply_broadcast:false,mrkdwn:true,parse:'none',link_names:false,unfurl_links:false,unfurl_media:false});
     if(!r.ts)throw Error('SLACK_OUTCOME_UNCERTAIN');return r.ts;
   }
   async resolveDot(name:string,userId?:string){

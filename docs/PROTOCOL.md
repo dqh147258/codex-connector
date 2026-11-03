@@ -64,3 +64,7 @@ Local/Skill `session.create` or a first `session.attach` requires `outputThreadT
 `session.list` 每次分别读取最多 `limit` 条 indexed interactive history 与 loaded ID，合并可达 `2*limit`。`nextCursor` 为复合不透明游标；跨页按 ID 去重。`loaded:true` 只说明本轮服务观察，stored-only `loaded:null` 不证明当前未加载。读取 loaded 元数据失败保留 ID / `METADATA_UNAVAILABLE` / unknown，不擅自 resume。`binding` 仅返回仍授权的既有映射。不同服务、CODEX_HOME 或 `--no-daemon` 的独立进程不保证可见。
 
 桌面使用认证 loopback API `action:"sessions",params:{limit,cursor}`，仅返回元数据，不经过模型命令队列、不发送 Slack、不隐式绑定。
+
+### 简洁响应与观察订阅
+
+Slack 默认响应是有界摘要，不再保证直接输出完整 JSON。需要结构化完整内容时使用摘要返回的 `result.page`；分页 session 查询可直接用 `result.next`。原始本地/桌面结构化查询保持兼容，Slack 的 loaded 默认与最大 10 条/来源是显式传输层差异。新增订阅不会增加审批权限。参数及边界见 [SLACK-OUTPUT](SLACK-OUTPUT.md)，完整命令 schema 由 `help` 生成。

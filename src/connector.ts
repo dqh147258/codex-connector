@@ -1,14 +1,16 @@
 import { realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolve,relative,isAbsolute,sep } from 'node:path';
+import { SessionSubscriptions, SubscriptionError, type Subscription } from './subscriptions.js';
 import { Store } from './store.js';
+import { compactResult, storeResult, readResult, nextResultQuery, resultPolicy, resultSensitive } from './slack-results.js';
 import { ReadonlyFiles, FileAccessError, containsSensitiveContent } from './files.js';
 import { parseEnvelope, validateCommand, ProtocolError, formatHelp, COMMANDS, START_MARKER, END_MARKER, type CommandEnvelope } from './protocol.js';
 import { BackendError } from './codex.js';
 import { parseSlackEnvelope, isSlackAddressed, SlackTransportError, SLACK_TRANSPORT_REVISION } from './slack-envelope.js';
 import type { Backend, Config, Delivery, Pending, Session, SlackPort, Source, State, Work } from './types.js';
 export class ConnectorError extends Error { constructor(readonly code:string){super(code);} }
-const codeOf=(e:unknown)=>e instanceof ConnectorError||e instanceof BackendError||e instanceof FileAccessError ? e.code : 'OPERATION_FAILED';
+const codeOf=(e:unknown)=>e instanceof SubscriptionError||e instanceof ConnectorError||e instanceof BackendError||e instanceof FileAccessError ? e.code : 'OPERATION_FAILED';
 const decisionCommands=new Set(['approval.respond','input.respond']);
 const boundCommands=new Set(['session.info','session.history','session.send','session.steer','session.queue','session.interrupt','session.reply']);
 function short(value:unknown,max=20000){const text=typeof value==='string'?value:JSON.stringify(value,null,2);return text.length>max?text.slice(0,max)+'\n[truncated; request a smaller page]':text;}
@@ -16,9 +18,16 @@ export class Connector {
   private running=new Map<string,Promise<void>>();private delivering?:Promise<void>;private closing=false;private lastPost=0;
   private events=Promise.resolve();private attached=new Set<string>();private items=new Map<string,any>();
   readonly files:ReadonlyFiles;
+  readonly subscriptions:SessionSubscriptions;
   selfUserId='';selfBotId='';
   constructor(readonly config:Config,readonly store:Store,readonly backend:Backend,readonly slack:SlackPort,private postIntervalMs=1100){
     this.files=new ReadonlyFiles(config.projects,{},config.filePolicy?.allowAbsolutePaths===true);
+    this.subscriptions=new SessionSubscriptions(store,backend,{
+      policy:()=>resultPolicy(this.config),
+      validate:(thread,owner)=>{this.subscriptionActor(owner);const cwd=this.canonicalCwd(thread?.cwd);if(!cwd||(!this.config.sessionPolicy?.allowAllSharedSessions&&!this.projectFor(cwd)))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');return{cwd,project:this.projectFor(cwd)};},
+      allow:sub=>{try{this.subscriptionActor(sub.owner);return this.validCwd(sub.cwd)&&(this.config.sessionPolicy?.allowAllSharedSessions===true||Boolean(this.projectFor(sub.cwd)));}catch{return false;}},
+      output:(state,text,sub)=>{const start=state.outbox.length;this.sessionText(state,text,'',sub.owner);for(const out of state.outbox.slice(start)){out.subscriptionId=sub.id;out.notificationThreadId=sub.threadId;}}
+    });
     backend.on('notification',(method,params,epoch)=>this.event(()=>this.notification(method,params,epoch)));
     backend.on('request',request=>this.event(()=>this.serverRequest(request)));
     backend.on('disconnect',epoch=>this.event(()=>this.disconnected(epoch)));
@@ -33,6 +42,7 @@ export class Connector {
     if(this.closing)return;
     try{
       await this.backend.connect();
+      await this.subscriptions.rejoin();
       for(const s of this.store.state.sessions){
         if(this.attached.has(s.threadId)||!this.authorizedSession(s))continue;
         try{const r=await this.backend.rpc('thread/read',{threadId:s.threadId,includeTurns:false});this.checkSessionThread(r.thread,s);await this.backend.rpc('thread/resume',{threadId:s.threadId,excludeTurns:true});this.attached.add(s.threadId);}catch{/* Capabilities/status exposes unavailable attachment; never starts a replacement thread. */}
@@ -40,7 +50,7 @@ export class Connector {
     }catch{/* Server remains usable for help/files/status. No independent fallback. */}
     this.pump();this.flush();
   }
-  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:'direct configured humans or verified same-thread human envelope; bots alone cannot approve',serviceManagement:'local template generation only'};}
+  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:'direct configured humans or verified same-thread human envelope; bots alone cannot approve',subscriptions:{commands:['session.subscribe','session.unsubscribe','session.subscriptions'],loadedOnly:true,localCancellationOnly:true},slackOutput:{mode:'compact',sessionDefaultView:'loaded',maxRowsPerSource:10,resultDetail:'result.page',nextPage:'result.next'},serviceManagement:'local template generation only'};}
   private authorizeEvent(body:any):Source|undefined{
     const e=body?.event,s=this.config.slack;
     if(body?.team_id!==s.teamId||typeof body.event_id!=='string'||!e||e.type!=='message'||!['',undefined,'bot_message'].includes(e.subtype)||typeof e.text!=='string'||typeof e.user!=='string'||typeof e.ts!=='string'||!this.validTimestamp(e.ts)||(e.thread_ts!==undefined&&!this.validTimestamp(e.thread_ts)))return;
@@ -58,7 +68,7 @@ export class Connector {
     if(!body.event.text.startsWith(START_MARKER)&&!addressed)return false;
     let request:CommandEnvelope;
     try{request=parseSlackEnvelope(body.event.text,body.event.blocks,this.config.instanceId,source.kind==='bot',addressed?mention:undefined);}catch(e){this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,`Command rejected: ${e instanceof ProtocolError?e.code:'invalid_envelope'}. Transport ${SLACK_TRANSPORT_REVISION}: ${e instanceof SlackTransportError?e.stage:'envelope'}. Use the generated help envelope exactly.`,undefined,source);});return true;}
-    if(source.channel!==this.config.slack.inputChannel&&!decisionCommands.has(request.command)){this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,'Command rejected: COMMAND_CHANNEL_NOT_ALLOWED. Use the configured command channel; no session operation executed.',undefined,source);});return true;}
+    if(source.channel!==this.config.slack.inputChannel&&!decisionCommands.has(request.command)&&!['result.page','session.unsubscribe','session.subscriptions'].includes(request.command)){this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,'Command rejected: COMMAND_CHANNEL_NOT_ALLOWED. Use the configured command channel; no session operation executed.',undefined,source);});return true;}
     this.record(request,source);return true;
   }
   local(request:CommandEnvelope){
@@ -96,7 +106,7 @@ export class Connector {
       this.store.transaction(s=>{s.work.find(x=>x.id===w.id)!.status='executing';});
       try{
         this.reauthorize(w);const result=await this.execute(w);
-        this.store.transaction(s=>{const done=s.work.find(x=>x.id===w.id)!;done.status='completed';done.resultRef={sessionId:this.outputSession(w,result),threadId:typeof result?.threadId==='string'?result.threadId:undefined,turnId:typeof result?.turn?.id==='string'?result.turn.id:undefined};this.output(s,`[request ${w.request.id}; work ${w.id}] ${short(result,w.request.command.startsWith('files.')||['session.list','session.history'].includes(w.request.command)?500000:20000)}${this.bindingNote(w,result)}`,this.outputSession(w,result),w.source);});
+        this.store.transaction(s=>{const done=s.work.find(x=>x.id===w.id)!;done.status='completed';const snapshot=w.source.kind!=='local'&&w.request.command!=='result.page'?storeResult(s,w,result,this.config):undefined;done.resultRef={sessionId:this.outputSession(w,result),threadId:typeof result?.threadId==='string'?result.threadId:undefined,turnId:typeof result?.turn?.id==='string'?result.turn.id:undefined,resultId:snapshot?.id};const text=w.source.kind==='local'?`[request ${w.request.id}; work ${w.id}] ${short(result,w.request.command.startsWith('files.')||['session.list','session.history'].includes(w.request.command)?500000:20000)}`:compactResult(w,result,snapshot);this.output(s,text+this.bindingNote(w,result),this.outputSession(w,result),w.source);});
       }catch(e){
         const code=codeOf(e),uncertain=code==='RPC_OUTCOME_UNCERTAIN'&&COMMANDS[w.request.command].permission!=='read';
         this.store.transaction(s=>{const current=s.work.find(x=>x.id===w.id)!;current.status=uncertain?'uncertain':'failed';current.error=code;this.output(s,`[${w.id}] ${code}${uncertain?': inspect backend state; operation will not be replayed.':''}`,typeof w.request.params.sessionId==='string'?w.request.params.sessionId:undefined,w.source);});
@@ -120,8 +130,30 @@ export class Connector {
     const session=state.sessions.find(s=>s.id===sessionId&&this.authorizedSession(s));if(!session)sessionId=undefined;
     const origin=source?.kind!=='local'?source:undefined;
     const destination=origin?this.originDestination(origin):session&&this.validTimestamp(session.threadTs)?{channel:session.channel,threadTs:session.threadTs}:undefined;
-    const points=[...text];for(let i=0;i<points.length||i===0;i+=2400){const chunk=points.slice(i,i+2400).join('');state.outbox.push({id:randomUUID(),sessionId,origin,channel:destination?.channel||'',threadTs:destination?.threadTs,root:false,text:chunk,status:destination?'queued':'failed',error:destination?undefined:'THREAD_DESTINATION_REQUIRED',attempts:0,nextAttemptAt:0});}
+    const points=[...text];for(let i=0;i<points.length||i===0;i+=2400){const chunk=points.slice(i,i+2400).join('');state.outbox.push({id:randomUUID(),sessionId,origin,channel:destination?.channel||'',threadTs:destination?.threadTs,root:false,text:chunk,mention:i===0,status:destination?'queued':'failed',error:destination?undefined:'THREAD_DESTINATION_REQUIRED',attempts:0,nextAttemptAt:0});}
   }
+  private sessionText(state:State,text:string,sessionId:string,source?:Source){
+    if(containsSensitiveContent(text)){this.output(state,'Sensitive-looking output withheld; inspect locally.',sessionId,source);return;}
+    if([...text].length<=1800){this.output(state,text,sessionId,source);return;}
+    const session=state.sessions.find(s=>s.id===sessionId&&this.authorizedSession(s));
+    const dot=state.dot?.userId,owner=source&&source.kind!=='local'?source:session&&dot&&this.config.slack.trustedBots.some(b=>b.userId===dot)?{kind:'bot' as const,userId:dot,channel:session.channel,threadTs:session.threadTs||'',ts:'',eventId:'notification'}:undefined;
+    const snapshot=owner?storeResult(state,{id:randomUUID(),eventId:owner.eventId,source:owner,request:{v:1,id:randomUUID(),target:this.config.instanceId,command:'session.reply',params:{sessionId}},status:'completed',createdAt:new Date().toISOString()},text,this.config):undefined;
+    const footer=snapshot?`\nFull text: result.page {"resultId":"${snapshot.id}","page":1}; same recipient/thread, 15 min.`:'\nLong text shortened; inspect the local session/source for the full response.';
+    this.output(state,[...text].slice(0,1600).join('')+'\n[Long response preview]'+footer,sessionId,source);
+  }
+  private subscriptionActor(source:Source){
+    if(source.kind==='local'||!this.originDestination(source))throw new ConnectorError('SUBSCRIPTION_SLACK_THREAD_REQUIRED');
+    const allowed=source.kind==='human'?this.config.slack.allowedHumans.includes(source.userId):this.config.slack.trustedBots.some(b=>b.userId===source.userId);
+    if(!allowed)throw new ConnectorError('ACTOR_REVOKED');
+  }
+  private boundNotice(state:State,text:string,session:Session,preview=false){
+    const before=state.outbox.length;
+    const route=(source?:Source,id?:string)=>{const start=state.outbox.length;if(preview)this.sessionText(state,text,session.id,source);else this.output(state,text,session.id,source);for(const o of state.outbox.slice(start)){o.notificationThreadId=session.threadId;o.subscriptionId=id;}};
+    if(!this.subscriptions.hasExplicitDestination(session.threadId,session.channel,session.threadTs||''))route();
+    else for(const sub of state.subscriptions||[])if(sub.threadId===session.threadId&&sub.owner.channel===session.channel&&sub.owner.threadTs===session.threadTs&&this.subscriptions.eventAllowed(sub.id))route(sub.owner,sub.id);
+    return state.outbox.length-before;
+  }
+  private subscriptionSummary(sub:Subscription){return{subscriptionId:sub.id,threadId:sub.threadId,enabled:sub.enabled,status:sub.status,error:sub.error,channel:sub.owner.channel,threadTs:sub.owner.threadTs};}
   private session(id:unknown):Session{const s=this.store.state.sessions.find(s=>s.id===id);if(!s)throw new ConnectorError('SESSION_NOT_FOUND');if(!this.authorizedSession(s))throw new ConnectorError('SESSION_SCOPE_REVOKED');return s;}
   private canonicalCwd(cwd:string){try{if(!this.validCwd(cwd))return undefined;const real=realpathSync(cwd);return this.validCwd(real)?real:undefined;}catch{return undefined;}}
   private within(root:string,cwd:string){const a=this.canonicalCwd(root),b=this.canonicalCwd(cwd);if(!a||!b)return false;const rel=relative(a,b);return rel===''||(!rel.startsWith('..'+sep)&&rel!=='..'&&!isAbsolute(rel));}
@@ -137,16 +169,21 @@ export class Connector {
   private queuedId(value:any):string{const id=value?.queuedSubmission?.id;if(typeof id!=='string'||!id||id.length>200)throw new BackendError('RPC_OUTCOME_UNCERTAIN');return id;}
   private async execute(w:Work):Promise<any>{
     const p=w.request.params as any,c=w.request.command;
+    if(c==='session.subscribe'){const sub=await this.subscriptions.create(p.threadId,w.source);this.store.transaction(state=>{for(const o of state.outbox)if(o.status==='queued'&&!o.subscriptionId&&o.notificationThreadId===sub.threadId&&o.channel===sub.owner.channel&&o.threadTs===sub.owner.threadTs){o.status='failed';o.error='SUBSCRIPTION_ROUTE_REPLACED';}});return this.subscriptionSummary(sub);}
+    if(c==='session.unsubscribe'){const result=this.subscriptions.cancel(p.subscriptionId,w.source);const sub=this.store.state.subscriptions?.find(s=>s.id===p.subscriptionId);if(sub)this.store.transaction(state=>{for(const o of state.outbox)if(o.status==='queued'&&!o.subscriptionId&&o.notificationThreadId===sub.threadId&&o.channel===sub.owner.channel&&o.threadTs===sub.owner.threadTs){o.status='failed';o.error='SUBSCRIPTION_CANCELLED';}});return result;}
+    if(c==='session.subscriptions')return this.subscriptions.list(w.source).map(s=>this.subscriptionSummary(s));
+    if(c==='result.next'){let query;try{query=nextResultQuery(this.store.state,p.resultId,w.source,this.config);}catch{throw new ConnectorError('RESULT_UNAVAILABLE');}return this.list(query);}
+    if(c==='result.page'){try{return readResult(this.store.state,p.resultId,p.page,w.source,this.config);}catch(e){throw new ConnectorError((e as Error).message==='RESULT_PAGE_INVALID'?'RESULT_PAGE_INVALID':'RESULT_UNAVAILABLE');}}
     if(c==='help')return formatHelp(p.command);if(c==='capabilities')return this.capabilities();
     if(c==='files.list')return this.files.list(p.root,p.path,{limit:p.limit});if(c==='files.stat')return this.files.stat(p.root,p.path);
     if(c==='files.read')return this.files.read(p.root,p.path,{offset:p.offset,maxBytes:p.maxBytes});if(c==='files.search')return this.files.search(p.root,p.path,p.query,{limit:p.limit,maxDepth:p.maxDepth});
     if(c==='approval.list')return this.store.state.pending.filter(r=>r.status==='pending'&&(!p.sessionId||r.sessionId===p.sessionId)).map(({rpcId,details,...r})=>r);
     if(decisionCommands.has(c))return this.answer(w);
-    if(c==='session.list')return this.list(p);
+    if(c==='session.list')return this.list(w.source.kind==='local'?p:{...p,view:p.view||'loaded',limit:Math.min(p.limit||10,10)});
     if(c==='session.create'||c==='session.attach')return this.attachOrCreate(p,c==='session.create',w.source);
     if(!boundCommands.has(c))throw new ConnectorError('UNKNOWN_COMMAND');
     const s=this.session(p.sessionId);
-    if(c==='session.reply'){this.store.transaction(state=>this.output(state,p.text,s.id,w.source));return{sessionId:s.id,queued:true};}
+    if(c==='session.reply'){this.store.transaction(state=>this.sessionText(state,p.text,s.id,w.source));return{sessionId:s.id,queued:true};}
     if(c==='session.info'){const meta=await this.metadata(s);const turns=await this.backend.rpc('thread/turns/list',{threadId:s.threadId,limit:3,itemsView:'summary',sortDirection:'desc'});return{sessionId:s.id,threadId:s.threadId,outputThread:s.threadTs||null,attached:this.attached.has(s.threadId),...this.threadSummary(meta),recentTurns:(turns.data||[]).map((t:any)=>({id:t.id,status:t.status}))};}
     if(c==='session.history'){
       await this.metadata(s);const r=await this.backend.rpc('thread/items/list',{threadId:s.threadId,limit:p.limit||20,cursor:p.cursor,sortDirection:'desc'});
@@ -165,30 +202,55 @@ export class Connector {
     const queued=await this.backend.rpc('thread/queue/add',{threadId:s.threadId,input,clientUserMessageId:w.id});const queuedId=this.queuedId(queued);
     try{return{queued,started:await this.backend.rpc('thread/queue/start',{threadId:s.threadId,queuedSubmissionId:queuedId})};}catch(e){if(codeOf(e)==='RPC_OUTCOME_UNCERTAIN')throw e;return{queued,startError:codeOf(e),note:'Message remains queued. Shared client may have become active; no fallback steering or duplicate enqueue.'};}
   }
-  async sessionPage(params:unknown={}){if(!params||typeof params!=='object'||Array.isArray(params)||Object.keys(params).some(k=>!['limit','cursor'].includes(k)))throw new ConnectorError('INVALID_SESSION_QUERY');return this.list(validateCommand('session.list',params));}
+  async sessionPage(params:unknown={}){if(!params||typeof params!=='object'||Array.isArray(params)||Object.keys(params).some(k=>!['limit','cursor','view'].includes(k)))throw new ConnectorError('INVALID_SESSION_QUERY');return this.list(validateCommand('session.list',params));}
   private async list(p:any){
-    let cursor:{stored?:string;loaded?:string;storedDone?:boolean;loadedDone?:boolean}={};
-    if(p.cursor){try{cursor=JSON.parse(Buffer.from(p.cursor,'base64url').toString());if(!cursor||Array.isArray(cursor)||typeof cursor!=='object'||['storedDone','loadedDone'].some(k=>(cursor as any)[k]!==undefined&&typeof(cursor as any)[k]!=='boolean')||Object.keys(cursor).some(k=>!['stored','loaded','storedDone','loadedDone'].includes(k))||['stored','loaded'].some(k=>(cursor as any)[k]!==undefined&&typeof(cursor as any)[k]!=='string'))throw Error();}catch{throw new ConnectorError('INVALID_CURSOR');}}
-    const roots=p.project?[this.project(p.project)]:undefined,limit=p.limit||50;
-    const stored=cursor.storedDone?{data:[],nextCursor:null}:await this.backend.rpc('thread/list',{limit,cursor:cursor.stored,useStateDbOnly:true});
-    const loaded=cursor.loadedDone?{data:[],nextCursor:null}:await this.backend.rpc('thread/loaded/list',{limit,cursor:cursor.loaded});
-    if(!Array.isArray(stored.data)||!Array.isArray(loaded.data)||stored.data.length>limit||loaded.data.length>limit)throw new ConnectorError('INVALID_SESSION_PAGE');
+    const view=p.view||'all',project=p.project||null,roots=project?[this.project(project)]:undefined,limit=p.limit||50;
+    type Cursor={v?:number;view?:string;project?:string|null;stored?:string;loaded?:string;storedDone?:boolean;loadedDone?:boolean};
+    let cursor:Cursor={};
+    const validBackendCursor=(value:unknown)=>typeof value==='string'&&value.length>0&&value.length<=512&&!/[\x00-\x1f]/.test(value);
+    if(p.cursor){try{
+      if(typeof p.cursor!=='string'||p.cursor.length>2048||!/^[A-Za-z0-9_-]+$/.test(p.cursor))throw Error();
+      cursor=JSON.parse(Buffer.from(p.cursor,'base64url').toString());
+      if(!cursor||Array.isArray(cursor)||typeof cursor!=='object'||['storedDone','loadedDone'].some(k=>(cursor as any)[k]!==undefined&&typeof(cursor as any)[k]!=='boolean')||['stored','loaded'].some(k=>(cursor as any)[k]!==undefined&&!validBackendCursor((cursor as any)[k])))throw Error();
+      if(cursor.v===undefined){
+        // Old desktop cursors did not carry filter context. Never reinterpret them under a filter.
+        if(view!=='all'||project!==null||Object.keys(cursor).some(k=>!['stored','loaded','storedDone','loadedDone'].includes(k)))throw Error();
+      }else{
+        if(cursor.v!==2||cursor.view!==view||cursor.project!==project||Object.keys(cursor).some(k=>!['v','view','project','stored','loaded','storedDone','loadedDone'].includes(k))||typeof cursor.storedDone!=='boolean'||typeof cursor.loadedDone!=='boolean')throw Error();
+        if(cursor.storedDone===Boolean(cursor.stored)||cursor.loadedDone===Boolean(cursor.loaded))throw Error();
+        if((view==='loaded'||view==='active')&&!cursor.storedDone||view==='history'&&!cursor.loadedDone)throw Error();
+      }
+      if(cursor.storedDone&&cursor.stored||cursor.loadedDone&&cursor.loaded||cursor.storedDone&&cursor.loadedDone)throw Error();
+    }catch{throw new ConnectorError('INVALID_CURSOR');}}
+    const stored=(view==='loaded'||view==='active'||cursor.storedDone)?{data:[],nextCursor:null}:await this.backend.rpc('thread/list',{limit,cursor:cursor.stored,useStateDbOnly:true});
+    const loaded=(view==='history'||cursor.loadedDone)?{data:[],nextCursor:null}:await this.backend.rpc('thread/loaded/list',{limit,cursor:cursor.loaded});
+    for(const [page,previous] of [[stored,cursor.stored],[loaded,cursor.loaded]] as const){
+      if(!page||!Array.isArray(page.data)||page.data.length>limit||page.nextCursor!=null&&(!validBackendCursor(page.nextCursor)||page.nextCursor===previous))throw new ConnectorError('INVALID_SESSION_PAGE');
+    }
     const byId=new Map<string,{thread:any;loaded:boolean|null;sources:string[];unavailable?:boolean}>();
     const visible=(t:any)=>!roots||this.validCwd(t?.cwd)&&roots.some(root=>this.within(root,t.cwd));
     for(const t of stored.data){if(!t||typeof t.id!=='string'||!t.id||t.id.length>512)throw new ConnectorError('INVALID_SESSION_PAGE');if(visible(t))byId.set(t.id,{thread:t,loaded:null,sources:['indexed-history']});}
-    const unresolvedLoadedIds:string[]=[];
-    for(const id of loaded.data){
+    const unresolvedLoadedIds:string[]=[],unknownLoadedIds=new Set<string>();
+    for(const id of new Set(loaded.data)){
       if(typeof id!=='string'||!id||id.length>512)throw new ConnectorError('INVALID_SESSION_PAGE');
       const previous=byId.get(id),sources=[...new Set([...(previous?.sources||[]),'loaded'])];
-      try{const r=await this.backend.rpc('thread/read',{threadId:id,includeTurns:false});if(!r?.thread||r.thread.id!==id)throw Error('Invalid thread metadata');if(visible(r.thread))byId.set(id,{thread:r.thread,loaded:true,sources});else byId.delete(id);}
-      catch{unresolvedLoadedIds.push(id);if(!roots||previous)byId.set(id,{thread:previous?.thread||{id},loaded:true,sources,unavailable:true});}
+      try{
+        const r=await this.backend.rpc('thread/read',{threadId:id,includeTurns:false});if(!r?.thread||r.thread.id!==id)throw Error('Invalid thread metadata');
+        if(!r.thread.status?.type||r.thread.status.type==='unknown')unknownLoadedIds.add(id);
+        if(visible(r.thread)&&(view!=='active'||r.thread.status?.type==='active'))byId.set(id,{thread:r.thread,loaded:true,sources});else byId.delete(id);
+      }catch{
+        unresolvedLoadedIds.push(id);unknownLoadedIds.add(id);
+        if(view!=='active'&&(!roots||previous))byId.set(id,{thread:previous?.thread||{id},loaded:true,sources,unavailable:true});
+      }
     }
-    const next=stored.nextCursor||loaded.nextCursor?Buffer.from(JSON.stringify({stored:stored.nextCursor||undefined,loaded:loaded.nextCursor||undefined,storedDone:!stored.nextCursor,loadedDone:!loaded.nextCursor})).toString('base64url'):null;
+    const next=stored.nextCursor||loaded.nextCursor?Buffer.from(JSON.stringify({v:2,view,project,stored:stored.nextCursor||undefined,loaded:loaded.nextCursor||undefined,storedDone:!stored.nextCursor,loadedDone:!loaded.nextCursor})).toString('base64url'):null;
+    if(next&&next.length>2048)throw new ConnectorError('INVALID_SESSION_PAGE');
     const sessions=[...byId.values()].map(row=>{
       const summary=this.threadSummary(row.thread),binding=this.store.state.sessions.find(s=>s.threadId===summary.id&&this.authorizedSession(s));
       return{...summary,...(row.unavailable?{manageable:null,reason:'METADATA_UNAVAILABLE',canAcceptDirectInput:null,status:{type:'unknown'}}:{}),loaded:row.loaded,discoverySources:row.sources,binding:binding?{channel:binding.channel,threadTs:binding.threadTs}:null};
     });
-    return{sessions,nextCursor:next,unresolvedLoadedIds,pageLimitPerSource:limit,scope:'Current shared-daemon loaded IDs plus indexed interactive history (default thread/list sources); each source is separately paginated, so one page can contain up to twice the limit. Stored-only rows do not prove unloaded status. Metadata failures remain unknown. No resume, content preload, filesystem history scan, or control-policy filtering. Separate CODEX_HOME, standalone --no-daemon and other servers are not guaranteed visible.'};
+    const sources=view==='all'?'Current shared-daemon loaded IDs plus indexed interactive history (default thread/list sources)':view==='history'?'Indexed interactive history (default thread/list sources)':view==='active'?'Current shared-daemon loaded IDs with freshly read active status':'Current shared-daemon loaded IDs';
+    return{sessions,nextCursor:next,project,unresolvedLoadedIds,pageLimitPerSource:limit,view,returnedCount:sessions.length,scanned:{loaded:loaded.data.length,history:stored.data.length},unknownLoadedCount:unknownLoadedIds.size,hasMore:next!==null,scope:`${sources}; one bounded page per selected source, not a global session count or complete enumeration. Filters may return an empty page with a continuation cursor. Stored-only rows do not prove unloaded status. Metadata failures remain unknown. No resume, content preload, filesystem history scan, or control-policy filtering. Separate CODEX_HOME, standalone --no-daemon and other servers are not guaranteed visible.`};
   }
 
   private async attachOrCreate(p:any,create:boolean,source:Source){
@@ -210,19 +272,33 @@ export class Connector {
     if(method==='serverRequest/resolved'){
       this.store.transaction(s=>{for(const r of s.pending)if(r.epoch===epoch&&r.rpcId===p.requestId&&['pending','responding'].includes(r.status))r.status='resolved';});return;
     }
-    const session=this.store.state.sessions.find(s=>s.threadId===p.threadId);if(!session||!this.authorizedSession(session))return;
-    if((method==='item/started'||method==='item/completed')&&p.item?.id){this.items.set(`${p.threadId}:${p.turnId}:${p.item.id}`,p.item);if(this.items.size>1000)this.items.delete(this.items.keys().next().value!);}
-    if(method==='item/completed'&&p.item?.type==='agentMessage'&&(!p.item.phase||p.item.phase==='final_answer')&&typeof p.item.text==='string'){
+    const session=this.store.state.sessions.find(s=>s.threadId===p.threadId&&this.authorizedSession(s));
+    if(!session&&!this.store.state.subscriptions?.some(s=>s.enabled&&s.threadId===p.threadId))return;
+    if(session&&(method==='item/started'||method==='item/completed')&&p.item?.id){this.items.set(`${p.threadId}:${p.turnId}:${p.item.id}`,p.item);if(this.items.size>1000)this.items.delete(this.items.keys().next().value!);}
+    if(method==='item/completed'&&p.item?.type==='agentMessage'&&(!p.item.phase||['commentary','partial_answer','final_answer'].includes(p.item.phase))&&typeof p.item.text==='string'){
       const key=`${p.threadId}:${p.turnId}:${p.item.id}`;
-      this.store.transaction(s=>{if(Object.hasOwn(s.seenNotifications,key))return;s.seenNotifications[key]=true;this.output(s,p.item.text,session.id);});this.flush();
+      this.store.transaction(state=>{if(Object.hasOwn(state.seenNotifications,key))return;const before=state.outbox.length;
+        if(session&&(!p.item.phase||p.item.phase==='final_answer'))this.boundNotice(state,p.item.text,session,true);
+        this.subscriptions.emit(state,`Session ${p.threadId}; turn ${p.turnId||'unknown'}; ${p.item.phase||'final_answer'}\n${p.item.text}`,p.threadId,key,sub=>!session||sub.owner.channel!==session.channel||sub.owner.threadTs!==session.threadTs||Boolean(p.item.phase&&p.item.phase!=='final_answer'));
+        if(state.outbox.length>before)state.seenNotifications[key]=true;
+      });this.flush();
     }
     if(method==='turn/completed'){
-      this.store.transaction(s=>{for(const r of s.pending)if(r.threadId===p.threadId&&r.turnId===p.turn?.id&&r.status==='pending')r.status='stale';if(p.turn?.status!=='completed')this.output(s,`Turn ${p.turn?.id||''}: ${p.turn?.status||'terminal'}; inspect session.info before continuing.`,session.id);});this.flush();
+      const key=`turn:${p.threadId}:${p.turn?.id}:${p.turn?.status}`;
+      this.store.transaction(state=>{for(const r of state.pending)if(r.threadId===p.threadId&&r.turnId===p.turn?.id&&r.status==='pending')r.status='stale';if(Object.hasOwn(state.seenNotifications,key))return;const before=state.outbox.length;
+        const text=`Session ${p.threadId}; turn ${p.turn?.id||'unknown'}: ${p.turn?.status||'terminal'}.`;
+        if(session&&p.turn?.status!=='completed')this.boundNotice(state,text+' Inspect session.info before continuing.',session);
+        this.subscriptions.emit(state,text,p.threadId,key,sub=>!session||p.turn?.status==='completed'||sub.owner.channel!==session.channel||sub.owner.threadTs!==session.threadTs);
+        if(state.outbox.length>before)state.seenNotifications[key]=true;
+      });this.flush();
     }
+    if(method==='error'&&p.willRetry===false){this.store.transaction(state=>this.subscriptions.emit(state,`Session ${p.threadId}; turn ${p.turnId||'unknown'}: execution error. Inspect the original local session.`,p.threadId,`error:${p.threadId}:${p.turnId}`));this.flush();}
   }
   private async serverRequest(r:any){
     if(r.epoch!==this.backend.epoch||!this.backend.connected||!['string','number'].includes(typeof r.id))return;
-    const s=this.store.state.sessions.find(s=>s.threadId===r.params?.threadId);if(!s||!this.authorizedSession(s))return;
+    const s=this.store.state.sessions.find(s=>s.threadId===r.params?.threadId&&this.authorizedSession(s));
+    this.store.transaction(state=>this.subscriptions.emit(state,`Session ${r.params?.threadId}; turn ${r.params?.turnId||'unknown'}: local decision/input required. Use the original local Codex UI or its authorized bound approval thread. This observation does not grant approval authority.`,r.params?.threadId,`request:${r.epoch}:${r.id}`,sub=>!s||sub.owner.channel!==s.channel||sub.owner.threadTs!==s.threadTs));this.flush();
+    if(!s)return;
     if(this.store.state.pending.some(p=>p.rpcId===r.id&&p.epoch===r.epoch))return;
     let kind:Pending['kind']='unsupported';if(r.method==='item/commandExecution/requestApproval')kind='command';if(r.method==='item/fileChange/requestApproval')kind='file';if(r.method==='item/tool/requestUserInput')kind='input';
     const details=structuredClone(r.params),decisions=Array.isArray(details.availableDecisions)?details.availableDecisions.filter((x:any)=>['accept','decline','cancel'].includes(x)):['accept','decline','cancel'];
@@ -234,10 +310,10 @@ export class Connector {
     if(kind==='command'&&((details.kind&&details.kind!=='command')||typeof details.command!=='string'||!details.command.trim()||typeof details.cwd!=='string'||!details.cwd))local=true;
     // Never offer accept for hidden/truncated scope or relay known credential-bearing data.
     const serialized=JSON.stringify(details);
-    if(serialized.length>12000 || containsSensitiveContent(serialized) || containsSensitiveContent(String(details.command||'')) || /(?:Bearer\s+\S+|(?:xox[baprs]-|xapp-|github_pat_|sk-proj-)[A-Za-z0-9_-]{12,}|-----BEGIN .*PRIVATE KEY|(?:password|secret|token|api[_-]?key)\s*[=:]\s*[^\s,}]{6,}|[\\/]\.codex[\\/]|[\\/]\.env(?:[.\\/]|$))/i.test(serialized))local=true;
+    if(serialized.length>12000 || resultSensitive(details) || containsSensitiveContent(serialized) || containsSensitiveContent(String(details.command||'')) || /(?:Bearer\s+\S+|(?:xox[baprs]-|xapp-|github_pat_|sk-proj-)[A-Za-z0-9_-]{12,}|-----BEGIN .*PRIVATE KEY|(?:password|secret|token|api[_-]?key)\s*[=:]\s*[^\s,}]{6,}|[\\/]\.codex[\\/]|[\\/]\.env(?:[.\\/]|$))/i.test(serialized))local=true;
     const safeDetails=local?{notice:'Sensitive, oversized, unsupported, or broader-scope request; inspect locally',itemId:details.itemId}:details;
     const pending:Pending={id:randomUUID(),rpcId:r.id,epoch:r.epoch,sessionId:s.id,threadId:s.threadId,turnId:details.turnId||'unavailable',method:r.method,kind,status:local?'local-required':'pending',details:safeDetails,decisions,expiresAt:Date.now()+this.config.approvalTimeoutSec*1000};
-    this.store.transaction(state=>{state.pending.push(pending);this.output(state,local?`LOCAL_ACTION_REQUIRED: ${r.method}\nrequestId=${pending.id}; sensitive, unsupported, or broader-scope request. No approval was granted. Use the original local Codex UI.`:this.prompt(pending),s.id);});this.flush();
+    this.store.transaction(state=>{state.pending.push(pending);this.boundNotice(state,local?`LOCAL_ACTION_REQUIRED: ${r.method}\nrequestId=${pending.id}; sensitive, unsupported, or broader-scope request. No approval was granted. Use the original local Codex UI.`:this.prompt(pending),s);});this.flush();
   }
   private prompt(p:Pending){
     const params:any={requestId:p.id,epoch:p.epoch,sessionId:p.sessionId,turnId:p.turnId};
@@ -281,8 +357,9 @@ export class Connector {
     this.attached.clear();this.items.clear();this.store.transaction(s=>{for(const p of s.pending)if(p.epoch===epoch&&['pending','responding'].includes(p.status))p.status='stale';});
   }
   async expire(){
+    if(this.store.state.results?.some(r=>r.expiresAt<=Date.now()))this.store.transaction(s=>{s.results=(s.results||[]).filter(r=>r.expiresAt>Date.now());});
     for(const p of this.store.state.pending.filter(p=>p.status==='pending'&&p.expiresAt<=Date.now())){
-      this.store.transaction(s=>{s.pending.find(x=>x.id===p.id)!.status='expired';this.output(s,`Request ${p.id} expired; no approval granted.`,p.sessionId);});
+      this.store.transaction(s=>{s.pending.find(x=>x.id===p.id)!.status='expired';const session=s.sessions.find(x=>x.id===p.sessionId);if(session)this.boundNotice(s,`Request ${p.id} expired; no approval granted.`,session);});
       if(this.backend.connected&&p.epoch===this.backend.epoch){try{if(p.kind==='command'||p.kind==='file')await this.backend.respond(p.rpcId,{decision:'decline'});else if(p.kind==='input')await this.backend.rpc('turn/interrupt',{threadId:p.threadId,turnId:p.turnId});}catch{/* never replay stale callbacks */}}
     }
     this.flush();
@@ -290,7 +367,7 @@ export class Connector {
   flush(){if(this.closing||this.delivering)return;try{this.store.assertHealthy();}catch{return;}this.delivering=this.deliver().catch(()=>{}).finally(()=>{this.delivering=undefined;if(!this.closing&&this.nextDelivery())queueMicrotask(()=>this.flush());});}
   private deliveryLane(o:Delivery,state:Readonly<State>){return `${o.channel}:${o.threadTs||state.sessions.find(s=>s.id===o.sessionId)?.threadTs||'missing'}`;}
   private nextDelivery(){
-    const state=this.store.state;return state.outbox.find((o,index)=>o.status==='queued'&&o.nextAttemptAt<=Date.now()&&!state.outbox.slice(0,index).some(earlier=>this.deliveryLane(earlier,state)===this.deliveryLane(o,state)&&!['sent','failed'].includes(earlier.status)));
+    const state=this.store.state;return state.outbox.find((o,index)=>o.status==='queued'&&o.nextAttemptAt<=Date.now()&&(!o.subscriptionId||!this.subscriptions.deliveryWaiting(o.subscriptionId))&&!state.outbox.slice(0,index).some(earlier=>this.deliveryLane(earlier,state)===this.deliveryLane(o,state)&&!['sent','failed'].includes(earlier.status)));
   }
   private async deliver(){
     while(!this.closing){
@@ -298,15 +375,18 @@ export class Connector {
       const next=this.nextDelivery();if(!next)return;
       const session=next.sessionId?state.sessions.find(s=>s.id===next.sessionId):undefined;
       const threadTs=next.threadTs||(!next.origin?session?.threadTs:undefined);
-      let invalid=next.root||!this.validChannel(next.channel)||!this.validTimestamp(threadTs);
+      let invalid=Boolean(next.subscriptionId&&!this.subscriptions.deliveryAllowed(next.subscriptionId))||Boolean(next.notificationThreadId&&!next.subscriptionId&&this.subscriptions.hasExplicitDestination(next.notificationThreadId,next.channel,threadTs||''))||next.root||!this.validChannel(next.channel)||!this.validTimestamp(threadTs);
       if(next.origin)invalid ||= !this.originDestination(next.origin)||next.origin.channel!==next.channel||next.origin.threadTs!==threadTs;
       else invalid ||= !session||!this.authorizedSession(session)||session.channel!==next.channel||session.threadTs!==threadTs;
       if(session&&!this.authorizedSession(session))invalid=true;
       if(invalid){this.store.transaction(s=>{const o=s.outbox.find(o=>o.id===next.id)!;o.status='failed';o.error='THREAD_DESTINATION_INVALID_OR_REVOKED';});continue;}
       await new Promise(r=>setTimeout(r,Math.max(0,this.lastPost+this.postIntervalMs-Date.now())));
+      const current=this.store.state.outbox.find(o=>o.id===next.id);if(!current||current.status!=='queued')continue;
+      if(current.subscriptionId&&this.subscriptions.deliveryWaiting(current.subscriptionId))continue;
+      if(current.subscriptionId&&!this.subscriptions.deliveryAllowed(current.subscriptionId)||current.notificationThreadId&&!current.subscriptionId&&this.subscriptions.hasExplicitDestination(current.notificationThreadId,current.channel,current.threadTs||'')){this.store.transaction(s=>{const o=s.outbox.find(x=>x.id===next.id)!;o.status='failed';o.error='SUBSCRIPTION_CANCELLED_OR_REVOKED';});continue;}
       this.store.transaction(s=>{const o=s.outbox.find(o=>o.id===next.id)!;o.status='sending';o.attempts++;});
       try{
-        const ts=await this.slack.post(next.channel,next.text,{threadTs,mentionUserId:dot.userId,deliveryId:next.id});this.lastPost=Date.now();
+        const ts=await this.slack.post(next.channel,next.text,{threadTs,mentionUserId:next.mention===false?undefined:dot.userId,deliveryId:next.id});this.lastPost=Date.now();
         this.store.transaction(s=>{const o=s.outbox.find(o=>o.id===next.id)!;o.status='sent';o.ts=ts;});
       }catch(e:any){
         this.store.transaction(s=>{const o=s.outbox.find(o=>o.id===next.id)!;if(e?.code==='slack_webapi_rate_limited_error'&&o.attempts<10){o.status='queued';o.nextAttemptAt=Date.now()+Math.max(1000,Number(e.retryAfter||1)*1000);}else{o.status='uncertain';o.error='Slack delivery may have occurred; local recovery required, never rerun Codex';}});return;

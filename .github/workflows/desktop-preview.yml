@@ -5,6 +5,7 @@ on:
       - 'desktop/**'
       - 'scripts/desktop-ui-smoke.cjs'
       - 'src/**'
+      - 'skills/**'
       - 'test/**'
       - 'package*.json'
       - 'tsconfig.json'
@@ -72,6 +73,7 @@ jobs:
             desktop-dist/SHA256SUMS
             desktop-dist/BUILD-INFO.json
             desktop-preview/*.png
+            skills/**
           if-no-files-found: error
           retention-days: 3
           compression-level: 0

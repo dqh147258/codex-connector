@@ -46,7 +46,8 @@
       "desktop/preload.cjs",
       "desktop/ui/**",
       "slack-app-manifest.json",
-      "package.json"
+      "package.json",
+      "skills/**"
     ],
     "mac": {
       "target": [

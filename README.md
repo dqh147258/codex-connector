@@ -184,3 +184,9 @@ npm test
 命令成功、失败和格式错误都回复发起命令的原 Thread；顶层命令以该消息自身建立回复 Thread。异步 Codex 输出/审批继续留在既有会话绑定，后续从别的 Thread 查询不会偷偷改绑。找不到有效目的 Thread 时拒绝发送，不回退到群聊顶层。
 
 本地/Skill 新建或首次绑定时，在参数中提供 `outputThreadTs`（配置输出频道中已存在的 Slack Thread 根时间戳）；Connector 验证可读取后才启动新 Codex 会话。已有绑定仍可直接 `session.reply`。完整边界见 [协议说明](docs/PROTOCOL.md#reply-destination-and-explicit-address)。
+
+## 简洁 Slack 输出与关键消息订阅
+
+Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:active` 从当前 loaded 元数据筛选，历史单独用 `view:history`。使用 `result.next` 获取下一页，`result.page` 显式读取短期、同身份同线程的详情，避免自动 JSON 刷屏。`session.subscribe` / `session.unsubscribe` 独立控制关键阶段消息，取消不会停止 Codex。完整边界见 [输出与订阅](docs/SLACK-OUTPUT.md)。
+
+提供两份可手动安装/阅读的 Skill：[Codex 本地](skills/codex-connector/SKILL.md) 与 [dot Slack 操作](skills/dot-slack-connector/SKILL.md)。没有自动安装到用户电脑或修改 dot 内部指令。
