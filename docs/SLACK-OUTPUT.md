@@ -13,7 +13,7 @@ Slack 默认展示短摘要，不再把整个后端 JSON 自动拆成几十条�
 
 Slack 每来源最多 10 条，即使请求 `limit:100` 也显示实际执行上限。本地/桌面默认仍为 `all`、每来源 50 条，最多 100。每次只读取每个选中来源的一页，没有隐式扫描全部历史。`active` 页可能为零条但仍有下一页；未知元数据数量会单独给出，不能把它们视为 idle。数量是本页数量，不是全局总数。历史行明确标为 `history(current unknown)`。
 
-例如严格命令信封中的 params 可为 `{"view":"active","limit":10}`。摘要包含精确结果句柄；用 `result.next {"resultId":"返回的ID"}` 获取同一筛选的下一页，无需复制长 cursor。也可以从详情取得完整 `nextCursor` 并在相同 view/project 的 `session.list` 中使用。每次命令使用新 request ID。游标绑定筛选上下文，不能跨筛选复用。
+例如严格命令信封中的 params 可为 `{"view":"active","limit":10}`。摘要包含精确结果句柄；用 `result.next {"resultId":"返回的ID"}` 获取同一筛选的下一页，无需复制长 cursor。`session.messages` 的结果也支持同样的 result.next，保留原 threadId/role/order。也可以从详情取得完整 `nextCursor` 并在相同 view/project 的 `session.list` 中使用。每次命令使用新 request ID。游标绑定筛选上下文，不能跨筛选复用。
 
 ## 完整详情
 

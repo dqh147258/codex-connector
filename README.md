@@ -190,3 +190,7 @@ npm test
 Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:active` 从当前 loaded 元数据筛选，历史单独用 `view:history`。使用 `result.next` 获取下一页，`result.page` 显式读取短期、同身份同线程的详情，避免自动 JSON 刷屏。`session.subscribe` / `session.unsubscribe` 独立控制关键阶段消息，取消不会停止 Codex。完整边界见 [输出与订阅](docs/SLACK-OUTPUT.md)。
 
 提供两份可手动安装/阅读的 Skill：[Codex 本地](skills/codex-connector/SKILL.md) 与 [dot Slack 操作](skills/dot-slack-connector/SKILL.md)。没有自动安装到用户电脑或修改 dot 内部指令。
+
+## 选定会话的上下文概览
+
+先 `session.list`，再用 `session.overview` 对 1–5 个 Codex threadId 获取首条/最近用户消息与最近可见模型消息的有界摘录；定位后用同一 threadId 调 `session.messages` 只读翻页或显式 `session.subscribe`。无需先绑定/恢复会话，不调用额外模型总结。范围、覆盖不足和 ID 区别见 [会话概览接口](docs/SESSION-OVERVIEW.md)。

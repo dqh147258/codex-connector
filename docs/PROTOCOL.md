@@ -68,3 +68,5 @@ Local/Skill `session.create` or a first `session.attach` requires `outputThreadT
 ### 简洁响应与观察订阅
 
 Slack 默认响应是有界摘要，不再保证直接输出完整 JSON。需要结构化完整内容时使用摘要返回的 `result.page`；分页 session 查询可直接用 `result.next`。原始本地/桌面结构化查询保持兼容，Slack 的 loaded 默认与最大 10 条/来源是显式传输层差异。新增订阅不会增加审批权限。参数及边界见 [SLACK-OUTPUT](SLACK-OUTPUT.md)，完整命令 schema 由 `help` 生成。
+
+`session.overview` 和 `session.messages` 使用发现得到的 Codex threadId，不是控制绑定 sessionId。前者是 1–5 个 ID 的有界摘录，后者是只读可见对话分页。它们不调用 resume。详细边界见 [SESSION-OVERVIEW](SESSION-OVERVIEW.md)，准确字段以生成的 help 为准。

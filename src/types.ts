@@ -13,7 +13,7 @@ export interface Config {
 export interface Source { kind: 'human' | 'bot' | 'local'; userId: string; channel: string; ts: string; threadTs: string; eventId: string }
 export interface Session { id: string; threadId: string; project: string; cwd?: string; channel: string; threadTs?: string; createdAt: string }
 export interface Work { id: string; eventId: string; request: CommandEnvelope; source: Source; status: 'queued'|'executing'|'completed'|'failed'|'uncertain'; createdAt: string; error?: string; resultRef?: {sessionId?:string;threadId?:string;turnId?:string;resultId?:string} }
-export interface ResultSnapshot { id:string; command:string; source:Source; createdAt:number; expiresAt:number; policy:string; text:string; nextQuery?:Record<string,unknown> }
+export interface ResultSnapshot { id:string; command:string; source:Source; createdAt:number; expiresAt:number; policy:string; text:string; nextQuery?:Record<string,unknown>; nextCommand?:'session.list'|'session.messages' }
 export interface Delivery { id: string; origin?: Source; sessionId?: string; channel: string; threadTs?: string; root: boolean; text: string; mention?:boolean; subscriptionId?:string; notificationThreadId?:string; status: 'queued'|'sending'|'sent'|'uncertain'|'failed'; attempts: number; nextAttemptAt: number; ts?: string; error?: string }
 export interface Pending {
   id: string; rpcId: string|number; epoch: string; sessionId: string; threadId: string; turnId: string;

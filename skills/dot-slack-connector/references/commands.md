@@ -36,9 +36,29 @@ CODEX_CONNECTOR_COMMAND_BEGIN
 CODEX_CONNECTOR_COMMAND_END
 ```
 
-## Read result details versus fetch next discovery page
+## Select a few candidates, then read one exact thread
 
-These require a real result handle issued to this same actor/channel/thread. `page` is one-based. `result.next` is valid only when the previous summary advertises a next discovery page.
+After discovery, use 1–5 distinct **Codex thread IDs**, not connector session handles. Read the overview's per-thread errors, scan coverage and message phase/text status before inferring the task. These are excerpts from available persisted items, not semantic summaries or a current-task guarantee.
+
+```text
+CODEX_CONNECTOR_COMMAND_BEGIN
+{"v":1,"id":"dot-overview-0001","target":"my-computer","command":"session.overview","params":{"threadIds":["thread-demo","thread-other"],"maxChars":500}}
+CODEX_CONNECTOR_COMMAND_END
+```
+
+Read one selected thread without attaching. Default descending order shows the latest available items first; use ascending only when earlier context is needed. `limit` counts backend items before visible-role filtering, so a zero-message page can still continue.
+
+```text
+CODEX_CONNECTOR_COMMAND_BEGIN
+{"v":1,"id":"dot-messages-0001","target":"my-computer","command":"session.messages","params":{"threadId":"thread-demo","role":"all","order":"desc","limit":10,"maxChars":1000}}
+CODEX_CONNECTOR_COMMAND_END
+```
+
+Continue with the returned `result.next` handle, or a real opaque `cursor` with the same threadId/role/order. Use `result.page` to expand already-returned excerpts; it does not fetch additional historical messages or remove per-message truncation. If observation is requested, subscribe to the exact identified thread only after confirming it is currently loaded. Content reading and subscribing do not grant control or approval authority.
+
+## Read result details versus fetch the next query page
+
+These require a real result handle issued to this same actor/channel/thread. `page` is one-based. `result.next` is valid only when a session-list or session-messages result advertises a next query page. It preserves the saved query scope; it does not repeat a control operation.
 
 ```text
 CODEX_CONNECTOR_COMMAND_BEGIN

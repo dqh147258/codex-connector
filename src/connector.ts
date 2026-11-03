@@ -1,16 +1,17 @@
 import { realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolve,relative,isAbsolute,sep } from 'node:path';
+import { SessionContent, SessionContentError } from './session-content.js';
 import { SessionSubscriptions, SubscriptionError, type Subscription } from './subscriptions.js';
 import { Store } from './store.js';
-import { compactResult, storeResult, readResult, nextResultQuery, resultPolicy, resultSensitive } from './slack-results.js';
+import { compactResult, storeResult, readResult, nextResultQuery, nextResultCommand, resultPolicy, resultSensitive } from './slack-results.js';
 import { ReadonlyFiles, FileAccessError, containsSensitiveContent } from './files.js';
 import { parseEnvelope, validateCommand, ProtocolError, formatHelp, COMMANDS, START_MARKER, END_MARKER, type CommandEnvelope } from './protocol.js';
 import { BackendError } from './codex.js';
 import { parseSlackEnvelope, isSlackAddressed, SlackTransportError, SLACK_TRANSPORT_REVISION } from './slack-envelope.js';
 import type { Backend, Config, Delivery, Pending, Session, SlackPort, Source, State, Work } from './types.js';
 export class ConnectorError extends Error { constructor(readonly code:string){super(code);} }
-const codeOf=(e:unknown)=>e instanceof SubscriptionError||e instanceof ConnectorError||e instanceof BackendError||e instanceof FileAccessError ? e.code : 'OPERATION_FAILED';
+const codeOf=(e:unknown)=>e instanceof SessionContentError||e instanceof SubscriptionError||e instanceof ConnectorError||e instanceof BackendError||e instanceof FileAccessError ? e.code : 'OPERATION_FAILED';
 const decisionCommands=new Set(['approval.respond','input.respond']);
 const boundCommands=new Set(['session.info','session.history','session.send','session.steer','session.queue','session.interrupt','session.reply']);
 function short(value:unknown,max=20000){const text=typeof value==='string'?value:JSON.stringify(value,null,2);return text.length>max?text.slice(0,max)+'\n[truncated; request a smaller page]':text;}
@@ -19,9 +20,11 @@ export class Connector {
   private events=Promise.resolve();private attached=new Set<string>();private items=new Map<string,any>();
   readonly files:ReadonlyFiles;
   readonly subscriptions:SessionSubscriptions;
+  readonly content:SessionContent;
   selfUserId='';selfBotId='';
   constructor(readonly config:Config,readonly store:Store,readonly backend:Backend,readonly slack:SlackPort,private postIntervalMs=1100){
     this.files=new ReadonlyFiles(config.projects,{},config.filePolicy?.allowAbsolutePaths===true);
+    this.content=new SessionContent(backend,thread=>{const cwd=this.canonicalCwd(thread?.cwd);if(!cwd||(!this.config.sessionPolicy?.allowAllSharedSessions&&!this.projectFor(cwd)))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');return this.threadSummary({...thread,cwd});});
     this.subscriptions=new SessionSubscriptions(store,backend,{
       policy:()=>resultPolicy(this.config),
       validate:(thread,owner)=>{this.subscriptionActor(owner);const cwd=this.canonicalCwd(thread?.cwd);if(!cwd||(!this.config.sessionPolicy?.allowAllSharedSessions&&!this.projectFor(cwd)))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');return{cwd,project:this.projectFor(cwd)};},
@@ -50,7 +53,7 @@ export class Connector {
     }catch{/* Server remains usable for help/files/status. No independent fallback. */}
     this.pump();this.flush();
   }
-  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:'direct configured humans or verified same-thread human envelope; bots alone cannot approve',subscriptions:{commands:['session.subscribe','session.unsubscribe','session.subscriptions'],loadedOnly:true,localCancellationOnly:true},slackOutput:{mode:'compact',sessionDefaultView:'loaded',maxRowsPerSource:10,resultDetail:'result.page',nextPage:'result.next'},serviceManagement:'local template generation only'};}
+  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:'direct configured humans or verified same-thread human envelope; bots alone cannot approve',sessionContent:{overview:'session.overview',messages:'session.messages',batchMax:5,readOnly:true,semanticSummary:false},subscriptions:{commands:['session.subscribe','session.unsubscribe','session.subscriptions'],loadedOnly:true,localCancellationOnly:true},slackOutput:{mode:'compact',sessionDefaultView:'loaded',maxRowsPerSource:10,resultDetail:'result.page',nextPage:'result.next'},serviceManagement:'local template generation only'};}
   private authorizeEvent(body:any):Source|undefined{
     const e=body?.event,s=this.config.slack;
     if(body?.team_id!==s.teamId||typeof body.event_id!=='string'||!e||e.type!=='message'||!['',undefined,'bot_message'].includes(e.subtype)||typeof e.text!=='string'||typeof e.user!=='string'||typeof e.ts!=='string'||!this.validTimestamp(e.ts)||(e.thread_ts!==undefined&&!this.validTimestamp(e.thread_ts)))return;
@@ -169,10 +172,12 @@ export class Connector {
   private queuedId(value:any):string{const id=value?.queuedSubmission?.id;if(typeof id!=='string'||!id||id.length>200)throw new BackendError('RPC_OUTCOME_UNCERTAIN');return id;}
   private async execute(w:Work):Promise<any>{
     const p=w.request.params as any,c=w.request.command;
+    if(c==='session.overview')return this.content.overview(p.threadIds,p.maxChars);
+    if(c==='session.messages')return this.content.messages(p);
     if(c==='session.subscribe'){const sub=await this.subscriptions.create(p.threadId,w.source);this.store.transaction(state=>{for(const o of state.outbox)if(o.status==='queued'&&!o.subscriptionId&&o.notificationThreadId===sub.threadId&&o.channel===sub.owner.channel&&o.threadTs===sub.owner.threadTs){o.status='failed';o.error='SUBSCRIPTION_ROUTE_REPLACED';}});return this.subscriptionSummary(sub);}
     if(c==='session.unsubscribe'){const result=this.subscriptions.cancel(p.subscriptionId,w.source);const sub=this.store.state.subscriptions?.find(s=>s.id===p.subscriptionId);if(sub)this.store.transaction(state=>{for(const o of state.outbox)if(o.status==='queued'&&!o.subscriptionId&&o.notificationThreadId===sub.threadId&&o.channel===sub.owner.channel&&o.threadTs===sub.owner.threadTs){o.status='failed';o.error='SUBSCRIPTION_CANCELLED';}});return result;}
     if(c==='session.subscriptions')return this.subscriptions.list(w.source).map(s=>this.subscriptionSummary(s));
-    if(c==='result.next'){let query;try{query=nextResultQuery(this.store.state,p.resultId,w.source,this.config);}catch{throw new ConnectorError('RESULT_UNAVAILABLE');}return this.list(query);}
+    if(c==='result.next'){let query;try{query=nextResultQuery(this.store.state,p.resultId,w.source,this.config);}catch{throw new ConnectorError('RESULT_UNAVAILABLE');}return nextResultCommand(this.store.state,p.resultId,w.source,this.config)==='session.messages'?this.content.messages(query as any):this.list(query);}
     if(c==='result.page'){try{return readResult(this.store.state,p.resultId,p.page,w.source,this.config);}catch(e){throw new ConnectorError((e as Error).message==='RESULT_PAGE_INVALID'?'RESULT_PAGE_INVALID':'RESULT_UNAVAILABLE');}}
     if(c==='help')return formatHelp(p.command);if(c==='capabilities')return this.capabilities();
     if(c==='files.list')return this.files.list(p.root,p.path,{limit:p.limit});if(c==='files.stat')return this.files.stat(p.root,p.path);

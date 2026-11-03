@@ -19,12 +19,14 @@ export function storeResult(state:State,work:Work,result:unknown,config:Config,n
   if(typeof text!=='string'||text.length>RESULT_MAX_CHARS||containsSensitiveContent(text)||resultSensitive(result))return;
   const snapshot:ResultSnapshot={id:randomUUID(),command:work.request.command,source:work.source,createdAt:now,expiresAt:now+RESULT_TTL_MS,policy:resultPolicy(config),text};
   const data=result as any;if(['session.list','result.next'].includes(work.request.command)&&Array.isArray(data?.sessions)&&data.nextCursor)snapshot.nextQuery={view:data.view,limit:Math.min(data.pageLimitPerSource,10),cursor:data.nextCursor,...(data.project?{project:data.project}:{})};
+  if(['session.messages','result.next'].includes(work.request.command)&&data?.kind==='session.messages'&&data.nextCursor){snapshot.nextCommand='session.messages';snapshot.nextQuery={threadId:data.threadId,role:data.role,order:data.order,limit:data.limit,maxChars:data.maxChars,cursor:data.nextCursor};}
   state.results=(state.results||[]).filter(r=>r.expiresAt>now).slice(-9);state.results.push(snapshot);return snapshot;
 }
 function authorizedResult(state:Readonly<State>,id:string,source:Source,config:Config,now:number){
   const r=state.results?.find(r=>r.id===id);
   if(!r||r.source.kind!==source.kind||r.source.userId!==source.userId||r.source.channel!==source.channel||r.source.threadTs!==source.threadTs||r.expiresAt<=now||r.policy!==resultPolicy(config)||containsSensitiveContent(r.text))throw Error('RESULT_UNAVAILABLE');try{if(resultSensitive(JSON.parse(r.text)))throw Error('RESULT_UNAVAILABLE');}catch(e){if((e as Error).message==='RESULT_UNAVAILABLE')throw e;}return r;
 }
+export function nextResultCommand(state:Readonly<State>,id:string,source:Source,config:Config,now=Date.now()){const r=authorizedResult(state,id,source,config,now);if(!r.nextQuery)throw Error('RESULT_UNAVAILABLE');return r.nextCommand==='session.messages'?'session.messages':'session.list';}
 export function nextResultQuery(state:Readonly<State>,id:string,source:Source,config:Config,now=Date.now()){const r=authorizedResult(state,id,source,config,now);if(!r.nextQuery)throw Error('RESULT_UNAVAILABLE');return structuredClone(r.nextQuery);}
 export function readResult(state:Readonly<State>,id:string,page:number,source:Source,config:Config,now=Date.now()){
   const r=authorizedResult(state,id,source,config,now);
@@ -39,6 +41,11 @@ export function compactResult(work:Work,result:any,snapshot?:ResultSnapshot):str
   let summary:string;
   if(c==='help')summary=p.command?String(result):`Commands: ${Object.keys(COMMANDS).join(', ')}\nUse help {"command":"session.list"} for parameters and examples. Slack session.list defaults to loaded sessions, at most 10 per source; view=active filters current loaded metadata, history is explicit. Use a new request ID for each page.`;
   else if(c==='capabilities')summary=`Backend ${result.connected?'connected':'disconnected'}; version=${clean(result.version)}; transport=${clean(result.transport)}\ninstance=${clean(result.instanceId)}; Slack transport=${clean(result.slackTransport?.revision)}; self=${clean(result.slackTransport?.connectorUserId)}\nabsoluteReadonly=${result.fileTools?.allowAbsolutePaths===true}; allSharedSessions=${result.sessionPolicy?.allowAllSharedSessions===true}; attached=${result.attachedThreads?.length||0}\nlastFailure=${clean(result.lastFailure??'none')}; unsupportedMethods=${(result.unsupportedMethods||[]).map((s:any)=>clean(s,60)).join(',')||'none'}`;
+  else if(c==='session.overview'){
+    const hint=(slot:any,max:number)=>clean(slot?.message?.excerpt??slot?.message?.textStatus??slot?.status??'unknown',max);
+    summary=`Selected=${result.count}; deterministic excerpts of available persisted messages, not a semantic task summary. Separate reads, not atomic.\n`+(result.items||[]).map((r:any)=>r.error?`${clean(r.threadId,64)}: ${clean(r.error,50)}`:`${clean(r.threadId,64)} | ${clean(r.metadata?.name||'',20)} | ${clean(r.metadata?.status?.type,12)}\nfirst user: ${hint(r.firstUser,25)}; last user: ${hint(r.lastUser,25)}\nlatest model (${clean(r.latestAssistant?.message?.phase??'unknown',15)}): ${hint(r.latestAssistant,35)}`).join('\n');
+  }
+  else if(c==='session.messages'||c==='result.next'&&result.kind==='session.messages')summary=`Thread ${clean(result.threadId,128)}; visible=${result.returnedCount}; scanned=${result.scannedItems}; more=${Boolean(result.nextCursor)}; ${result.order}; role=${result.role}. One page, excerpts only.\n`+(result.items||[]).slice(0,3).map((r:any)=>`${clean(r.turnId,128)} ${r.role} (${clean(r.phase??'unknown',20)}): ${clean(r.excerpt??r.textStatus,180)}`).join('\n');
   else if(c==='session.list'||c==='result.next'){
     const rows=result.sessions||[],unknown=result.unknownLoadedCount??result.unresolvedLoadedIds?.length??0;
     summary=`Sessions view=${result.view||p.view||'loaded'}; returned=${rows.length}; unknownLoaded=${unknown}; more=${Boolean(result.nextCursor)}. scannedLoaded=${result.scanned?.loaded??'unknown'}, scannedHistory=${result.scanned?.history??'unknown'}; limitPerSource=${result.pageLimitPerSource}. Page counts, not a global total.\n`+rows.slice(0,10).map((r:any)=>`${clean(r.id,128)} | ${r.loaded===true?'loaded':'history(current unknown)'}:${clean(r.status?.type,20)} | ${clean(r.name||r.reason||'',55)}${r.connectorSessionId?` | session=${clean(r.connectorSessionId,128)}`:''}`).join('\n');
@@ -58,7 +65,7 @@ export function compactResult(work:Work,result:any,snapshot?:ResultSnapshot):str
   const full=typeof result==='string'?result:JSON.stringify(result);
   if(containsSensitiveContent(full)||resultSensitive(result))return`[${clean(work.request.id,128)}] Sensitive-looking output withheld; inspect locally.`;
   const pages=snapshot?Math.max(1,Math.ceil([...snapshot.text].length/RESULT_PAGE_SIZE)):0;
-  const next=snapshot?.nextQuery?`\nNext discovery page: result.next {"resultId":"${snapshot.id}"}.`: '';
+  const next=snapshot?.nextQuery?`\nNext query page: result.next {"resultId":"${snapshot.id}"}.`: '';
   const footer=snapshot?`${next}\nDetail: result.page {"resultId":"${snapshot.id}","page":1} (${pages} pages; same actor/thread; up to 15 min; earlier eviction possible).`:'\nDetail unavailable (size/security limit); request a smaller page or inspect locally.';
   return`[${clean(work.request.id,128)}] ${budget(summary)}${[...summary].length>1500?'\n[Summary shortened; complete result in detail]':''}${footer}`;
 }
