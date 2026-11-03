@@ -194,3 +194,7 @@ Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:activ
 ## 选定会话的上下文概览
 
 先 `session.list`，再用 `session.overview` 对 1–5 个 Codex threadId 获取首条/最近用户消息与最近可见模型消息的有界摘录；定位后用同一 threadId 调 `session.messages` 只读翻页或显式 `session.subscribe`。无需先绑定/恢复会话，不调用额外模型总结。范围、覆盖不足和 ID 区别见 [会话概览接口](docs/SESSION-OVERVIEW.md)。
+
+### 最近活跃会话
+
+`session.recent {"limit":5}` 根据生产者生命周期时间列出有界候选中的最近活动；当前 idle 也可入选。没有真实活动时间的记录单列为后端更新参考，不混称执行。只查元数据、不自动接管或订阅，也不会把查询/重连算成活跃。随后用精确 Codex threadId 查询概览和对话。完整范围、时间来源和限制见 [SESSION-RECENT.md](docs/SESSION-RECENT.md)。

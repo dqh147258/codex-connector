@@ -36,9 +36,21 @@ CODEX_CONNECTOR_COMMAND_BEGIN
 CODEX_CONNECTOR_COMMAND_END
 ```
 
+## Recent execution evidence, then task identification
+
+For “recently active 5 sessions”, use this metadata-only query. `limit` is 1–20, default 5. Ranked lifecycle evidence is distinct from `updatedCandidates` (generic backend-update references), and coverage is bounded, not global top N. Missing activity timestamps do not imply inactivity. Current running/idle/unknown state is a separate observation. The connector does not automatically attach sessions to collect a complete activity history.
+
+```text
+CODEX_CONNECTOR_COMMAND_BEGIN
+{"v":1,"id":"dot-recent-0001","target":"my-computer","command":"session.recent","params":{"limit":5}}
+CODEX_CONNECTOR_COMMAND_END
+```
+
+Use `result.page` if needed to inspect errors, activity source and coverage. This command has no `result.next` continuation. Select a few exact Codex thread IDs from the result for overview below, then read messages or subscribe only as requested. Do not use a backend update timestamp, receipt time, or connector control handle as proof of execution or as the Codex thread ID.
+
 ## Select a few candidates, then read one exact thread
 
-After discovery, use 1–5 distinct **Codex thread IDs**, not connector session handles. Read the overview's per-thread errors, scan coverage and message phase/text status before inferring the task. These are excerpts from available persisted items, not semantic summaries or a current-task guarantee.
+After recent/list discovery, use 1–5 distinct **Codex thread IDs**, not connector session handles. Read the overview's per-thread errors, scan coverage and message phase/text status before inferring the task. These are excerpts from available persisted items, not semantic summaries or a current-task guarantee.
 
 ```text
 CODEX_CONNECTOR_COMMAND_BEGIN

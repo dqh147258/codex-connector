@@ -1,3 +1,4 @@
+import type { ActivityRecord } from './session-activity.js';
 import type { Subscription } from './subscriptions.js';
 import type { CommandEnvelope } from './protocol.js';
 export interface Config {
@@ -20,7 +21,7 @@ export interface Pending {
   method: string; kind: 'command'|'file'|'input'|'unsupported'; status: 'pending'|'responding'|'resolved'|'stale'|'expired'|'local-required';
   details: Record<string, any>; expiresAt: number; decisions: string[];
 }
-export interface State { version: 2; subscriptions?:Subscription[]; results?:ResultSnapshot[]; sessions: Session[]; work: Work[]; outbox: Delivery[]; pending: Pending[]; seenEvents: Record<string, string>; seenNotifications: Record<string, true>; dot?: { userId: string; name: string; selector?: string } }
+export interface State { version: 2; activity?:ActivityRecord[]; subscriptions?:Subscription[]; results?:ResultSnapshot[]; sessions: Session[]; work: Work[]; outbox: Delivery[]; pending: Pending[]; seenEvents: Record<string, string>; seenNotifications: Record<string, true>; dot?: { userId: string; name: string; selector?: string } }
 export interface Backend {
   epoch: string; connected: boolean;
   connect(): Promise<void>; close(): Promise<void>; rpc(method: string, params: unknown): Promise<any>; respond(id: string|number, result: unknown): Promise<void>;

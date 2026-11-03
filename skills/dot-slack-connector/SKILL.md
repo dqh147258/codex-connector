@@ -32,10 +32,21 @@ Connector replies stay in the originating Slack thread. A top-level command beco
 ## Start with discovery, not control
 
 1. Ask `help` or `help {"command":"session.list"}`, then `capabilities` when connection/method support is unknown. A connected Slack socket is not proof the shared Codex backend is available.
-2. Use `session.list {"view":"loaded","limit":10}` to find currently loaded shared IDs, or `view:"active"` for fresh active metadata within the current loaded page.
+2. For “recently active N”, use `session.recent {"limit":5}` (1–20, default 5) and the evidence rules below. For **currently** loaded shared IDs use `session.list {"view":"loaded","limit":10}`, or `view:"active"` for fresh active metadata within the current loaded page. Recent activity and currently running are different questions.
 3. `history` is indexed history, **not currently running sessions**. `all` combines sources. Slack defaults to loaded and caps each source at 10; desktop/local defaults to all and 50. “Returned”, “scanned” and “unknownLoaded” are page counts, not global totals. Unknown metadata is not idle; an empty active page can still have more pages.
 4. When a summary advertises a next result handle, use `result.next {"resultId":"..."}` in the same thread as the same authenticated actor. For a session list, this fetches the next discovery page with its stored filter. Do not decode opaque cursors, use truncated IDs containing `…`, or reuse a cursor with another view/project.
-5. Select only a few plausible **Codex thread IDs** from the list and use the overview workflow below to identify their task. If several still fit, ask the user. Never choose “latest” or use current-activity claims from history rows.
+5. Select only a few plausible **Codex thread IDs** from recent/list results and use the overview workflow below to identify their task. If several still fit, ask the user. Never choose “latest” or use current-activity claims from history rows.
+
+## Interpret recent activity as bounded evidence
+
+`session.recent` returns up to the requested number of ranked `sessions` from at most 40 candidate IDs. Candidates interleave the connector's observed lifecycle ledger, a loaded-ID page, and indexed history ordered by backend `updated_at`. Rank uses genuine producer turn/item lifecycle timestamps, including a metadata-only latest-turn query with `itemsView:notLoaded`. It does not read message content, resume/attach sessions, start turns, or call a model.
+
+- Read `lastActivityAt`, `activitySource` and `activityEvent` together. `observed-lifecycle` is a timed event the connector actually received; `latest-turn-lifecycle` comes from the sampled latest turn. `observedAtMs` is when an event was received, not when execution happened. Delayed/replayed events must not be described as newly executed just because they arrived now.
+- `updatedCandidates` are a **separate reference list** based on generic backend updates. Their `backendUpdatedAtMs` can help locate candidates but is not execution evidence. Do not mix them into the ranked activity list or use their update time as `lastActivityAt`.
+- Recent execution evidence does not prove a session is currently running. Check `currentState` separately; unknown state is not idle. A null activity time or fewer than N ranked results means evidence is missing, not that every other session was inactive.
+- Inspect `coverage` (`globalTopN:false`, candidate/inspected/known counts, source errors and more-page indicators), per-thread `failures` and `turnMetadataError`. This is not a global top-N guarantee, complete execution log, or atomic snapshot. Latest-turn sampling can miss other activity. The bounded ledger only records supported timed lifecycle events actually seen; it does not auto-subscribe/attach every session or guarantee activity while the connector was offline.
+
+Report “the most recent execution evidence among the inspected candidates”, preserving unknowns. If the user needs task identity, choose a small subset for `session.overview`, then `session.messages` or an explicitly requested subscription using their exact Codex thread IDs. A returned `connectorSessionId` is still a separate control handle. Recent results support `result.page` for their existing detail, not a `result.next` continuation; use a separate scoped list/query when additional discovery is needed.
 
 ## Inspect selected tasks without attaching
 
@@ -76,7 +87,7 @@ A compact summary is an index, not the complete result. Read `result.page {"resu
 
 Result access is restricted to the same authenticated actor and channel/thread, lasts at most 15 minutes, can be evicted earlier, and is invalidated by relevant policy changes. Old messages are not deleted when snapshots expire. For expired/unavailable detail, narrow and rerun a harmless query if still needed; **never rerun a mutation merely to recover its output**. Long assistant replies may assign detail access to the configured trusted dot in their output thread; another actor cannot reuse that handle.
 
-`result.page`, `session.subscriptions` and `session.unsubscribe` can be used in their allowed output origin. Subscribe and other ordinary commands, including overview, messages and query continuation, belong in the configured input channel. Do not move a handle to another channel to bypass this restriction. If payload/secret limits prevent detail, reduce the query or use an authorized local view, not secret extraction or repeated full dumps. Only first output fragments mention dot; don't turn continuations into new mention storms.
+`result.page`, `session.subscriptions` and `session.unsubscribe` can be used in their allowed output origin. Subscribe and other ordinary commands, including recent, overview, messages and query continuation, belong in the configured input channel. Do not move a handle to another channel to bypass this restriction. If payload/secret limits prevent detail, reduce the query or use an authorized local view, not secret extraction or repeated full dumps. Only first output fragments mention dot; don't turn continuations into new mention storms.
 
 Correlate request IDs and actual results. “Accepted”, a tool send receipt, or a queued reply is not completed execution/delivery. On `REQUEST_ALREADY_ACCEPTED`, inspect the existing operation; do not mint a new ID to force it again. On `RPC_OUTCOME_UNCERTAIN`, stop dependent mutations and ask the local operator to inspect. Do not run local recovery, service actions or arbitrary RPC/shell through chat.
 
