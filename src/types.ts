@@ -1,3 +1,4 @@
+import type { MessageDelivery } from './session-delivery.js';
 import type { ActivityRecord } from './session-activity.js';
 import type { Subscription } from './subscriptions.js';
 import type { CommandEnvelope } from './protocol.js';
@@ -7,13 +8,14 @@ export interface Config {
     trustedBots: { botId: string; userId: string; appId: string }[]; dot: { name: string; userId?: string } };
   projects: Record<string, string>;
   sessionPolicy?: { allowAllSharedSessions: boolean };
+  screenPolicy?: { enabled: boolean };
   filePolicy?: { allowAbsolutePaths: boolean };
   backend: { executable: string; socketPath?: string; expectedVersion?: string; autoStartDaemon?: boolean };
   approvalTimeoutSec: number;
 }
 export interface Source { kind: 'human' | 'bot' | 'local'; userId: string; channel: string; ts: string; threadTs: string; eventId: string }
 export interface Session { id: string; threadId: string; project: string; cwd?: string; channel: string; threadTs?: string; createdAt: string }
-export interface Work { id: string; eventId: string; request: CommandEnvelope; source: Source; status: 'queued'|'executing'|'completed'|'failed'|'uncertain'; createdAt: string; error?: string; resultRef?: {sessionId?:string;threadId?:string;turnId?:string;resultId?:string} }
+export interface Work { messageDelivery?: MessageDelivery; id: string; eventId: string; request: CommandEnvelope; source: Source; status: 'queued'|'executing'|'completed'|'failed'|'uncertain'; createdAt: string; error?: string; resultRef?: {sessionId?:string;threadId?:string;turnId?:string;resultId?:string} }
 export interface ResultSnapshot { id:string; command:string; source:Source; createdAt:number; expiresAt:number; policy:string; text:string; nextQuery?:Record<string,unknown>; nextCommand?:'session.list'|'session.messages' }
 export interface Delivery { id: string; origin?: Source; sessionId?: string; channel: string; threadTs?: string; root: boolean; text: string; mention?:boolean; subscriptionId?:string; notificationThreadId?:string; status: 'queued'|'sending'|'sent'|'uncertain'|'failed'; attempts: number; nextAttemptAt: number; ts?: string; error?: string }
 export interface Pending {
@@ -29,6 +31,7 @@ export interface Backend {
   on(event: 'notification'|'request'|'disconnect', listener: (...args: any[]) => void): this;
 }
 export interface SlackPort {
+  uploadScreens?(channel: string, threadTs: string, images: import('./screens.js').ScreenImage[], requestId: string): Promise<void>;
   post(channel: string, text: string, options: { threadTs?: string; mentionUserId?: string; deliveryId: string }): Promise<string>;
   resolveDot(name: string, userId?: string): Promise<{userId: string; name: string}>;
   threadExists(channel: string, threadTs: string): Promise<boolean>;

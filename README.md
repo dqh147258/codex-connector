@@ -97,7 +97,7 @@ node dist/src/cli.js help --command session.create
 | 类别 | 命令 |
 |---|---|
 | 说明 | `help`、`capabilities` |
-| 会话 | `session.list/info/history/create/attach/send/steer/queue/interrupt/reply` |
+| 会话 | `session.list/info/history/delivery/create/attach/send/steer/queue/interrupt/reply` |
 | 审批/输入 | `approval.list/respond`、`input.respond` |
 | 文件只读 | `files.list/stat/read/search` |
 
@@ -117,7 +117,7 @@ node dist/src/cli.js help --command session.create
 {"command":"session.interrupt","params":{"sessionId":"...","turnId":"..."}}
 ```
 
-上面只展示 command/params；实际必须放入完整 envelope。`session.info` 提供近期 turn ID/status。`send` 检查输入能力后使用 `thread/queue/add` + `thread/queue/start`，不通过可能隐式 steer 的 `turn/start`。若另一共享客户端抢先启动任务，已加入的消息保留在队列并报告 startError，不重复入队也不悄悄改变正在运行的 turn；当前版本缺少 queue API 时明确失败，不回退。已知忙碌时使用带精确 turn ID 的 `steer` 或 queue。Codex 版本/运行时可能拒绝子代理、独立 `--no-daemon`、特殊来源或不能直接输入的会话；会明确显示 `DIRECT_INPUT_UNAVAILABLE` 等错误。
+上面只展示 command/params；实际必须放入完整 envelope。`session.info` 提供近期 turn ID/status。`send` 检查输入能力后使用 `thread/queue/add` + `thread/queue/start`，不通过可能隐式 steer 的 `turn/start`。`queue/add` 可能在响应前唤醒并消费消息，因此 `startError` 只能说明启动请求未获确认，不能断言消息仍在队列或没有收到。发送结果分别报告队列接纳、启动请求和关联 turn 的执行状态；用 `session.delivery {sessionId,workId}` 只读核对最新证据。不重复入队也不悄悄改变正在运行的 turn；当前版本缺少 queue API 时明确失败，不回退。已知忙碌时使用带精确 turn ID 的 `steer` 或 queue。完整状态语义、并发限制和验证方式见 [SESSION-DELIVERY.md](docs/SESSION-DELIVERY.md)。Codex 版本/运行时可能拒绝子代理、独立 `--no-daemon`、特殊来源或不能直接输入的会话；会明确显示 `DIRECT_INPUT_UNAVAILABLE` 等错误。
 
 **只有显式绑定且仍符合本机会话控制策略的会话会被转发**，不会自动广播其他会话。历史只输出用户/assistant 文本，不输出工具日志、推理、图片或原始本地文件路径；长文本有界截断并保留分页游标。
 
@@ -198,3 +198,7 @@ Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:activ
 ### 最近活跃会话
 
 `session.recent {"limit":5}` 根据生产者生命周期时间列出有界候选中的最近活动；当前 idle 也可入选。没有真实活动时间的记录单列为后端更新参考，不混称执行。只查元数据、不自动接管或订阅，也不会把查询/重连算成活跃。随后用精确 Codex threadId 查询概览和对话。完整范围、时间来源和限制见 [SESSION-RECENT.md](docs/SESSION-RECENT.md)。
+
+## 远程屏幕截图（默认关闭）
+
+桌面版本新增 `screen.list` 与 `screen.capture {"displayId":"all"}` / 精确屏幕 ID：一次截图作为 JPEG 上传至原 Slack 线程。需要本机显式启用、系统屏幕录制权限和 Slack `files:write`；不逐次确认、不后台截屏。画面不自动脱敏。Wayland/PipeWire 不支持可靠的全部/指定屏幕映射，纯 CLI 无截图 provider。设置、风险、平台限制与验收说明见 [SCREENSHOTS.md](docs/SCREENSHOTS.md)。

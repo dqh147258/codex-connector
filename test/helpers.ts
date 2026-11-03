@@ -17,7 +17,8 @@ export class FakeBackend extends EventEmitter implements Backend {
     if(method==='thread/read'||method==='thread/resume'){const thread=this.threads.get(params.threadId);if(!thread)throw Error('not found');return{thread};}
     if(method==='thread/start'){const thread={id:randomUUID(),cwd:params.cwd,canAcceptDirectInput:true,status:{type:'idle'},model:'configured-model'};this.threads.set(thread.id,thread);return{thread};}
     if(method==='thread/items/list')return{data:[{turnId:'turn-1',item:{type:'agentMessage',text:'safe history'}}],nextCursor:null};
-    if(method==='thread/queue/add')return{queuedSubmission:{id:'queued-1'}};
+    if(method==='thread/queue/list'||method==='thread/turns/list')return{data:[],nextCursor:null};
+    if(method==='thread/queue/add')return{queuedSubmission:{id:'queued-1',clientUserMessageId:params.clientUserMessageId,input:params.input}};
     if(method==='turn/start'||method==='turn/steer'||method==='thread/queue/start')return{turn:{id:'turn-1',status:'inProgress'}};
     return{};
   }

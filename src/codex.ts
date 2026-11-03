@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import type { Backend, Config } from './types.js';
 const runFile = promisify(execFile);
-const METHODS = new Set(['thread/list','thread/loaded/list','thread/read','thread/start','thread/resume','thread/turns/list','thread/items/list','turn/start','turn/steer','turn/interrupt','thread/queue/add','thread/queue/start']);
+const METHODS = new Set(['thread/list','thread/loaded/list','thread/read','thread/start','thread/resume','thread/turns/list','thread/items/list','turn/start','turn/steer','turn/interrupt','thread/queue/add','thread/queue/start','thread/queue/list']);
 export class BackendError extends Error { constructor(readonly code: string, message = code) { super(message); } }
 export function codexLaunch(path: string, args: string[]) {
   if (/\.(cmd|bat)$/i.test(path)) throw new BackendError('SHELL_SHIM_FORBIDDEN');

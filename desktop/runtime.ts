@@ -1,3 +1,4 @@
+import { ScreenError, validDisplayId, type ScreenPort } from '../src/screens.js';
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFileSync, existsSync } from 'node:fs';
@@ -14,7 +15,7 @@ export function desktopChildEnvironment(home:string,tokens:{appToken:string;botT
 }
 export class DesktopRuntime {
   private child?:ChildProcess;private state:RuntimeSnapshot['state']='stopped';private lastError?:string;private backend?:Record<string,unknown>;private stopping?:Promise<RuntimeSnapshot>;private config?:Config;
-  constructor(private home:string,private cliPath:string,private executable=process.execPath,private spawnChild:typeof spawn=spawn,private stopTimeout=45000){}
+  constructor(private home:string,private cliPath:string,private executable=process.execPath,private spawnChild:typeof spawn=spawn,private stopTimeout=45000,private screens?:ScreenPort){}
   snapshot():RuntimeSnapshot{return{state:this.state,owned:!!this.child,backend:this.backend,lastError:this.lastError};}
   start(config:Config,tokens:{appToken:string;botToken:string}){
     if(this.child||this.stopping)throw Error('ALREADY_RUNNING');
@@ -23,10 +24,30 @@ export class DesktopRuntime {
     const child=this.spawnChild(this.executable,[this.cliPath,'start','--home',this.home],{env:desktopChildEnvironment(this.home,tokens),shell:false,windowsHide:true,stdio:['ignore','pipe','pipe','ipc']});this.child=child;
     // Never forward stdout/stderr: upstream diagnostics can contain private data.
     child.stdout?.on('data',()=>{});child.stderr?.on('data',()=>{});
-    child.on('message',(m:any)=>{if(this.child!==child)return;if(m?.type==='connector:ready'&&this.state==='starting')this.state='running';if(m?.type==='connector:stopping')this.state='stopping';if(m?.type==='connector:failure'&&['LOCK_EXISTS','CONFIGURATION_INVALID','LOCAL_PORT_IN_USE','WORKSPACE_MISMATCH','SLACK_AUTH_FAILED','SERVER_START_FAILED'].includes(m.code)){this.lastError=m.code;this.state='failed';}});
+    child.on('message',(m:any)=>{if(this.child!==child)return;if(m?.type==='connector:screens'){void this.screenRequest(child,m);return;}if(m?.type==='connector:ready'&&this.state==='starting')this.state='running';if(m?.type==='connector:stopping')this.state='stopping';if(m?.type==='connector:failure'&&['LOCK_EXISTS','CONFIGURATION_INVALID','LOCAL_PORT_IN_USE','WORKSPACE_MISMATCH','SLACK_AUTH_FAILED','SERVER_START_FAILED'].includes(m.code)){this.lastError=m.code;this.state='failed';}});
     child.on('error',()=>{if(this.child===child){this.lastError='SERVER_START_FAILED';this.state='failed';}});
     child.on('close',(code)=>{if(this.child!==child)return;this.child=undefined;this.backend=undefined;const requested=this.state==='stopping';this.state=requested||code===0?'stopped':'failed';if(this.state==='failed'&&!this.lastError)this.lastError='SERVER_EXITED';});
     return this.snapshot();
+  }
+  private screenRequestBusy=false;
+  private async screenRequest(child:ChildProcess,message:any){
+    if(typeof message.id!=='string'||!/^[a-f0-9-]{36}$/.test(message.id)||!['list','capture'].includes(message.operation)||Object.keys(message).some(k=>!['type','id','operation','displayId'].includes(k)))return;
+    const active=()=>this.child===child&&this.state==='running'&&child.connected&&this.config?.screenPolicy?.enabled===true;
+    const send=(value:Record<string,unknown>)=>{if(this.child===child&&child.connected)child.send?.({type:'connector:screens:result',id:message.id,...value},()=>{});};
+    if(!active()){send({error:'SCREEN_DISABLED'});return;}
+    if(!this.screens){send({error:'SCREEN_DESKTOP_REQUIRED'});return;}
+    if(this.screenRequestBusy){send({error:'SCREEN_BUSY'});return;}
+    if(message.operation==='capture'&&!validDisplayId(message.displayId)){send({error:'SCREEN_NOT_FOUND'});return;}
+    this.screenRequestBusy=true;
+    const deadline=Date.now()+25000;let expired=false,timer:ReturnType<typeof setTimeout>|undefined;
+    try{
+      const operation=message.operation==='list'?this.screens.list():this.screens.capture(message.displayId);
+      const result=await Promise.race([operation.then(result=>{if(expired){if(Array.isArray(result))for(const i of result)i.jpeg.fill(0);throw new ScreenError('SCREEN_CANCELLED');}return result;}),new Promise<never>((_,reject)=>{timer=setTimeout(()=>{expired=true;reject(new ScreenError('SCREEN_TIMEOUT'));},25000);})]);
+      if(!active()||Date.now()>deadline){if(Array.isArray(result))for(const i of result)i.jpeg.fill(0);send({error:'SCREEN_CANCELLED'});return;}
+      if(Array.isArray(result)){try{send({result:result.map(i=>({...i,jpeg:i.jpeg.toString('base64')}))});}finally{for(const i of result)i.jpeg.fill(0);}}
+      else send({result});
+    }catch(error){send({error:error instanceof ScreenError?error.code:'SCREEN_UNAVAILABLE'});}
+    finally{if(timer)clearTimeout(timer);this.screenRequestBusy=false;}
   }
   async refresh(){
     if(this.state!=='running'||!this.child||!this.config)return this.snapshot();

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { desktopScreenPort } from './screen-ipc.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
@@ -16,7 +17,7 @@ function options(args:string[]){const out:Record<string,string>={};for(let i=0;i
 async function start(){
   const config=loadConfig(),token=readToken(),appToken=process.env.SLACK_APP_TOKEN,botToken=process.env.SLACK_BOT_TOKEN;
   if(!appToken?.startsWith('xapp-')||!botToken?.startsWith('xoxb-'))throw Error('Slack app/bot tokens required only in daemon environment');
-  const store=new Store(home()),slack=new SlackClient(botToken),backend=new SharedAppServer(config.backend),connector=new Connector(config,store,backend,slack),server=apiServer(connector,token);
+  const store=new Store(home()),slack=new SlackClient(botToken),backend=new SharedAppServer(config.backend),connector=new Connector(config,store,backend,slack,1100,desktopScreenPort()),server=apiServer(connector,token);
   const socket=new SocketModeClient({appToken,logLevel:LogLevel.ERROR});let stopping=false;let stopTask:Promise<void>|undefined;let timer:NodeJS.Timeout|undefined;let tick:Promise<void>|undefined;
   const stop=()=>stopTask??=(async()=>{stopping=true;if(timer)clearInterval(timer);await socket.disconnect().catch(()=>{});await new Promise<void>(r=>server.close(()=>r()));await tick;await connector.close();store.close();})();
   const onSignal=()=>{void stop().then(()=>{if(process.env.CONNECTOR_DESKTOP_CHILD==='1'&&process.connected)process.disconnect?.();}).catch(()=>{console.error('Shutdown uncertain; inspect proxy and lock before restart.');process.exitCode=1;});};process.on('SIGINT',onSignal);process.on('SIGTERM',onSignal);
@@ -39,7 +40,7 @@ async function main(){
   if(cmd==='help'||cmd==='--help'){console.log(`codex-connector0.2\ninit | doctor | start [--home PATH] | status | command --name NAME --params JSON [--id ID] | envelope --name NAME --params JSON\nrecover --kind command|outbox --id ID [--observed-ts SLACK_TS] (local operator only)\nservice-template --platform linux|macos|windows --mode login|prelogin --user USER --node ABS --script ABS --cwd ABS [--home ABS]\n\n${formatHelp(f.command)}`);return;}
   if(cmd==='init'){
     const dir=home();mkdirSync(dir,{recursive:true,mode:0o700});
-    const config={version:2,instanceId:'my-computer',port:17381,slack:{teamId:'T_REPLACE',inputChannel:'C_REPLACE',outputChannel:'C_REPLACE',allowedHumans:['U_REPLACE'],approvalUsers:['U_REPLACE'],trustedBots:[{botId:'B_REPLACE',userId:'U_DOT',appId:'A_REPLACE'}],dot:{name:'YOUR_DOT_NAME',userId:'U_DOT'}},projects:{demo:'/absolute/project'},sessionPolicy:{allowAllSharedSessions:false},filePolicy:{allowAbsolutePaths:false},backend:{executable:'/absolute/codex',autoStartDaemon:false},approvalTimeoutSec:300};
+    const config={version:2,instanceId:'my-computer',port:17381,slack:{teamId:'T_REPLACE',inputChannel:'C_REPLACE',outputChannel:'C_REPLACE',allowedHumans:['U_REPLACE'],approvalUsers:['U_REPLACE'],trustedBots:[{botId:'B_REPLACE',userId:'U_DOT',appId:'A_REPLACE'}],dot:{name:'YOUR_DOT_NAME',userId:'U_DOT'}},projects:{demo:'/absolute/project'},sessionPolicy:{allowAllSharedSessions:false},filePolicy:{allowAbsolutePaths:false},screenPolicy:{enabled:false},backend:{executable:'/absolute/codex',autoStartDaemon:false},approvalTimeoutSec:300};
     if(!existsSync(join(dir,'config.json')))writeFileSync(join(dir,'config.json'),JSON.stringify(config,null,2),{mode:0o600,flag:'wx'});
     if(!existsSync(join(dir,'api.token')))writeFileSync(join(dir,'api.token'),randomBytes(32).toString('hex'),{mode:0o600,flag:'wx'});
     console.log(`Initialized private templates in${dir}. Existing files preserved; no service/Codex was started.`);return;

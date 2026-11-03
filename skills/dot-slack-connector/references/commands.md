@@ -161,3 +161,10 @@ CODEX_CONNECTOR_COMMAND_END
 ```
 
 The question ID and option above are examples; use only the actual prompt's IDs and allowed options. `NEED_VERIFIABLE_HUMAN_DECISION` requires the human to use the original bound thread or local UI, not weaker proof. `STALE_OR_MISROUTED_REQUEST` requires a current exact request, not rewriting old IDs. No observation subscription, mention, user quote or help output confers approval authority.
+
+
+## Message delivery evidence
+
+`session.send` / `session.queue` return `workId`, `commandStatus`, `deliveryStatus`, and separate `admission`, `start`, `execution` evidence. Local immediate acceptance only means the connector inbox accepted work. Command `completed` is not model completion. A `startError` does not mean “still queued” or “not received”: queue/add can automatically dispatch before replying. Never resend with a new request ID to resolve uncertainty.
+
+Use `session.delivery {"sessionId":"session-demo","workId":"work-demo"}` to refresh exact evidence. It makes bounded read-only queue/items/turns queries (20 entries per page), never starts or resubmits. `refresh:false` returns cached evidence. Inspect coverage/errors; missing evidence is unknown, not non-delivery. Slack queries require the original actor/channel/thread. User-message correlation is `item.clientId`; assistant final text and unrelated latest turns do not establish completion. Only the exact correlated terminal turn supports completed/failed/interrupted. An observation gap or older snapshot is not live state. Full semantics: docs/SESSION-DELIVERY.md.

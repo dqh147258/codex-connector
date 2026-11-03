@@ -63,6 +63,7 @@
       'expected-version': backend.expectedVersion || '', 'socket-path': backend.socketPath || ''
     };
     for (const [id, value] of Object.entries(values)) $(id).value = String(value);
+    $('allow-screen-capture').checked = config.screenPolicy?.enabled === true;
     $('allow-absolute-paths').checked = config.filePolicy?.allowAbsolutePaths === true;
     updateProjectRequirements();
     $('allow-all-sessions').checked = config.sessionPolicy?.allowAllSharedSessions === true;
@@ -93,6 +94,7 @@
     if (alias && originalProject && alias !== originalProject && Object.hasOwn(c.projects, alias)) throw new Error('这个项目别名已被另一项目使用，请换一个名称。');
     if (originalProject && alias !== originalProject) delete c.projects[originalProject];
     if (alias) c.projects[alias] = projectPath;
+    c.screenPolicy = { enabled: $('allow-screen-capture').checked };
     c.filePolicy = { allowAbsolutePaths };
     c.sessionPolicy = { allowAllSharedSessions: $('allow-all-sessions').checked };
     c.backend = { ...(c.backend || {}), executable: $('codex-path').value.trim(), autoStartDaemon: $('auto-start-daemon').checked };

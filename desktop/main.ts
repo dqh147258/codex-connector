@@ -1,4 +1,5 @@
-import { app, BrowserWindow, ipcMain, dialog, safeStorage, shell, Tray, Menu, nativeImage, clipboard, session } from 'electron';
+import { DesktopScreens } from './screens.js';
+import { desktopCapturer, screen, systemPreferences, powerMonitor, app, BrowserWindow, ipcMain, dialog, safeStorage, shell, Tray, Menu, nativeImage, clipboard, session } from 'electron';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -23,7 +24,7 @@ async function confirm(title:string,message:string){const result=await dialog.sh
 const methods:Record<string,(value:any)=>unknown|Promise<unknown>>={
   snapshot:()=>snapshot(),
   listSessions:value=>runtime.listSessions(sessionListParams(value)),
-  saveConfig:async value=>{ensureStopped();const previous=settings.readConfig();if(value?.sessionPolicy?.allowAllSharedSessions===true&&!previous.sessionPolicy?.allowAllSharedSessions)await confirm('扩大共享会话管理范围','允许管理同账户、项目根以外的共享会话？只读文件范围不会扩大，原 Codex 沙箱不会改变。');if(value?.filePolicy?.allowAbsolutePaths===true&&previous.filePolicy?.allowAbsolutePaths!==true){await confirm('允许系统范围的绝对路径只读访问','高风险：配置中受信任的 Slack 用户和 bot 可以请求读取此操作系统账户可读的任意路径，并将内容发送到 Slack。敏感路径、秘密内容和文件类型防护仍然生效，但不构成完整的数据防泄漏保证；此开关不提升操作系统权限、不允许写入。仅在你明确接受这些接收者访问范围后确认。');ensureStopped();}if(value?.backend?.autoStartDaemon===true&&!previous.backend.autoStartDaemon)await confirm('允许启动共享 Codex daemon','连接时可运行官方 daemon start；它可能准备 daemon 包或管理 Codex 自身更新器。不提权、不停止共享 daemon。');ensureStopped();settings.saveConfig(value);return snapshot();},
+  saveConfig:async value=>{ensureStopped();const previous=settings.readConfig();if(value?.sessionPolicy?.allowAllSharedSessions===true&&!previous.sessionPolicy?.allowAllSharedSessions)await confirm('扩大共享会话管理范围','允许管理同账户、项目根以外的共享会话？只读文件范围不会扩大，原 Codex 沙箱不会改变。');if(value?.filePolicy?.allowAbsolutePaths===true&&previous.filePolicy?.allowAbsolutePaths!==true){await confirm('允许系统范围的绝对路径只读访问','高风险：配置中受信任的 Slack 用户和 bot 可以请求读取此操作系统账户可读的任意路径，并将内容发送到 Slack。敏感路径、秘密内容和文件类型防护仍然生效，但不构成完整的数据防泄漏保证；此开关不提升操作系统权限、不允许写入。仅在你明确接受这些接收者访问范围后确认。');ensureStopped();}if(value?.screenPolicy?.enabled===true&&previous.screenPolicy?.enabled!==true){await confirm('允许远程屏幕截图','已配置的 Slack 用户和可信 bot 可显式请求截取全部屏幕或选定屏幕，并发送至请求所在的已授权 Slack 线程，无需逐次本机确认。屏幕像素不会自动脱敏，可能包含密码、私人信息或其他应用内容；请先关闭敏感内容。Electron 可在内存中临时取得所有屏幕缩略图，但只发送请求的屏幕。图片不写入本地状态文件；Slack 的文件保留规则仍适用。不会后台定时截图。需要 Slack files:write 和系统屏幕录制权限。');ensureStopped();}if(value?.backend?.autoStartDaemon===true&&!previous.backend.autoStartDaemon)await confirm('允许启动共享 Codex daemon','连接时可运行官方 daemon start；它可能准备 daemon 包或管理 Codex 自身更新器。不提权、不停止共享 daemon。');ensureStopped();settings.saveConfig(value);return snapshot();},
   saveCredentials:value=>{ensureStopped();settings.saveCredentials(value);const c=settings.credentialStatus();return{appToken:c.appToken,botToken:c.botToken,secureStorage:c.secureStorageAvailable};},
   savePreferences:value=>{settings.savePreferences(value);return settings.readPreferences();},
   testSlack:async()=>{const c=credentials();const r=await slack.testTokens(c.appToken,c.botToken);return{...r,selfUserId:r.connectorUserId,selfBotId:r.connectorBotId};},
@@ -47,7 +48,7 @@ async function requestQuit(){
 if(!app.requestSingleInstanceLock())app.quit();else{
   app.on('second-instance',show);
   app.whenReady().then(async()=>{
-    settings=new DesktopSettings(home,safeStorage);runtime=new DesktopRuntime(home,join(root,'dist/src/cli.js'));
+    settings=new DesktopSettings(home,safeStorage);runtime=new DesktopRuntime(home,join(root,'dist/src/cli.js'),process.execPath,undefined,45000,new DesktopScreens({displays:()=>screen.getAllDisplays(),primaryId:()=>screen.getPrimaryDisplay().id,sources:()=>desktopCapturer.getSources({types:['screen'],thumbnailSize:{width:2560,height:2560},fetchWindowIcons:false}),permission:()=>process.platform==='darwin'?systemPreferences.getMediaAccessStatus('screen'):'os-managed',locked:()=>powerMonitor.getSystemIdleState(1)==='locked'},()=>!shutdownRequested&&settings.readConfig().screenPolicy?.enabled===true));
     session.defaultSession.setPermissionRequestHandler((_wc,_permission,callback)=>callback(false));session.defaultSession.setPermissionCheckHandler(()=>false);
     window=new BrowserWindow({width:1180,height:820,minWidth:850,minHeight:660,title:'Codex Connector',backgroundColor:'#f5f6f8',show:false,webPreferences:{preload:join(root,'desktop/preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true,allowRunningInsecureContent:false,devTools:!app.isPackaged}});
     window.webContents.setWindowOpenHandler(()=>({action:'deny'}));window.webContents.on('will-navigate',e=>e.preventDefault());window.webContents.on('will-attach-webview',e=>e.preventDefault());
