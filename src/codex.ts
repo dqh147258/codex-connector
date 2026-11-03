@@ -6,9 +6,16 @@ import WebSocket from 'ws';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import type { Backend, Config } from './types.js';
+import { classifyRpcError, validRpcDiagnostic, type RpcDiagnostic } from './rpc-diagnostics.js';
 const runFile = promisify(execFile);
 const METHODS = new Set(['thread/list','thread/loaded/list','thread/read','thread/start','thread/resume','thread/turns/list','thread/items/list','turn/start','turn/steer','turn/interrupt','thread/queue/add','thread/queue/start','thread/queue/list']);
-export class BackendError extends Error { constructor(readonly code: string, message = code) { super(message); } }
+export class BackendError extends Error {
+  readonly diagnostic?: RpcDiagnostic;
+  constructor(readonly code: string, message = code, diagnostic?: RpcDiagnostic) {
+    super(message);
+    if (validRpcDiagnostic(diagnostic)) this.diagnostic = Object.freeze({ rpcCode: diagnostic.rpcCode, classification: diagnostic.classification });
+  }
+}
 export function codexLaunch(path: string, args: string[]) {
   if (/\.(cmd|bat)$/i.test(path)) throw new BackendError('SHELL_SHIM_FORBIDDEN');
   return /\.(js|mjs|cjs)$/i.test(path) ? { file: process.execPath, args: [path, ...args] } : { file: path, args };
@@ -16,7 +23,7 @@ export function codexLaunch(path: string, args: string[]) {
 export class SharedAppServer extends EventEmitter implements Backend {
   epoch = ''; connected = false;
   private child?: ChildProcessWithoutNullStreams; private socket?: WebSocket; private connecting?: Promise<void>; private counter = 0;
-  private pending = new Map<number, {resolve:(x:any)=>void;reject:(e:Error)=>void;timer:NodeJS.Timeout}>();
+  private pending = new Map<number, {resolve:(x:any)=>void;reject:(e:Error)=>void;timer:NodeJS.Timeout;method:string;queuedSubmissionId?:string}>();
   private unsupported = new Set<string>(); private version = ''; private lastFailure = ''; private stopped = false; private daemonStartAttempted=false; private daemonStartResult='not-requested';
   constructor(private config: Config['backend'], private timeoutMs = 30000) { super(); }
   capabilities() { return { transport:'shared-daemon-proxy', daemonStart:{enabled:this.config.autoStartDaemon===true,attempted:this.daemonStartAttempted,result:this.daemonStartResult}, connected:this.connected, epoch:this.epoch, version:this.version || null, expectedVersion:this.config.expectedVersion || null, lastFailure:this.lastFailure || null, unsupportedMethods:[...this.unsupported], arbitraryRpc:false, policyOverrides:false, sharedTakeover:'requires runtime verification; no fallback to independent app-server' }; }
@@ -93,7 +100,8 @@ export class SharedAppServer extends EventEmitter implements Backend {
     const id = ++this.counter;
     return new Promise((resolve,reject) => {
       const timer = setTimeout(() => { this.pending.delete(id); reject(new BackendError('RPC_OUTCOME_UNCERTAIN')); },this.timeoutMs);
-      this.pending.set(id,{resolve,reject,timer}); void this.write({id,method,params}).catch(e=>{ clearTimeout(timer);this.pending.delete(id);reject(e); });
+      const queuedSubmissionId = method === 'thread/queue/start' && params && typeof params === 'object' && 'queuedSubmissionId' in params && typeof params.queuedSubmissionId === 'string' ? params.queuedSubmissionId : undefined;
+      this.pending.set(id,{resolve,reject,timer,method,queuedSubmissionId}); void this.write({id,method,params}).catch(e=>{ clearTimeout(timer);this.pending.delete(id);reject(e); });
     });
   }
   private message(m:any,epoch:string) {
@@ -101,9 +109,9 @@ export class SharedAppServer extends EventEmitter implements Backend {
     if (m?.id !== undefined && typeof m.method === 'string') { this.emit('request', {id:m.id,method:m.method,params:m.params||{},epoch}); return; }
     if (m?.id !== undefined) {
       const p=this.pending.get(m.id);if(!p)return;
-      if(Object.hasOwn(m,'result')===Object.hasOwn(m,'error')||(Object.hasOwn(m,'error')&&(!m.error||typeof m.error!=='object'||Array.isArray(m.error)||!Number.isInteger(m.error.code)||typeof m.error.message!=='string')))throw new BackendError('INVALID_PROTOCOL');
+      if(Object.hasOwn(m,'result')===Object.hasOwn(m,'error')||(Object.hasOwn(m,'error')&&(!m.error||typeof m.error!=='object'||Array.isArray(m.error)||!Number.isSafeInteger(m.error.code)||typeof m.error.message!=='string')))throw new BackendError('INVALID_PROTOCOL');
       this.pending.delete(m.id);clearTimeout(p.timer);
-      m.error ? p.reject(new BackendError(m.error.code === -32601 ? 'METHOD_UNSUPPORTED' : 'RPC_REJECTED')) : p.resolve(m.result);return;
+      m.error ? p.reject(new BackendError(m.error.code === -32601 ? 'METHOD_UNSUPPORTED' : 'RPC_REJECTED', undefined, classifyRpcError(p.method,m.error.code,m.error.message,p.queuedSubmissionId))) : p.resolve(m.result);return;
     }
     if (typeof m?.method === 'string') this.emit('notification',m.method,m.params||{},epoch);
   }

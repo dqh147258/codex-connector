@@ -39,3 +39,6 @@ An optional local-only default-off autoStartDaemon flag invokes only the officia
 ## Explicit limitations
 
 No guarantee for arbitrary older/newer app-server versions, standalone `--no-daemon` processes, unsupported subagents or protected original-owner approvals. No real Slack/Windows/macOS/shared-active-session end-to-end validation was completed here. Offline Slack event backfill, exactly-once external delivery, automatic migration from0.1, and turnkey privileged/prelogin service installation are not implemented.
+## RPC diagnostic privacy
+
+JSON-RPC failures retain only a safe integer code and an allowlisted classification. Queue classifications require the exact method/code/message shape; no raw message or error data is copied into error objects, persisted delivery diagnostics or Slack output. Unknown wording is not displayed as a sanitized excerpt. Classification does not authorize a retry, resend, implicit steering, or a new turn, and does not itself establish message processing.

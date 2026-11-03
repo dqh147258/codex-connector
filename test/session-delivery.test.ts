@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
 import { BackendError } from '../src/codex.js';
 import { Store } from '../src/store.js';
-import { deliveryStatus, deliveryView } from '../src/session-delivery.js';
+import { deliveryStatus, deliveryView, validateMessageDelivery } from '../src/session-delivery.js';
 import { compactResult } from '../src/slack-results.js';
 import { validateCommand } from '../src/protocol.js';
 import { fixture, ready, run, request, event, waitFor } from './helpers.js';
@@ -330,5 +330,79 @@ test('readback commit rechecks queue correlation against an ack received during 
     const receipt=f.connector.local(request('session.send',{sessionId:s.id,text:'same text'}));await waitFor(()=>Boolean(finish));refreshing=true;
     await run(f,'session.delivery',{sessionId:s.id,workId:receipt.id});const d=saved(f,receipt.id).messageDelivery!;
     assert.equal(d.queuedSubmissionId,'ack-B');assert.equal(d.correlationConflict,true);assert.equal(deliveryStatus(saved(f,receipt.id)),'uncertain');
+  }finally{await f.cleanup();}
+});
+
+test('start rejection diagnostics coexist with correlated processing and completion without retry',async()=>{
+  for(const status of ['processing','completed'] as const){const f=fixture();try{
+    const s=await ready(f),rpc=f.backend.rpc.bind(f.backend);
+    f.backend.rpc=async(method,params)=>{
+      if(method==='thread/queue/start'){
+        f.backend.calls.push({method,params});
+        emit(f,'item/started',user(s.threadId,params.clientUserMessageId||f.store.state.work.at(-1)!.id));
+        if(status==='completed')emit(f,'turn/completed',{threadId:s.threadId,turn:{id:'turn-matched',status:'completed'}});
+        await tick();throw new BackendError('RPC_REJECTED',undefined,{rpcCode:-32600,classification:'QUEUE_ENTRY_NOT_FOUND'});
+      }
+      return rpc(method,params);
+    };
+    const w=await run(f,'session.send',{sessionId:s.id,text:'same text'});
+    assert.equal(w.messageDelivery?.admission,'accepted');assert.equal(w.messageDelivery?.start,'rejected');assert.equal(deliveryStatus(w),status);
+    assert.deepEqual(w.messageDelivery?.startDiagnostic,{rpcCode:-32600,classification:'QUEUE_ENTRY_NOT_FOUND'});
+    const text=compactResult(w,deliveryView(w));assert.match(text,new RegExp(`execution=${status}`));assert.match(text,/Explicit start request: RPC_REJECTED \(JSON-RPC -32600; reason=QUEUE_ENTRY_NOT_FOUND\)/);
+    assert.match(text,/Start result and execution evidence are independent/);
+    assert.equal(f.backend.calls.filter(c=>c.method==='thread/queue/add').length,1);assert.equal(f.backend.calls.filter(c=>c.method==='thread/queue/start').length,1);
+    assert.ok(!f.backend.calls.some(c=>['turn/start','turn/steer'].includes(c.method)));
+  }finally{await f.cleanup();}}
+});
+
+test('unmatched busy rejection preserves unknown execution and no automatic resend or start',async()=>{
+  const f=fixture();try{
+    const s=await ready(f),rpc=f.backend.rpc.bind(f.backend);
+    f.backend.rpc=async(method,params)=>{if(method==='thread/queue/start'){f.backend.calls.push({method,params});throw new BackendError('RPC_REJECTED',undefined,{rpcCode:-32600,classification:'THREAD_BUSY'});}return rpc(method,params);};
+    const w=await run(f,'session.send',{sessionId:s.id,text:'same text'});
+    assert.equal(deliveryStatus(w),'accepted');assert.equal(w.messageDelivery?.execution,'unknown');assert.equal(w.messageDelivery?.startDiagnostic?.classification,'THREAD_BUSY');
+    await run(f,'session.delivery',{sessionId:s.id,workId:w.id,refresh:false});
+    assert.equal(f.backend.calls.filter(c=>c.method==='thread/queue/add').length,1);assert.equal(f.backend.calls.filter(c=>c.method==='thread/queue/start').length,1);
+  }finally{await f.cleanup();}
+});
+
+test('admission rejection retains diagnostics but remains conservative about side effects',async()=>{
+  const f=fixture();try{
+    const s=await ready(f),rpc=f.backend.rpc.bind(f.backend);
+    f.backend.rpc=async(method,params)=>{if(method==='thread/queue/add')throw new BackendError('RPC_REJECTED',undefined,{rpcCode:-32603,classification:'INTERNAL_ERROR'});return rpc(method,params);};
+    const w=await run(f,'session.send',{sessionId:s.id,text:'same text'});
+    assert.equal(w.status,'uncertain');assert.equal(deliveryStatus(w),'uncertain');assert.equal(w.messageDelivery?.start,'not-requested');assert.equal(w.messageDelivery?.admissionDiagnostic?.rpcCode,-32603);
+    assert.ok(f.store.state.outbox.some(o=>o.text.includes('Admission request: RPC_REJECTED (JSON-RPC -32603; reason=INTERNAL_ERROR)')));
+    assert.ok(!f.backend.calls.some(c=>c.method==='thread/queue/start'));
+  }finally{await f.cleanup();}
+});
+
+test('diagnostics survive restart without losing code or classification',async()=>{
+  const f=fixture();try{
+    const s=await ready(f);rejectStart(f);const old=await run(f,'session.send',{sessionId:s.id,text:'old'});
+    f.store.transaction(state=>{const d=state.work.find(w=>w.id===old.id)!.messageDelivery!;d.startDiagnostic={rpcCode:-32600,classification:'QUEUE_ENTRY_NOT_FOUND'};});
+    f.store.close();const store=new Store(f.dir);try{assert.deepEqual(store.state.work.find(w=>w.id===old.id)!.messageDelivery?.startDiagnostic,{rpcCode:-32600,classification:'QUEUE_ENTRY_NOT_FOUND'});}finally{store.close();}
+  }finally{await f.cleanup();}
+});
+
+test('old records stay valid; corrupted diagnostic fields fail closed at the persistence boundary',async()=>{
+  const f=fixture();try{
+    const s=await ready(f);rejectStart(f);const w=await run(f,'session.send',{sessionId:s.id,text:'old'});
+    assert.doesNotThrow(()=>validateMessageDelivery(w));assert.equal(w.messageDelivery?.startDiagnostic,undefined);
+    assert.match(compactResult(w,deliveryView(w)),/RPC details unavailable/);
+    for(const diagnostic of [{rpcCode:-32600,classification:'QUEUE_ENTRY_NOT_FOUND',raw:'private'}, {rpcCode:-32600,classification:'guessed-consumed'}, {rpcCode:0.1,classification:'UNCLASSIFIED'}]){
+      const copy=structuredClone(w);copy.messageDelivery!.startDiagnostic=diagnostic as any;assert.throws(()=>validateMessageDelivery(copy),/INVALID_MESSAGE_DELIVERY_STATE/);
+    }
+    const copy=structuredClone(w);copy.messageDelivery!.startDiagnostic={rpcCode:-32600,classification:'THREAD_BUSY'};delete copy.messageDelivery!.startError;assert.throws(()=>validateMessageDelivery(copy),/INVALID_MESSAGE_DELIVERY_STATE/);
+  }finally{await f.cleanup();}
+});
+
+test('explicit resume keeps selected-entry start when execution is unknown',async()=>{
+  const f=fixture();try{
+    const s=await ready(f);f.backend.threads.get(s.threadId).status={type:'idle',activeFlags:[]};
+    const w=await run(f,'session.queue',{sessionId:s.id,text:'resume requested',resume:true});
+    assert.equal(w.messageDelivery?.start,'accepted');assert.equal(deliveryStatus(w),'processing');assert.equal(w.messageDelivery?.startDiagnostic,undefined);
+    assert.equal(f.backend.calls.filter(c=>c.method==='thread/queue/start').length,1);
+    assert.equal(f.backend.calls.find(c=>c.method==='thread/queue/start')!.params.queuedSubmissionId,w.messageDelivery?.queuedSubmissionId);
   }finally{await f.cleanup();}
 });

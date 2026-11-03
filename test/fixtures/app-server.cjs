@@ -45,6 +45,7 @@ const message = line => {
   if (m.params?.threadId === 'fixture-fractional-id') { reply({ id: 1.5, result: {} }); return; }
   if (m.params?.threadId === 'fixture-null-error') { reply({ id: m.id, error: null }); return; }
   if (m.params?.threadId === 'fixture-malformed-error') { reply({ id: m.id, error: { code: 'not-a-number', message: 'invalid code' } }); return; }
+  if (m.params?.threadId === 'fixture-rpc-error') { reply({ id: m.id, error: m.params.fixtureError }); return; }
   if (m.method === 'thread/list') { reply({ id: m.id, result: { data: [{ id: 'shared-thread-1', cwd: '/fixture/project', status: { type: 'idle' } }], nextCursor: null } }); return; }
   if (m.method === 'thread/loaded/list') { reply({ id: m.id, result: { data: ['shared-thread-1'], nextCursor: null } }); return; }
   if (['thread/start', 'thread/read', 'thread/resume'].includes(m.method)) { reply({ id: m.id, result: { thread: { id: m.params.threadId || 'created-thread', cwd: m.params.cwd || '/fixture/project', status: { type: 'idle' } } } }); return; }

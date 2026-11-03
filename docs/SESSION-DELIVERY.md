@@ -20,6 +20,24 @@ Queue/add persists the submission and wakes an already-loaded session before rep
 
 If exact execution evidence arrives before the queue/add acknowledgement, the connector skips its now-redundant explicit start. The connector never falls back to turn/start or steer, never re-enqueues after a rejected/uncertain start, and never automatically retries a mutating RPC. Use the same request ID for transport retries. A new request ID represents new work and can duplicate the user's input; identical text is not an idempotency key. `clientUserMessageId` is correlation, not a cross-client exactly-once guarantee.
 
+An explicit start is still used when requested and execution has not been correlated. It must not be removed wholesale: upstream skips automatic wake for interrupted sessions. If execution begins while the start RPC is in flight, its rejection is recorded independently and cannot downgrade matched processing/completion.
+
+## Sanitized RPC diagnostics
+
+New queue failures retain optional `admissionDiagnostic` and `startDiagnostic` objects alongside the existing `admissionError` / `startError` labels. Each object has exactly two fields: numeric `rpcCode` and a closed `classification` enum. Slack, local status and `session.delivery` expose these safe fields. For example:
+
+```json
+{"admission":"accepted","start":"rejected","execution":"processing","startError":"RPC_REJECTED","startDiagnostic":{"rpcCode":-32600,"classification":"QUEUE_ENTRY_NOT_FOUND"}}
+```
+
+This means the daemon reported the selected entry missing when explicitly starting it, while separate exact evidence matched the submission to a processing turn. Without that matching evidence, execution stays `unknown`. A missing queue entry alone does not prove consumption; another client may have removed it. `THREAD_BUSY` similarly does not identify which message is running.
+
+Classification uses the actual pending RPC's method, numeric error code and complete message, not substrings or guesses. For queue/start, `QUEUE_ENTRY_NOT_FOUND` additionally requires the message's ID to equal the exact selected queue ID. Known exact responses also map to `THREAD_BUSY`, `THREAD_RESUME_REQUIRED`, and `QUEUE_UNAVAILABLE`. Standard JSON-RPC codes fall back to `PARSE_ERROR`, `INVALID_REQUEST`, `METHOD_NOT_FOUND`, `INVALID_PARAMS`, or `INTERNAL_ERROR`; other codes use `UNCLASSIFIED`. These labels describe the response, not delivery success, retryability, or a verified root cause. Changed upstream wording falls back to its numeric code class rather than a guessed reason.
+
+Raw `error.message`, `error.data`, nested causes, paths, credentials and interpolated IDs are never copied to the retained error, delivery ledger, logs or Slack. This is an allowlisted classification, not a redacted excerpt. Timeout/disconnect outcomes remain uncertain and have no invented RPC code. Old saved records remain valid but display `RPC details unavailable`; their lost original reason cannot be reconstructed. New diagnostic objects reject extra fields and unknown labels on state load. Back up state before downgrading: older Connector builds may reject records containing the new optional fields.
+
+Reason matching was verified against the [upstream queue processor at rust-v0.165.0](https://github.com/openai/codex/blob/360319d8dee62d87e2d59fc0c21805d79519cfed/codex-rs/app-server/src/request_processors/thread_queue_processor.rs#L186-L227), its [error conversion](https://github.com/openai/codex/blob/360319d8dee62d87e2d59fc0c21805d79519cfed/codex-rs/app-server/src/request_processors/thread_queue_processor.rs), and the [selected-entry lookup](https://github.com/openai/codex/blob/360319d8dee62d87e2d59fc0c21805d79519cfed/codex-rs/ext/queue/src/service.rs#L367-L386). No installed-runtime version or historical error cause is inferred from these source checks.
+
 ## Exact evidence and races
 
 The connector persists a submission record before queue/add and persists its returned queue ID before queue/start. It sends its internal work ID as `clientUserMessageId`.

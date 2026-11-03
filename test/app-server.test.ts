@@ -197,3 +197,34 @@ test('unsupported capability cache is re-probed once per fresh successful proxy 
 test('explicit daemon autostart is fixed, version-gated, once-only, and never stop/update',async()=>{const f=setup({autoStartDaemon:true,expectedVersion:'0.166.0-alpha.1'});try{await f.server.connect();assert.deepEqual(f.readLog().filter(x=>x.kind==='launch').map(x=>x.args),[['--version'],['app-server','daemon','start'],['app-server','proxy']]);await assert.rejects(f.server.rpc('thread/read',{threadId:'fixture-exit'}));await f.server.connect();const launches=f.readLog().filter(x=>x.kind==='launch');assert.equal(launches.filter(x=>x.args.join(' ')==='app-server daemon start').length,1);assert.ok(!launches.some(x=>x.args.includes('stop')||x.args.includes('update')));assert.equal((f.server.capabilities().daemonStart as any).result,'started-or-already-running');}finally{await f.close();}});
 test('daemon start failure is visible and not repeatedly retried; socket conflict fails closed',async()=>{const old=process.env.CONNECTOR_FIXTURE_DAEMON_FAIL;process.env.CONNECTOR_FIXTURE_DAEMON_FAIL='1';const f=setup({autoStartDaemon:true});try{await assert.rejects(f.server.connect(),errorCode('DAEMON_START_FAILED'));assert.equal(f.server.connected,false);await f.server.connect();assert.equal(f.readLog().filter(x=>x.kind==='launch'&&x.args.join(' ')==='app-server daemon start').length,1);}finally{await f.close();if(old===undefined)delete process.env.CONNECTOR_FIXTURE_DAEMON_FAIL;else process.env.CONNECTOR_FIXTURE_DAEMON_FAIL=old;}const conflict=setup({autoStartDaemon:true,socketPath:'/fixture/socket'});try{await assert.rejects(conflict.server.connect(),errorCode('DAEMON_START_SOCKET_CONFLICT'));assert.ok(!conflict.readLog().some(x=>x.kind==='launch'&&x.args.includes('daemon')));}finally{await conflict.close();}});
 test('shutdown during optional daemon start cannot launch a proxy afterward',async()=>{const old=process.env.CONNECTOR_FIXTURE_DAEMON_DELAY;process.env.CONNECTOR_FIXTURE_DAEMON_DELAY='1';const f=setup({autoStartDaemon:true});try{const connecting=f.server.connect();connecting.catch(()=>{});for(let i=0;i<100&&!f.readLog().some(x=>x.kind==='launch'&&x.args.includes('daemon'));i++)await new Promise(r=>setTimeout(r,5));await f.server.close();await assert.rejects(connecting,errorCode('BACKEND_STOPPED'));assert.ok(!f.readLog().some(x=>x.kind==='launch'&&x.args.includes('proxy')));}finally{await f.close();if(old===undefined)delete process.env.CONNECTOR_FIXTURE_DAEMON_DELAY;else process.env.CONNECTOR_FIXTURE_DAEMON_DELAY=old;}});
+
+test('transport retains only numeric code and closed reason classification from actual error frames',async()=>{
+  const f=setup();try{
+    await f.server.connect();
+    for(const [code,message,classification] of [
+      [-32600,'queued submission not found: queue-selected','QUEUE_ENTRY_NOT_FOUND'],
+      [-32600,'thread already has an active or pending turn','THREAD_BUSY'],
+      [-32600,'private prompt /private/path?token=fixture-secret','INVALID_REQUEST'],
+      [-32099,'unknown error fixture-secret','UNCLASSIFIED'],
+      [-32603,'queued submission operation failed: /private/path','INTERNAL_ERROR'],
+    ] as const){
+      await assert.rejects(f.server.rpc('thread/queue/start',{threadId:'fixture-rpc-error',queuedSubmissionId:'queue-selected',fixtureError:{code,message,data:{secret:'fixture-secret'}}}),error=>{
+        assert.ok(error instanceof BackendError);assert.equal(error.code,'RPC_REJECTED');
+        assert.deepEqual(error.diagnostic,{rpcCode:code,classification});
+        assert.equal(error.message,'RPC_REJECTED');assert.doesNotMatch(JSON.stringify(error)+error.stack,/private prompt|private\/path|fixture-secret/);return true;
+      });
+    }
+    await assert.rejects(f.server.rpc('thread/queue/start',{threadId:'fixture-rpc-error',queuedSubmissionId:'queue-selected',fixtureError:{code:-32601,message:'private unsupported detail'}}),error=>{
+      assert.ok(error instanceof BackendError);assert.equal(error.code,'METHOD_UNSUPPORTED');assert.deepEqual(error.diagnostic,{rpcCode:-32601,classification:'METHOD_NOT_FOUND'});return true;
+    });
+    assert.equal(f.server.connected,true);
+  }finally{await f.close();}
+});
+
+test('unsafe integer JSON-RPC codes fail protocol validation without diagnostics',async()=>{
+  const f=setup();try{
+    await f.server.connect();
+    await assert.rejects(f.server.rpc('thread/queue/start',{threadId:'fixture-rpc-error',fixtureError:{code:Number.MAX_SAFE_INTEGER+1,message:'unsafe'}}),errorCode('RPC_OUTCOME_UNCERTAIN'));
+    assert.equal(f.server.connected,false);assert.ok(['INVALID_PROTOCOL','PROXY_DISCONNECTED'].includes(String(f.server.capabilities().lastFailure)));
+  }finally{await f.close();}
+});

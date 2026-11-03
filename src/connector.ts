@@ -12,6 +12,7 @@ import { compactResult, storeResult, readResult, nextResultQuery, nextResultComm
 import { ReadonlyFiles, FileAccessError, containsSensitiveContent } from './files.js';
 import { parseEnvelope, validateCommand, ProtocolError, formatHelp, COMMANDS, START_MARKER, END_MARKER, type CommandEnvelope } from './protocol.js';
 import { BackendError } from './codex.js';
+import { formatRpcDiagnostic } from './rpc-diagnostics.js';
 import { parseSlackEnvelope, isSlackAddressed, SlackTransportError, SLACK_TRANSPORT_REVISION } from './slack-envelope.js';
 import type { Backend, Config, Delivery, Pending, Session, SlackPort, Source, State, Work } from './types.js';
 export class ConnectorError extends Error { constructor(readonly code:string){super(code);} }
@@ -120,7 +121,7 @@ export class Connector {
       }catch(e){
         const code=codeOf(e),uncertain=code==='SCREEN_UPLOAD_UNCERTAIN'||code==='RPC_OUTCOME_UNCERTAIN'&&COMMANDS[w.request.command].permission!=='read';
         const reason=uncertain?(code==='SCREEN_UPLOAD_UNCERTAIN'?': inspect the Slack thread for partial or completed uploads; no automatic retry.':': inspect backend state; operation will not be replayed.'):code==='SCREEN_RESTART_REQUIRED'||code==='SCREEN_TIMEOUT'?': quit and reopen the desktop app before a new explicit capture request.':code==='SCREEN_PERMISSION_DENIED'?': grant Screen Recording permission in local OS settings, then restart the desktop app.':code==='SCREEN_UPLOAD_REJECTED'?': check Slack files:write scope, channel membership and rate limits; no automatic retry.':'';
-        this.store.transaction(s=>{const current=s.work.find(x=>x.id===w.id)!;current.status=uncertain?'uncertain':'failed';current.error=code;this.output(s,`[${w.id}] ${code}${reason}${current.messageDelivery?` Message evidence: ${deliveryView(current).deliveryStatus}; admission=${current.messageDelivery.admission}; start=${current.messageDelivery.start}. Check session.delivery {"sessionId":"${current.request.params.sessionId}","workId":"${current.id}"}. Do not resend.`:''}`,typeof w.request.params.sessionId==='string'?w.request.params.sessionId:undefined,w.source);});
+        this.store.transaction(s=>{const current=s.work.find(x=>x.id===w.id)!;current.status=uncertain?'uncertain':'failed';current.error=code;this.output(s,`[${w.id}] ${code}${reason}${current.messageDelivery?` Message evidence: ${deliveryView(current).deliveryStatus}; admission=${current.messageDelivery.admission}; start=${current.messageDelivery.start}; execution=${current.messageDelivery.execution}.${current.messageDelivery.admissionError?` Admission request: ${current.messageDelivery.admissionError} (${formatRpcDiagnostic(current.messageDelivery.admissionDiagnostic)}).`:""}${current.messageDelivery.startError?` Start request: ${current.messageDelivery.startError} (${formatRpcDiagnostic(current.messageDelivery.startDiagnostic)}).`:""} Check session.delivery {"sessionId":"${current.request.params.sessionId}","workId":"${current.id}"}. Do not resend.`:''}`,typeof w.request.params.sessionId==='string'?w.request.params.sessionId:undefined,w.source);});
         if(uncertain)return;
       }finally{this.flush();}
     }
@@ -184,7 +185,7 @@ export class Connector {
     this.store.transaction(state=>{state.work.find(x=>x.id===w.id)!.messageDelivery={threadId:s.threadId,clientUserMessageId:w.id,admission:'pending',start:'not-requested',execution:'unknown',evidence:'submission-attempt',observedAt:new Date().toISOString(),observationGap:false};});
     let queued:any;
     try{queued=await this.backend.rpc('thread/queue/add',{threadId:s.threadId,input:[{type:'text',text:w.request.params.text}],clientUserMessageId:w.id});}
-    catch(e){const code=this.mutationError(e),uncertain=!['METHOD_UNSUPPORTED','BACKEND_UNAVAILABLE','RPC_FORBIDDEN'].includes(code);this.updateDelivery(w.id,d=>{if(d.admission!=='accepted')d.admission=uncertain?'uncertain':'rejected';d.admissionError=code;});throw new BackendError(uncertain?'RPC_OUTCOME_UNCERTAIN':code);}
+    catch(e){const code=this.mutationError(e),uncertain=!['METHOD_UNSUPPORTED','BACKEND_UNAVAILABLE','RPC_FORBIDDEN'].includes(code);this.updateDelivery(w.id,d=>{if(d.admission!=='accepted')d.admission=uncertain?'uncertain':'rejected';d.admissionError=code;if(e instanceof BackendError&&e.diagnostic)d.admissionDiagnostic=e.diagnostic;});throw new BackendError(uncertain?'RPC_OUTCOME_UNCERTAIN':code);}
     const queuedId=queued?.queuedSubmission?.id,validAck=deliveryId(queuedId)&&queued?.queuedSubmission?.clientUserMessageId===w.id;
     // Persist admission and the exact queue ID before requesting start. Concurrent
     // autonomous consumption may already have produced stronger lifecycle evidence.
@@ -196,7 +197,7 @@ export class Connector {
       this.updateDelivery(w.id,d=>{d.start='pending';});
       let started:any;
       try{started=await this.backend.rpc('thread/queue/start',{threadId:s.threadId,queuedSubmissionId:queuedId});}
-      catch(e){const code=this.mutationError(e);this.updateDelivery(w.id,d=>{d.start=code==='RPC_OUTCOME_UNCERTAIN'?'uncertain':'rejected';d.startError=code;});if(code==='RPC_OUTCOME_UNCERTAIN')throw new BackendError(code);return deliveryView(this.deliveryWork(w.id));}
+      catch(e){const code=this.mutationError(e);this.updateDelivery(w.id,d=>{d.start=code==='RPC_OUTCOME_UNCERTAIN'?'uncertain':'rejected';d.startError=code;if(e instanceof BackendError&&e.diagnostic)d.startDiagnostic=e.diagnostic;});if(code==='RPC_OUTCOME_UNCERTAIN')throw new BackendError(code);return deliveryView(this.deliveryWork(w.id));}
       if(!deliveryId(started?.turn?.id)||!['inProgress','completed','failed','interrupted'].includes(started.turn.status)){
         this.updateDelivery(w.id,d=>{d.start='uncertain';d.startError='INVALID_START_ACK';});throw new BackendError('RPC_OUTCOME_UNCERTAIN');
       }

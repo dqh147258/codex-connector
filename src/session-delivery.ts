@@ -1,5 +1,6 @@
 import { containsSensitiveContent } from './files.js';
 import type { Work } from './types.js';
+import { validRpcDiagnostic, type RpcDiagnostic } from './rpc-diagnostics.js';
 
 /** Command completion is not message completion. This record contains only
  * acknowledgement/correlation metadata, never another copy of message text. */
@@ -16,6 +17,8 @@ export interface MessageDelivery {
   observationGap: boolean;
   startError?: string;
   admissionError?: string;
+  startDiagnostic?: RpcDiagnostic;
+  admissionDiagnostic?: RpcDiagnostic;
   correlationConflict?: true;
 }
 export const deliveryId = (value: unknown): value is string => typeof value === 'string' &&
@@ -67,7 +70,7 @@ export function observeTurn(d: MessageDelivery, threadId: unknown, turn: any, no
 export function validateMessageDelivery(work: Work) {
   const d = work.messageDelivery;
   if (d === undefined) return;
-  const allowed = new Set(['threadId','clientUserMessageId','queuedSubmissionId','turnId','admission','start','execution','evidence','observedAt','observationGap','startError','admissionError','correlationConflict']);
+  const allowed = new Set(['threadId','clientUserMessageId','queuedSubmissionId','turnId','admission','start','execution','evidence','observedAt','observationGap','startError','admissionError','startDiagnostic','admissionDiagnostic','correlationConflict']);
   if (!d || typeof d !== 'object' || Array.isArray(d) || Object.keys(d).some(k => !allowed.has(k)) ||
       !['session.send','session.queue'].includes(work.request.command) || !deliveryId(d.threadId) ||
       d.clientUserMessageId !== work.id || !deliveryId(d.clientUserMessageId) ||
@@ -80,6 +83,9 @@ export function validateMessageDelivery(work: Work) {
       typeof d.observedAt !== 'string' || !Number.isFinite(Date.parse(d.observedAt)) ||
       typeof d.observationGap !== 'boolean' ||
       [d.startError,d.admissionError].some(v => v !== undefined && (typeof v !== 'string' || !/^[A-Z_]{1,80}$/.test(v))) ||
+      [d.startDiagnostic,d.admissionDiagnostic].some(v => v !== undefined && !validRpcDiagnostic(v)) ||
+      (d.startDiagnostic !== undefined && d.startError === undefined) ||
+      (d.admissionDiagnostic !== undefined && d.admissionError === undefined) ||
       (d.correlationConflict !== undefined && d.correlationConflict !== true) ||
       (d.execution !== 'unknown' && !d.turnId)) throw Error('INVALID_MESSAGE_DELIVERY_STATE');
 }
