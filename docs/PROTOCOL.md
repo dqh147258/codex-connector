@@ -72,3 +72,11 @@ Slack 默认响应是有界摘要，不再保证直接输出完整 JSON。需要
 `session.overview` 和 `session.messages` 使用发现得到的 Codex threadId，不是控制绑定 sessionId。前者是 1–5 个 ID 的有界摘录，后者是只读可见对话分页。它们不调用 resume。详细边界见 [SESSION-OVERVIEW](SESSION-OVERVIEW.md)，准确字段以生成的 help 为准。
 
 `session.recent {"limit":5}`（1–20）是只读元数据查询，返回有界候选中的生命周期时间排名和独立后端更新参考。它不是 `session.list view=active`：已完成且 idle 的会话也可能最近活跃。不自动建立控制绑定或订阅，记录器不把接收/读取时间当活动时间。见 [SESSION-RECENT.md](SESSION-RECENT.md)。
+
+### 可见会话文本搜索
+
+`session.search` 通过只读 `thread/list` 发现按 `updated_at` 降序的 indexed interactive/nonarchived 会话，再对获准会话读取 `thread/items/list`。它不使用执行活动时间排名，不合并 loaded-only 会话，不 attach/resume，也不扫描 rollout/session 文件。用户文本只取 `userMessage` 的 text parts；模型文本只取 `agentMessage.text`，不含工具、reasoning、系统内容或语义总结。
+
+参数为 `terms`（1–10 个字符串，提交值每个最多 200 UTF-16 code unit、总计不超过 1000，去首尾空白后非空，不允许控制字符）、`mode:and|or`（默认 and）、`role:all|user|assistant`（默认 all）、`sessionLimit`（1–20，默认 10）、`limit`（1–50 条命中，默认 20）、`maxChars`（每条摘录 100–2000，默认 1000）与返回的不透明 `cursor`。大小写不敏感的字面子串匹配在**同一条**完整安全可见消息内完成，之后才截断；不支持正则、跨消息 AND 或查询语言。敏感消息被隐藏，不通过匹配结果探测秘密。
+
+结果包含命中消息、对应会话基础信息及覆盖/排除/失败信息；有界读取、无权限或不可用历史不能被解释为全局没有命中。搜索是非原子实时读取，不是稳定历史快照。Slack `result.next` 延续同一搜索，遵守同认证身份、同频道/线程及有限结果保留策略；`result.page` 只展开已有结果，不继续扫描。完整语义见 [SESSION-SEARCH.md](SESSION-SEARCH.md)。

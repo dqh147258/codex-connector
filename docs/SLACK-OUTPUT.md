@@ -13,7 +13,7 @@ Slack 默认展示短摘要，不再把整个后端 JSON 自动拆成几十条�
 
 Slack 每来源最多 10 条，即使请求 `limit:100` 也显示实际执行上限。本地/桌面默认仍为 `all`、每来源 50 条，最多 100。每次只读取每个选中来源的一页，没有隐式扫描全部历史。`active` 页可能为零条但仍有下一页；未知元数据数量会单独给出，不能把它们视为 idle。数量是本页数量，不是全局总数。历史行明确标为 `history(current unknown)`。
 
-例如严格命令信封中的 params 可为 `{"view":"active","limit":10}`。摘要包含精确结果句柄；用 `result.next {"resultId":"返回的ID"}` 获取同一筛选的下一页，无需复制长 cursor。`session.messages` 的结果也支持同样的 result.next，保留原 threadId/role/order。也可以从详情取得完整 `nextCursor` 并在相同 view/project 的 `session.list` 中使用。每次命令使用新 request ID。游标绑定筛选上下文，不能跨筛选复用。
+例如严格命令信封中的 params 可为 `{"view":"active","limit":10}`。摘要包含精确结果句柄；用 `result.next {"resultId":"返回的ID"}` 获取同一筛选的下一页，无需复制长 cursor。`session.messages` 的结果也支持同样的 result.next，保留原 threadId/role/order；`session.search` 保留原搜索条件与所选会话范围。也可以从详情取得完整 `nextCursor` 并在相同 view/project 的 `session.list` 中使用。每次命令使用新 request ID。游标绑定筛选上下文，不能跨筛选复用。
 
 ## 完整详情
 
@@ -49,3 +49,9 @@ Slack 每来源最多 10 条，即使请求 `limit:100` 也显示实际执行上
 本版订阅控制由 Slack 严格命令提供，不在 Desktop 自动勾选，也不安装任何用户端 Skill。
 
 `session.recent` 默认摘要区分真实执行时间与 unknown 的后端更新时间参考，显示候选覆盖限制；所有有界行、精确 ID 和证据时间在 `result.page` 中。详情不会再次执行排名查询。需要更新时使用新请求 ID 再查。
+
+## 会话搜索的短摘要与继续读取
+
+`session.search {"terms":["部署","失败"],"mode":"and","role":"assistant","sessionLimit":10}` 只搜索用户/模型可见文字，默认最近 10 个获准的已索引、未归档交互会话。最近由后端更新排序决定，不能说成最近执行。默认每页最多返回 20 条匹配摘录；`limit` 上限 50，`maxChars` 默认 1000、范围 100–2000。AND 要求同一条消息含所有词，OR 任一词即可。
+
+短摘要只是命中预览，精确消息/turn/thread ID、会话基础信息、截断标记与覆盖缺口在 `result.page` 中。仅在结果确实提供继续入口时使用同身份、同频道/线程的 `result.next`；搜索会重新读取后续数据，不是把本页详情多显示一次。不要把零命中、有页未扫完、权限排除或历史不可用解释成“全部会话都没有”。不要为补齐搜索而自动绑定、恢复或订阅会话。详见 [SESSION-SEARCH.md](SESSION-SEARCH.md)。

@@ -38,3 +38,11 @@ test('message continuation via scoped result.next preserves exact thread/role/or
 test('five overview rows all have identity and key indicators in compact summary',()=>{const items=Array.from({length:5},(_,i)=>({threadId:`thread-${i}`,metadata:{name:'Task '+i,status:{type:'active'}},firstUser:{status:'found',message:{excerpt:'a'.repeat(1000)}},lastUser:{status:'found',message:{excerpt:'b'.repeat(1000)}},latestAssistant:{status:'found',message:{excerpt:'c'.repeat(1000),phase:'commentary'}}}));const w:any={request:request('session.overview',{threadIds:items.map(x=>x.threadId)})};const text=compactResult(w,{items,count:5});for(const row of items)assert.ok(text.includes(row.threadId));assert.ok(text.length<2400);assert.equal((text.match(/first user/g)||[]).length,5);});
 
 test('malformed exhausted pages never prove absence or replace a visible message with empty text',async()=>{for(const page of [{data:[{item:{}}],nextCursor:null},{data:[{item:[]}],nextCursor:null},{data:[{item:{type:'agentMessage'}}],nextCursor:null},{data:[{item:{type:'userMessage',content:'wrong'}}],nextCursor:null},{data:[{item:{type:'userMessage',content:[{type:'text',text:4}]}}],nextCursor:null},{data:[]}]){const {backend,content}=setup([]),original=backend.rpc.bind(backend);backend.rpc=async(m,p)=>m==='thread/items/list'?page:original(m,p);const s=(await content.overview(['chosen'])).items[0];assert.equal(s.firstUser.status,'unknown');assert.equal(s.coverage.ascending.error,'INVALID_HISTORY_PAGE');assert.equal(s.latestAssistant.status,'unknown');}});
+
+
+test('joined user text parts are sensitivity checked before excerpt clipping',async()=>{
+  const {content}=setup([entry(1,'userMessage','',{content:[{type:'text',text:'password'},{type:'text',text:'= "split-sensitive-value"'}]})]);
+  const messages=await content.messages({threadId:'chosen'});
+  assert.equal(messages.items[0].textStatus,'withheld');assert.equal(messages.items[0].excerpt,null);
+  assert.ok(!JSON.stringify(messages).includes('split-sensitive-value'));
+});

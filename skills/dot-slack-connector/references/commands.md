@@ -68,9 +68,33 @@ CODEX_CONNECTOR_COMMAND_END
 
 Continue with the returned `result.next` handle, or a real opaque `cursor` with the same threadId/role/order. Use `result.page` to expand already-returned excerpts; it does not fetch additional historical messages or remove per-message truncation. If observation is requested, subscribe to the exact identified thread only after confirming it is currently loaded. Content reading and subscribing do not grant control or approval authority.
 
+## Search text across recently updated sessions
+
+Search default 10 allowed indexed, nonarchived interactive sessions by backend update order, not execution activity. Terms are literal case-insensitive substrings within one message. There is no regex or embedded AND/OR query language. Each separate term is an array entry.
+
+Require both terms in one user message:
+
+```text
+CODEX_CONNECTOR_COMMAND_BEGIN
+{"v":1,"id":"dot-search-user-0001","target":"my-computer","command":"session.search","params":{"terms":["Slack","审批"],"mode":"and","role":"user","sessionLimit":10,"limit":20,"maxChars":1000}}
+CODEX_CONNECTOR_COMMAND_END
+```
+
+Find either term in visible assistant messages:
+
+```text
+CODEX_CONNECTOR_COMMAND_BEGIN
+{"v":1,"id":"dot-search-assistant-0001","target":"my-computer","command":"session.search","params":{"terms":["结论","建议"],"mode":"or","role":"assistant","sessionLimit":10}}
+CODEX_CONNECTOR_COMMAND_END
+```
+
+Omit `role` (or use `all`) to search both roles. Terms must contain 1–10 strings, at most 200 UTF-16 code units each and 1000 combined before trimming, with nonempty trimmed values and no control characters. Sensitive-looking terms are rejected. Defaults: mode and, role all, sessionLimit 10 (max 20), limit 20 matching rows (max 50), maxChars 1000 (range 100–2000). Tools, reasoning, hidden/system content and secret-like messages are not searched/exported. This returns matching messages with session metadata, not model-generated conclusions.
+
+Read coverage and failures before describing the result; zero rows can still have a continuation, and no continuation does not prove all sessions were searched. Matching precedes excerpt truncation; the excerpt centers on the first matching term, while other AND terms may be outside it. Use only the returned `result.next` in this same actor/channel/thread to continue unchanged scope. `result.page` shows already-returned detail; it cannot recover truncated text or missing history. Later pages are fresh reads. Do not decode/manufacture cursors or broaden scope by attaching/reading session files.
+
 ## Read result details versus fetch the next query page
 
-These require a real result handle issued to this same actor/channel/thread. `page` is one-based. `result.next` is valid only when a session-list or session-messages result advertises a next query page. It preserves the saved query scope; it does not repeat a control operation.
+These require a real result handle issued to this same actor/channel/thread. `page` is one-based. `result.next` is valid only when a session-list, session-messages or session-search result advertises a next query page. It preserves the saved query scope; it does not repeat a control operation.
 
 ```text
 CODEX_CONNECTOR_COMMAND_BEGIN

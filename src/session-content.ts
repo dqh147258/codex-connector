@@ -10,19 +10,19 @@ const time=(value:unknown)=>typeof value==='number'&&Number.isSafeInteger(value)
 const nextCursor=(value:unknown):string|null=>value===null||value===undefined?null:typeof value==='string'&&value.length>0&&value.length<=512&&!/[\x00-\x1f\x7f]/.test(value)?value:fail('INVALID_HISTORY_PAGE');
 export interface ContentLimits { timeoutMs:number; rpcTimeoutMs:number; maxBytes:number; maxPages:number; pageSize:number; maxCalls:number }
 const LIMITS:ContentLimits={timeoutMs:30000,rpcTimeoutMs:5000,maxBytes:2*1024*1024,maxPages:3,pageSize:20,maxCalls:40};
-interface Budget{deadline:number;bytes:number;calls:number;epoch:string}
+interface Budget{deadline:number;bytes:number;calls:number;maxCalls:number;epoch:string}
 export interface VisibleMessage { itemId:string|null;turnId:string|null;role:'user'|'assistant';phase:string|null;startedAtMs:number|null;completedAtMs:number|null;excerpt:string|null;excerptTruncated:boolean;textStatus:'text'|'empty-or-non-text'|'withheld';nonTextOmitted:boolean }
 type Slot={status:'found'|'withheld'|'absent'|'unknown';message?:VisibleMessage};
 interface Scan { slots:{user?:Slot;assistant?:Slot};pages:number;scannedItems:number;exhausted:boolean;stop:'found'|'end'|'limit'|'error';error?:string }
 /** Only supported read RPCs. No resume, filesystem fallback, hidden prompt/tool
  * export, timestamp sorting, or extra model invocation. */
 export class SessionContent {
-  private limits:ContentLimits;
-  constructor(private backend:Backend,private authorize:(thread:any)=>Record<string,unknown>,limits:Partial<ContentLimits>={}){this.limits={...LIMITS,...limits};for(const[k,v]of Object.entries(this.limits))if(!Number.isSafeInteger(v)||v<1||v>LIMITS[k as keyof ContentLimits])fail('INVALID_CONTENT_LIMIT');}
-  private budget():Budget{return{deadline:Date.now()+this.limits.timeoutMs,bytes:0,calls:0,epoch:this.backend.epoch};}
-  private async rpc(method:'thread/read'|'thread/items/list',params:unknown,b:Budget){
+  protected limits:ContentLimits;
+  constructor(protected backend:Backend,protected authorize:(thread:any)=>Record<string,unknown>,limits:Partial<ContentLimits>={}){this.limits={...LIMITS,...limits};for(const[k,v]of Object.entries(this.limits))if(!Number.isSafeInteger(v)||v<1||v>LIMITS[k as keyof ContentLimits])fail('INVALID_CONTENT_LIMIT');}
+  protected budget(maxCalls=this.limits.maxCalls):Budget{return{maxCalls,deadline:Date.now()+this.limits.timeoutMs,bytes:0,calls:0,epoch:this.backend.epoch};}
+  protected async rpc(method:'thread/read'|'thread/items/list'|'thread/list',params:unknown,b:Budget){
     if(!this.backend.connected||b.epoch!==this.backend.epoch)fail('CONTENT_BACKEND_CHANGED');
-    const remaining=b.deadline-Date.now();if(remaining<=0||++b.calls>this.limits.maxCalls)fail('CONTENT_BUDGET_EXCEEDED');
+    const remaining=b.deadline-Date.now();if(remaining<=0||++b.calls>b.maxCalls)fail('CONTENT_BUDGET_EXCEEDED');
     let timer:ReturnType<typeof setTimeout>|undefined;
     try{
       const value=await Promise.race([this.backend.rpc(method,params),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new SessionContentError('CONTENT_TIMEOUT')),Math.min(remaining,this.limits.rpcTimeoutMs));})]);
@@ -31,7 +31,7 @@ export class SessionContent {
       b.bytes+=size!;if(b.bytes>this.limits.maxBytes)fail('CONTENT_BUDGET_EXCEEDED');return value;
     }finally{if(timer)clearTimeout(timer);}
   }
-  private async metadata(threadId:string,b:Budget):Promise<Record<string,unknown>>{
+  protected async metadata(threadId:string,b:Budget):Promise<Record<string,unknown>>{
     if(!id(threadId))fail('INVALID_THREAD_ID');
     const response=await this.rpc('thread/read',{threadId,includeTurns:false},b),thread=response?.thread;
     if(!thread||thread.id!==threadId)fail('INVALID_THREAD_METADATA');
@@ -41,16 +41,17 @@ export class SessionContent {
     const status=meta!.status as any;
     return{id:threadId,name:field(meta!.name,200),cwd:field(meta!.cwd,1024),status:{type:field(status?.type,40)||'unknown'},model:field(meta!.model,100),source:field(meta!.source,100),manageable:typeof meta!.manageable==='boolean'?meta!.manageable:null,canAcceptDirectInput:typeof meta!.canAcceptDirectInput==='boolean'?meta!.canAcceptDirectInput:null,connectorSessionId:field(meta!.connectorSessionId,128),createdAtUnixSeconds:time(thread.createdAt),updatedAtUnixSeconds:time(thread.updatedAt)};
   }
-  private message(entry:any,maxChars:number):VisibleMessage|undefined{
+  protected message(entry:any,maxChars:number):VisibleMessage|undefined{
     const item=entry?.item;if(!item||!['userMessage','agentMessage'].includes(item.type))return;
     const user=item.type==='userMessage',parts=Array.isArray(item.content)?item.content:[],nonText=user&&parts.some((p:any)=>p?.type!=='text');
     const base={itemId:id(item.id)?item.id:null,turnId:id(entry.turnId)?entry.turnId:null,role:user?'user' as const:'assistant' as const,phase:user?null:['commentary','partial_answer','final_answer'].includes(item.phase)?item.phase:null,startedAtMs:time(entry.startedAtMs),completedAtMs:time(entry.completedAtMs)};
     // Scan full nested raw content, not a clipped or JSON-escaped representation.
     if(resultSensitive(item)||resultSensitive(base))return{...base,...(resultSensitive(base)?{itemId:null,turnId:null}:{}),excerpt:null,excerptTruncated:false,textStatus:'withheld',nonTextOmitted:nonText};
     const text=user?parts.filter((p:any)=>p?.type==='text'&&typeof p.text==='string').map((p:any)=>p.text).join('\n'):typeof item.text==='string'?item.text:'';
+    if(resultSensitive(text))return{...base,excerpt:null,excerptTruncated:false,textStatus:'withheld',nonTextOmitted:nonText};
     const chars=[...text];return{...base,excerpt:text?chars.slice(0,maxChars).join(''):null,excerptTruncated:chars.length>maxChars,textStatus:text?'text':'empty-or-non-text',nonTextOmitted:nonText};
   }
-  private async page(threadId:string,order:'asc'|'desc',cursor:string|undefined,limit:number,b:Budget){
+  protected async page(threadId:string,order:'asc'|'desc',cursor:string|undefined,limit:number,b:Budget){
     const page=await this.rpc('thread/items/list',{threadId,sortDirection:order,limit,...(cursor?{cursor}:{})},b);
     if(!page||!Array.isArray(page.data)||page.data.length>limit||!Object.hasOwn(page,'nextCursor')||page.nextCursor===undefined||page.data.some((e:any)=>!e||typeof e!=='object'||Array.isArray(e)||!e.item||typeof e.item!=='object'||Array.isArray(e.item)||typeof e.item.type!=='string'||!e.item.type||e.item.type==='agentMessage'&&typeof e.item.text!=='string'||e.item.type==='userMessage'&&(!Array.isArray(e.item.content)||e.item.content.some((part:any)=>!part||typeof part!=='object'||Array.isArray(part)||typeof part.type!=='string'||!part.type||part.type==='text'&&typeof part.text!=='string'))))fail('INVALID_HISTORY_PAGE');
     const next=nextCursor(page.nextCursor);if(next&&next===cursor)fail('INVALID_HISTORY_PAGE');return{data:page.data,nextCursor:next};

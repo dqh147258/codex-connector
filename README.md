@@ -97,7 +97,7 @@ node dist/src/cli.js help --command session.create
 | 类别 | 命令 |
 |---|---|
 | 说明 | `help`、`capabilities` |
-| 会话 | `session.list/info/history/delivery/create/attach/send/steer/queue/interrupt/reply` |
+| 会话 | `session.list/recent/search/overview/messages/info/history/delivery/create/attach/send/steer/queue/interrupt/reply` |
 | 审批/输入 | `approval.list/respond`、`input.respond` |
 | 文件只读 | `files.list/stat/read/search` |
 
@@ -198,6 +198,12 @@ Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:activ
 ### 最近活跃会话
 
 `session.recent {"limit":5}` 根据生产者生命周期时间列出有界候选中的最近活动；当前 idle 也可入选。没有真实活动时间的记录单列为后端更新参考，不混称执行。只查元数据、不自动接管或订阅，也不会把查询/重连算成活跃。随后用精确 Codex threadId 查询概览和对话。完整范围、时间来源和限制见 [SESSION-RECENT.md](docs/SESSION-RECENT.md)。
+
+### 搜索用户输入和模型可见消息
+
+`session.search {"terms":["Slack","审批"],"mode":"and","role":"all","sessionLimit":10}` 在最近更新的已索引、未归档交互会话中搜索。`mode:and` 要求同一条消息包含所有关键词，`or` 命中任一个即可；`role:user` 只搜用户输入，`assistant` 只搜模型可见文字。默认最近 10 个获准会话，每页最多 20 条命中，返回匹配消息和会话基础信息，不搜工具、reasoning 或系统内容，不调用模型提炼结论。
+
+这里“最近”按后端 `updated_at` 排序，不是 `session.recent` 的执行活动时间。匹配先于摘录截断，读取和发现均有界；零命中不代表所有会话都没有。用同身份、同 Slack thread 的 `result.next` 继续可用搜索页，`result.page` 查看本页详情和覆盖缺口。完整参数、范围和例子见 [SESSION-SEARCH.md](docs/SESSION-SEARCH.md)。
 
 ## 远程屏幕截图（默认关闭）
 
