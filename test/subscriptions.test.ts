@@ -233,7 +233,7 @@ test('backend epoch change during join fails closed and cancels any unsent messa
   assert.equal(f.store.state.subscriptions![0]!.enabled, false);
 });
 
-test('bounded event keys preserve latest 500; parent global replay guard remains required', async () => {
+test('recent event cache preserves latest 500 alongside durable per-event routing', async () => {
   const f = setup(); await f.subscriptions.create('thread-1', source());
   f.store.transaction(s => { for (let i = 0; i < 510; i++) f.subscriptions.emit(s, 'message', 'thread-1', `event-${i}`); });
   assert.equal(f.store.state.subscriptions![0]!.seen.length, 500);
@@ -337,4 +337,80 @@ test('eventAllowed shares replay enqueue gate without granting joining delivery 
   f.policy.authorized = true; f.subscriptions.cancel(row.id, source());
   assert.equal(f.subscriptions.eventAllowed(row.id), false);
   assert.equal(f.subscriptions.eventAllowed('missing'), false);
+});
+
+test('duplicate subscribe after restart waits for a fresh validated current-epoch join', async () => {
+  const f = setup(), row = await f.subscriptions.create('thread-1', source());
+  const restarted = new SessionSubscriptions(f.store, f.backend, f.hooks);
+  let release!: () => void, entered!: () => void;
+  const enteredJoin = new Promise<void>(r => { entered = r; });
+  const blocked = new Promise<void>(r => { release = r; });
+  f.backend.resumeHook = async () => { entered(); await blocked; };
+  let completed = false;
+  const repeated = restarted.create('thread-1', source()).then(s => { completed = true; return s; });
+  await Promise.race([enteredJoin, repeated]);
+  assert.equal(completed, false, 'must not return the persisted active row without joining');
+  assert.equal(restarted.deliveryAllowed(row.id), false);
+  release();
+  assert.equal((await repeated).id, row.id);
+  assert.equal(restarted.deliveryAllowed(row.id), true);
+});
+
+test('recipient ledger survives restart and the 500-key cache without backfilling newly subscribed destinations', async () => {
+  const f = setup(), first = await f.subscriptions.create('thread-1', source());
+  f.store.transaction(s => f.subscriptions.emit(s, 'first event', 'thread-1', 'old-event'));
+  f.store.transaction(s => { for (let i = 0; i < 510; i++) f.subscriptions.emit(s, 'later event', 'thread-1', `later-${i}`); });
+  const restarted = new SessionSubscriptions(f.store, f.backend, f.hooks);
+  await restarted.rejoin();
+  const second = await restarted.create('thread-1', source({ threadTs: '456.78' }));
+  f.store.transaction(s => assert.equal(restarted.emit(s, 'must not backfill', 'thread-1', 'old-event'), 0));
+  assert.equal(f.store.state.outbox.filter(o => o.text === 'first event').length, 1);
+  assert.notEqual(first.id, second.id);
+});
+
+test('pending replay membership persists but cancellation and re-subscription cannot revive it', async () => {
+  const f = setup(), row = await f.subscriptions.create('thread-1', source());
+  f.backend.epoch = 'epoch-2';
+  f.store.transaction(s => assert.equal(f.subscriptions.emit(s, 'unvalidated text', 'thread-1', 'deferred'), 0));
+  assert.equal(JSON.stringify(f.store.state).includes('unvalidated text'), false);
+  const restarted = new SessionSubscriptions(f.store, f.backend, f.hooks);
+  await restarted.rejoin();
+  f.store.transaction(s => assert.equal(restarted.emit(s, 'replayed text', 'thread-1', 'deferred'), 1));
+  f.backend.epoch = 'epoch-3';
+  f.store.transaction(s => restarted.emit(s, 'cancel me', 'thread-1', 'cancelled-deferred'));
+  restarted.cancel(row.id, source());
+  await restarted.create('thread-1', source());
+  f.store.transaction(s => assert.equal(restarted.emit(s, 'must not revive', 'thread-1', 'cancelled-deferred'), 0));
+});
+
+test('legacy global replay guard remains fail-closed when no recipient ledger exists', async () => {
+  const f = setup(); await f.subscriptions.create('thread-1', source());
+  f.store.transaction(s => { s.seenNotifications['legacy-event'] = true; assert.equal(f.subscriptions.emit(s, 'old', 'thread-1', 'legacy-event'), 0); });
+});
+
+test('duplicate subscribe shares rejoin validation and propagates failure without a false active receipt', async () => {
+  for (const failJoin of [false, true]) {
+    const f = setup(); await f.subscriptions.create('thread-1', source());
+    f.backend.epoch = 'epoch-2';
+    let release!: () => void, entered!: () => void;
+    const started = new Promise<void>(r => { entered = r; });
+    const blocked = new Promise<void>(r => { release = r; });
+    f.backend.resumeHook = async () => { entered(); await blocked; };
+    f.backend.resumeFailure = failJoin;
+    const rejoin = f.subscriptions.rejoin(); await started;
+    const create = f.subscriptions.create('thread-1', source());
+    release();
+    if (failJoin) await assert.rejects(create, /SUBSCRIPTION_JOIN_FAILED/);
+    else assert.equal((await create).status, 'active');
+    await rejoin;
+    assert.equal(resumes(f.backend).length, 2);
+    assert.equal(f.store.state.subscriptions![0]!.enabled, !failJoin);
+  }
+});
+
+test('malformed persisted recipient ledger is rejected', () => {
+  for (const events of [null, [], { invalid: [] }, { ['a'.repeat(64)]: ['duplicate', 'duplicate'] }]) {
+    const f = setup(); f.store.transaction(s => { s.subscriptionEvents = events as any; });
+    assert.throws(() => new SessionSubscriptions(f.store, f.backend, f.hooks), /SUBSCRIPTION_STATE_INVALID/);
+  }
 });

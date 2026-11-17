@@ -3,7 +3,7 @@ import { Store } from '../src/store.js';
 import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { DesktopScreens, type ScreenAPI } from '../desktop/screens.js';
@@ -92,7 +92,8 @@ test('capture completion reauthorizes before upload; uncertain uploads never aut
 });
 test('desktop settings and old configs default disabled; invalid policies are rejected',async()=>{
   const f=fixture();try{
-    const settings=new DesktopSettings(f.dir,{isEncryptionAvailable:()=>false,encryptString:()=>Buffer.alloc(0),decryptString:()=>''});
+    // macOS temp paths can contain /var symlinks; retain production's strict parent checks.
+    const settings=new DesktopSettings(realpathSync(f.dir),{isEncryptionAvailable:()=>false,encryptString:()=>Buffer.alloc(0),decryptString:()=>''});
     assert.equal(settings.defaultConfig().screenPolicy?.enabled,false);assert.equal(JSON.parse(readFileSync('config.example.json','utf8')).screenPolicy.enabled,false);
     assert.notEqual(parseConfig(structuredClone(f.config)).screenPolicy?.enabled,true);
     for(const policy of [null,{},[],{enabled:1},{enabled:true,background:true},Object.create({enabled:true})])assert.throws(()=>parseConfig({...f.config,screenPolicy:policy}));
