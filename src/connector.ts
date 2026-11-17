@@ -162,14 +162,19 @@ export class Connector {
     const allowed=source.kind==='human'?this.config.slack.allowedHumans.includes(source.userId):this.config.slack.trustedBots.some(b=>b.userId===source.userId);
     if(!allowed)throw new ConnectorError('ACTOR_REVOKED');
   }
-  private boundNotice(state:State,text:string,session:Session,preview=false){
+  private boundNotice(state:State,text:string,session:Session,preview=false,eventKey?:string){
     const before=state.outbox.length;
     const route=(source?:Source,id?:string)=>{const start=state.outbox.length;if(preview)this.sessionText(state,text,session.id,source);else this.output(state,text,session.id,source);for(const o of state.outbox.slice(start)){o.notificationThreadId=session.threadId;o.subscriptionId=id;}};
-    if(!this.subscriptions.hasExplicitDestination(session.threadId,session.channel,session.threadTs||''))route();
+    if(!this.subscriptions.hasExplicitDestination(session.threadId,session.channel,session.threadTs||'')){
+      if(!eventKey||!Object.hasOwn(state.seenNotifications,eventKey)){route();if(eventKey)state.seenNotifications[eventKey]=true;}
+    }
+    else if(eventKey)this.subscriptions.emit(state,text,session.threadId,eventKey,
+      sub=>sub.owner.channel===session.channel&&sub.owner.threadTs===session.threadTs,
+      (_state,_text,sub)=>route(sub.owner,sub.id));
     else for(const sub of state.subscriptions||[])if(sub.threadId===session.threadId&&sub.owner.channel===session.channel&&sub.owner.threadTs===session.threadTs&&this.subscriptions.eventAllowed(sub.id))route(sub.owner,sub.id);
     return state.outbox.length-before;
   }
-  private subscriptionSummary(sub:Subscription){return{subscriptionId:sub.id,threadId:sub.threadId,enabled:sub.enabled,status:sub.status,error:sub.error,channel:sub.owner.channel,threadTs:sub.owner.threadTs};}
+  private subscriptionSummary(sub:Subscription){return{subscriptionId:sub.id,threadId:sub.threadId,enabled:sub.enabled,status:sub.status,observationReady:this.subscriptions.deliveryAllowed(sub.id),error:sub.error,channel:sub.owner.channel,threadTs:sub.owner.threadTs};}
   private session(id:unknown):Session{const s=this.store.state.sessions.find(s=>s.id===id);if(!s)throw new ConnectorError('SESSION_NOT_FOUND');if(!this.authorizedSession(s))throw new ConnectorError('SESSION_SCOPE_REVOKED');return s;}
   private canonicalCwd(cwd:string){try{if(!this.validCwd(cwd))return undefined;const real=realpathSync(cwd);return this.validCwd(real)?real:undefined;}catch{return undefined;}}
   private within(root:string,cwd:string){const a=this.canonicalCwd(root),b=this.canonicalCwd(cwd);if(!a||!b)return false;const rel=relative(a,b);return rel===''||(!rel.startsWith('..'+sep)&&rel!=='..'&&!isAbsolute(rel));}
@@ -398,31 +403,39 @@ export class Connector {
     if(s&&!this.authorizedSession(s))throw new ConnectorError('SESSION_SCOPE_REVOKED');
     if(!s){if(!destination)throw new ConnectorError('THREAD_DESTINATION_REQUIRED');s={id:randomUUID(),threadId:thread.id,project:alias,cwd:thread.cwd,channel:destination.channel,threadTs:destination.threadTs,createdAt:new Date().toISOString()};const saved=s;this.store.transaction(state=>{state.sessions.push(saved);this.output(state,`Codex session ${saved.id}\nThread ${saved.threadId}\nProject ${saved.project}\n${p.title||''}`,saved.id);});}
     if(!create)thread=(await this.backend.rpc('thread/resume',{threadId:thread.id,excludeTurns:true})).thread;
-    this.attached.add(thread.id);this.flush();return{sessionId:s.id,threadId:thread.id,canAcceptDirectInput:thread.canAcceptDirectInput??null,status:thread.status,outputChannel:s.channel,outputThread:s.threadTs};
+    this.attached.add(thread.id);this.flush();return{sessionId:s.id,threadId:thread.id,canAcceptDirectInput:thread.canAcceptDirectInput??null,status:thread.status,outputChannel:s.channel,outputThread:s.threadTs,observation:{attachCreatesSubscription:false,note:'Control binding only; attach does not subscribe to commentary or partial answers (including ordinary questions). Use session.subscribe in the desired Slack thread, then session.subscriptions to check status. Existing explicit subscriptions and cancellation remain unchanged.',subscribe:{command:'session.subscribe',params:{threadId:thread.id}}}};
   }
   private async notification(method:string,p:any,epoch:string){
     if(epoch!==this.backend.epoch||!this.backend.connected)return;
     if(['turn/started','turn/completed','item/started','item/completed'].includes(method)){const activity=recordActivity(this.store.state.activity,method,p,Date.now());if(activity)this.store.transaction(s=>{s.activity=activity;});}
     if(['turn/started','turn/completed','item/started','item/completed'].includes(method))this.observeDelivery(method,p);
     if(method==='serverRequest/resolved'){
-      this.store.transaction(s=>{for(const r of s.pending)if(r.epoch===epoch&&r.rpcId===p.requestId&&['pending','responding'].includes(r.status))r.status='resolved';});return;
+      this.store.transaction(s=>{for(const r of s.pending)if(r.epoch===epoch&&r.rpcId===p.requestId&&['pending','responding','local-required'].includes(r.status))r.status='resolved';});return;
     }
     const session=this.store.state.sessions.find(s=>s.threadId===p.threadId&&this.authorizedSession(s));
     if(!session&&!this.store.state.subscriptions?.some(s=>s.enabled&&s.threadId===p.threadId))return;
     if(session&&(method==='item/started'||method==='item/completed')&&p.item?.id){this.items.set(`${p.threadId}:${p.turnId}:${p.item.id}`,p.item);if(this.items.size>1000)this.items.delete(this.items.keys().next().value!);}
     if(method==='item/completed'&&p.item?.type==='agentMessage'&&(!p.item.phase||['commentary','partial_answer','final_answer'].includes(p.item.phase))&&typeof p.item.text==='string'){
       const key=`${p.threadId}:${p.turnId}:${p.item.id}`;
-      this.store.transaction(state=>{if(Object.hasOwn(state.seenNotifications,key))return;const before=state.outbox.length;
-        if(session&&(!p.item.phase||p.item.phase==='final_answer'))this.boundNotice(state,p.item.text,session,true);
+      this.store.transaction(state=>{const seen=Object.hasOwn(state.seenNotifications,key),before=state.outbox.length;
+        const boundFinal=session&&(!p.item.phase||p.item.phase==='final_answer');
+        if(boundFinal){
+          if(!seen&&!this.subscriptions.hasExplicitDestination(session.threadId,session.channel,session.threadTs||''))this.boundNotice(state,p.item.text,session,true);
+          this.subscriptions.emit(state,p.item.text,p.threadId,key,sub=>sub.owner.channel===session.channel&&sub.owner.threadTs===session.threadTs);
+        }
         this.subscriptions.emit(state,`Session ${p.threadId}; turn ${p.turnId||'unknown'}; ${p.item.phase||'final_answer'}\n${p.item.text}`,p.threadId,key,sub=>!session||sub.owner.channel!==session.channel||sub.owner.threadTs!==session.threadTs||Boolean(p.item.phase&&p.item.phase!=='final_answer'));
         if(state.outbox.length>before)state.seenNotifications[key]=true;
       });this.flush();
     }
     if(method==='turn/completed'){
       const key=`turn:${p.threadId}:${p.turn?.id}:${p.turn?.status}`;
-      this.store.transaction(state=>{for(const r of state.pending)if(r.threadId===p.threadId&&r.turnId===p.turn?.id&&r.status==='pending')r.status='stale';if(Object.hasOwn(state.seenNotifications,key))return;const before=state.outbox.length;
+      this.store.transaction(state=>{for(const r of state.pending)if(r.threadId===p.threadId&&r.turnId===p.turn?.id&&['pending','local-required'].includes(r.status))r.status='stale';const seen=Object.hasOwn(state.seenNotifications,key),before=state.outbox.length;
         const text=`Session ${p.threadId}; turn ${p.turn?.id||'unknown'}: ${p.turn?.status||'terminal'}.`;
-        if(session&&p.turn?.status!=='completed')this.boundNotice(state,text+' Inspect session.info before continuing.',session);
+        if(session&&p.turn?.status!=='completed'){
+          const boundText=text+' Inspect session.info before continuing.';
+          if(!seen&&!this.subscriptions.hasExplicitDestination(session.threadId,session.channel,session.threadTs||''))this.boundNotice(state,boundText,session);
+          this.subscriptions.emit(state,boundText,p.threadId,key,sub=>sub.owner.channel===session.channel&&sub.owner.threadTs===session.threadTs);
+        }
         this.subscriptions.emit(state,text,p.threadId,key,sub=>!session||p.turn?.status==='completed'||sub.owner.channel!==session.channel||sub.owner.threadTs!==session.threadTs);
         if(state.outbox.length>before)state.seenNotifications[key]=true;
       });this.flush();
@@ -431,10 +444,18 @@ export class Connector {
   }
   private async serverRequest(r:any){
     if(r.epoch!==this.backend.epoch||!this.backend.connected||!['string','number'].includes(typeof r.id))return;
+    const previous=this.store.state.pending.find(p=>p.rpcId===r.id&&p.epoch===r.epoch);
+    // Check lifecycle before either route: even the fixed observer notice must not
+    // resurrect a closed request while a destination is catching up after joining.
+    if(previous&&(!['pending','local-required'].includes(previous.status)||previous.expiresAt<=Date.now()||
+      previous.threadId!==r.params?.threadId||previous.turnId!==(r.params?.turnId||'unavailable')||previous.method!==r.method))return;
     const s=this.store.state.sessions.find(s=>s.threadId===r.params?.threadId&&this.authorizedSession(s));
     this.store.transaction(state=>this.subscriptions.emit(state,`Session ${r.params?.threadId}; turn ${r.params?.turnId||'unknown'}: local decision/input required. Use the original local Codex UI or its authorized bound approval thread. This observation does not grant approval authority.`,r.params?.threadId,`request:${r.epoch}:${r.id}`,sub=>!s||sub.owner.channel!==s.channel||sub.owner.threadTs!==s.threadTs));this.flush();
     if(!s)return;
-    if(this.store.state.pending.some(p=>p.rpcId===r.id&&p.epoch===r.epoch))return;
+    if(previous){
+      if(previous.threadId===s.threadId&&previous.sessionId===s.id&&['pending','local-required'].includes(previous.status)&&previous.expiresAt>Date.now())this.store.transaction(state=>this.boundNotice(state,this.requestNotice(previous),s,false,`request:${r.epoch}:${r.id}`));
+      this.flush();return;
+    }
     let kind:Pending['kind']='unsupported';if(r.method==='item/commandExecution/requestApproval')kind='command';if(r.method==='item/fileChange/requestApproval')kind='file';if(r.method==='item/tool/requestUserInput')kind='input';
     const details=structuredClone(r.params),decisions=Array.isArray(details.availableDecisions)?details.availableDecisions.filter((x:any)=>['accept','decline','cancel'].includes(x)):['accept','decline','cancel'];
     let local=kind==='unsupported'||typeof details.turnId!=='string'||kind==='input'&&(!Array.isArray(details.questions)||details.questions.some((q:any)=>q.isSecret));
@@ -448,8 +469,9 @@ export class Connector {
     if(serialized.length>12000 || resultSensitive(details) || containsSensitiveContent(serialized) || containsSensitiveContent(String(details.command||'')) || /(?:Bearer\s+\S+|(?:xox[baprs]-|xapp-|github_pat_|sk-proj-)[A-Za-z0-9_-]{12,}|-----BEGIN .*PRIVATE KEY|(?:password|secret|token|api[_-]?key)\s*[=:]\s*[^\s,}]{6,}|[\\/]\.codex[\\/]|[\\/]\.env(?:[.\\/]|$))/i.test(serialized))local=true;
     const safeDetails=local?{notice:'Sensitive, oversized, unsupported, or broader-scope request; inspect locally',itemId:details.itemId}:details;
     const pending:Pending={id:randomUUID(),rpcId:r.id,epoch:r.epoch,sessionId:s.id,threadId:s.threadId,turnId:details.turnId||'unavailable',method:r.method,kind,status:local?'local-required':'pending',details:safeDetails,decisions,expiresAt:Date.now()+this.config.approvalTimeoutSec*1000};
-    this.store.transaction(state=>{state.pending.push(pending);this.boundNotice(state,local?`LOCAL_ACTION_REQUIRED: ${r.method}\nrequestId=${pending.id}; sensitive, unsupported, or broader-scope request. No approval was granted. Use the original local Codex UI.`:this.prompt(pending),s);});this.flush();
+    this.store.transaction(state=>{state.pending.push(pending);this.boundNotice(state,this.requestNotice(pending),s,false,`request:${r.epoch}:${r.id}`);});this.flush();
   }
+  private requestNotice(p:Pending){return p.status==='local-required'?`LOCAL_ACTION_REQUIRED: ${p.method}\nrequestId=${p.id}; sensitive, unsupported, or broader-scope request. No approval was granted. Use the original local Codex UI.`:this.prompt(p);}
   private prompt(p:Pending){
     const params:any={requestId:p.id,epoch:p.epoch,sessionId:p.sessionId,turnId:p.turnId};
     if(p.kind==='input')params.answers=Object.fromEntries((p.details.questions||[]).map((q:any)=>[q.id,['YOUR ANSWER']]));else params.decision='decline';

@@ -44,11 +44,16 @@ const fail = (code: string): never => { throw new SubscriptionError(code); };
 
 export class SessionSubscriptions {
   private creating = new Map<string, Promise<Subscription>>();
+  private restoring = new Map<string, Promise<void>>();
   private joining = new Map<string, Promise<void>>();
   private joined = new Map<string, string>();
   private validatedJoiningEpoch = new Map<string, string>();
   private reconnecting?: Promise<void>;
   constructor(private readonly store: SubscriptionStore, private readonly backend: Backend, private readonly hooks: SubscriptionHooks) {
+    const events = store.state.subscriptionEvents;
+    if (events !== undefined && (!events || typeof events !== 'object' || Array.isArray(events) ||
+      Object.entries(events).some(([key, ids]) => !/^[a-f0-9]{64}$/.test(key) || !Array.isArray(ids) ||
+        ids.length > MAX_SUBSCRIPTIONS || ids.some(id => !validId(id)) || new Set(ids).size !== ids.length))) fail('SUBSCRIPTION_STATE_INVALID');
     const rows = store.state.subscriptions;
     // Persisted disabled rows are tombstones: never evict them and revive legacy output silently.
     if (rows !== undefined && (!Array.isArray(rows) || rows.length > MAX_SUBSCRIPTIONS || rows.some(s =>
@@ -109,7 +114,8 @@ export class SessionSubscriptions {
     const previous = this.store.state.subscriptions?.find(s => s.enabled && s.threadId === threadId && sameOwner(s.owner, owner));
     if (previous) {
       if (!this.allowed(previous)) { this.disable(previous.id, 'SUBSCRIPTION_SCOPE_REVOKED'); fail('SUBSCRIPTION_SCOPE_REVOKED'); }
-      return previous;
+      await this.restore(previous.id);
+      return this.store.state.subscriptions!.find(s => s.id === previous.id)!;
     }
     if ((this.store.state.subscriptions?.length || 0) >= MAX_SUBSCRIPTIONS) fail('SUBSCRIPTION_LIMIT_REACHED');
     const epoch = this.backend.epoch, policy = this.hooks.policy();
@@ -204,6 +210,7 @@ export class SessionSubscriptions {
     if (!row) return;
     row.enabled = false; row.status = error ? 'error' : 'disabled';
     this.joined.delete(id); this.validatedJoiningEpoch.delete(id);
+    for (const [key, ids] of Object.entries(state.subscriptionEvents || {})) state.subscriptionEvents![key] = ids.filter(candidate => candidate !== id);
     if (error) row.error = error; else delete row.error;
     for (const delivery of state.outbox as SubscriptionDelivery[]) if (delivery.subscriptionId === id && delivery.status === 'queued') {
       delivery.status = 'failed'; delivery.error = error || 'SUBSCRIPTION_CANCELLED';
@@ -232,36 +239,61 @@ export class SessionSubscriptions {
     this.reconnecting = this.rejoinAll().finally(() => { this.reconnecting = undefined; });
     return this.reconnecting;
   }
+  private restore(id: string): Promise<void> {
+    const pending = this.restoring.get(id);
+    if (pending) return pending;
+    const operation = this.restoreOne(id).finally(() => this.restoring.delete(id));
+    this.restoring.set(id, operation);
+    return operation;
+  }
+  private async restoreOne(id: string) {
+    const row = this.store.state.subscriptions?.find(s => s.id === id);
+    if (!row?.enabled) return;
+    try {
+      if (!this.allowed(row)) fail('SUBSCRIPTION_SCOPE_REVOKED');
+      if (this.backend.connected && this.joined.get(id) === this.backend.epoch) return;
+      const epoch = this.backend.epoch;
+      await this.confirmLoaded(row.threadId);
+      const scope = await this.metadata(row.threadId, row.owner);
+      if (scope.cwd !== row.cwd) fail('SUBSCRIPTION_SCOPE_REVOKED');
+      const current = this.store.state.subscriptions?.find(s => s.id === id);
+      if (!current?.enabled) return;
+      this.store.transaction(state => { const s = state.subscriptions!.find(s => s.id === id)!; if (s.enabled) s.status = 'joining'; });
+      await this.join(id, epoch);
+    } catch (error) {
+      const code = error instanceof SubscriptionError ? error.code : 'SUBSCRIPTION_JOIN_FAILED';
+      this.disable(id, code); throw new SubscriptionError(code);
+    }
+  }
   private async rejoinAll() {
     for (const row of this.store.state.subscriptions || []) {
       if (!row.enabled) continue;
-      try {
-        if (!this.allowed(row)) fail('SUBSCRIPTION_SCOPE_REVOKED');
-        if (this.joined.get(row.id) === this.backend.epoch) continue;
-        const epoch = this.backend.epoch;
-        await this.confirmLoaded(row.threadId);
-        const scope = await this.metadata(row.threadId, row.owner);
-        if (scope.cwd !== row.cwd) fail('SUBSCRIPTION_SCOPE_REVOKED');
-        const current = this.store.state.subscriptions?.find(s => s.id === row.id);
-        if (!current?.enabled) continue;
-        this.store.transaction(state => { const s = state.subscriptions!.find(s => s.id === row.id)!; if (s.enabled) s.status = 'joining'; });
-        await this.join(row.id, epoch);
-      } catch (error) { this.disable(row.id, error instanceof SubscriptionError ? error.code : 'SUBSCRIPTION_JOIN_FAILED'); }
+      try { await this.restore(row.id); } catch { /* Persisted error remains visible; do not revive. */ }
     }
   }
 
-  /** Must be called inside the parent's transaction alongside its global event replay guard. */
-  emit(state: State, text: string, threadId: string, eventKey: string, predicate?: (subscription: Subscription) => boolean) {
+  /** Transactional per-event recipient ledger. Capture only subscriptions present on first
+   * observation; a replay may fill a still-unjoined recipient, never backfill a new one.
+   * Empty entries are durable tombstones, just like the parent's global replay guard.
+   * No content is buffered before fresh scope validation. */
+  emit(state: State, text: string, threadId: string, eventKey: string, predicate?: (subscription: Subscription) => boolean, output = this.hooks.output) {
     if (!eventKey) fail('SUBSCRIPTION_EVENT_KEY_REQUIRED');
     const key = createHash('sha256').update(eventKey).digest('hex');
+    const events = state.subscriptionEvents ||= {};
+    if (!Object.hasOwn(events, key)) {
+      // Pre-upgrade events have only the global guard. Preserve its no-backfill behavior.
+      events[key] = Object.hasOwn(state.seenNotifications, eventKey) ? [] :
+        (state.subscriptions || []).filter(row => row.threadId === threadId && this.allowed(row)).map(row => row.id);
+    }
     let routed = 0;
     for (const row of (state as SubscriptionState).subscriptions || []) {
       if (row.threadId !== threadId || !row.enabled) continue;
       if (!this.allowed(row)) { this.disableIn(state, row.id, 'SUBSCRIPTION_SCOPE_REVOKED'); continue; }
-      if (!this.connectionReady(row.id)) continue;
+      if (!events[key]!.includes(row.id) || !this.connectionReady(row.id)) continue;
       if (predicate && !predicate(row)) continue;
-      if (row.seen.includes(key)) continue;
-      this.hooks.output(state, text, structuredClone(row));
+      if (row.seen.includes(key)) { events[key] = events[key]!.filter(id => id !== row.id); continue; }
+      output(state, text, structuredClone(row));
+      events[key] = events[key]!.filter(id => id !== row.id);
       row.seen.push(key); row.seen = row.seen.slice(-MAX_SEEN); routed++;
     }
     return routed;
