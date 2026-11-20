@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
 import { parseConfig } from '../src/config.js';
 import { DesktopSettings, importConfigPreview } from '../desktop/settings.js';
+import { DesktopConnection } from '../desktop/connection.js';
 import type { Config } from '../src/types.js';
 const { JSDOM } = createRequire(import.meta.url)('jsdom');
 const copy=<T>(value:T):T=>JSON.parse(JSON.stringify(value));
@@ -41,13 +42,14 @@ function nativeSaveHarness(config:Config){
   const start=source.indexOf('saveConfig:async value=>')+'saveConfig:'.length;
   const end=source.indexOf(',\n  saveCredentials:',start);
   assert.ok(start>0&&end>start);
-  let running=false,saves=0,confirmations:{title:string;message:string}[]=[],duringConfirm:()=>void=()=>{},cancel=false;
+  let shuttingDown=false,saves=0,confirmations:{title:string;message:string}[]=[],duringConfirm:()=>void=()=>{},cancel=false;
+  const connection=new DesktopConnection({snapshot:()=>({state:'stopped',owned:false}),stop:async()=>({state:'stopped',owned:false})},()=>({state:'starting',owned:true}),()=>shuttingDown);
   const handler=runInNewContext('('+source.slice(start,end)+')',{
-    ensureStopped:()=>{if(running)throw Error('SERVER_RUNNING');},
-    settings:{readConfig:()=>copy(config),saveConfig:()=>{saves++;}},snapshot:()=>({}),
+    connection,
+    settings:{readConfig:()=>copy(config),prepareConfig:()=>()=>{saves++;}},snapshot:()=>({}),
     confirm:async(title:string,message:string)=>{confirmations.push({title,message});duringConfirm();if(cancel)throw Error('CANCELLED');}
   }) as (value:Config)=>Promise<unknown>;
-  return{handler,get saves(){return saves;},confirmations,setRunningDuringConfirm:()=>{duringConfirm=()=>{running=true;};},cancel:()=>{cancel=true;}};
+  return{handler,get saves(){return saves;},confirmations,quitDuringConfirm:()=>{duringConfirm=()=>{shuttingDown=true;};},cancel:()=>{cancel=true;}};
 }
 test('native save requires explicit risk confirmation only when widening file access',async()=>{
   const f=fixture();try{
@@ -58,8 +60,8 @@ test('native save requires explicit risk confirmation only when widening file ac
     const denied=nativeSaveHarness(f.config);denied.cancel();await assert.rejects(denied.handler(c),/CANCELLED/);assert.equal(denied.saves,0);
   }finally{f.close();}
 });
-test('native permission change rechecks stopped state after dialog before persisting',async()=>{
-  const f=fixture();try{const h=nativeSaveHarness(f.config);h.setRunningDuringConfirm();await assert.rejects(h.handler({...f.config,filePolicy:{allowAbsolutePaths:true}}),/SERVER_RUNNING/);assert.equal(h.saves,0);}finally{f.close();}
+test('native permission change rechecks shutdown after dialog before persisting',async()=>{
+  const f=fixture();try{const h=nativeSaveHarness(f.config);h.quitDuringConfirm();await assert.rejects(h.handler({...f.config,filePolicy:{allowAbsolutePaths:true}}),/CANCELLED/);assert.equal(h.saves,0);}finally{f.close();}
 });
 const settle=async()=>{for(let i=0;i<5;i++)await new Promise<void>(r=>setImmediate(r));};
 test('desktop checkbox defaults off and roundtrips true/false without expanding session policy',async()=>{

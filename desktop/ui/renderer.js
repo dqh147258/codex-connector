@@ -5,7 +5,7 @@
   const clone = value => JSON.parse(JSON.stringify(value));
   const busy = new Set();
   let snapshot = null, editingConfig = null, originalProject = null, originalDot = null;
-  let dirty = false, revision = 0, polling = false, preferencesBusy = false;
+  let dirty = false, revision = 0, snapshotEpoch = 0, polling = false, preferencesBusy = false;
   let lockEligible = false, disposed = false;
   const tokenFields = [$('app-token'), $('bot-token')];
   const safeText = value => String(value ?? '').replace(/\b(?:xox[baprs]-|xapp-)[A-Za-z0-9-]+/g, '[令牌已隐藏]').slice(0, 1200);
@@ -29,6 +29,7 @@
     const elements = buttons.map(id => $(id));
     for (const button of elements) { button.disabled = true; button.classList.add('is-busy'); button.setAttribute('aria-busy', 'true'); }
     text('busy-status', '正在处理，请稍候。');
+    if (snapshot) renderState(snapshot);
     try { return await fn(); } catch (error) { notice(errorMessage(error), 'error'); }
     finally {
       busy.delete(key);
@@ -122,14 +123,15 @@
   function renderState(s) {
     const runtime = s.runtime || {}, backend = runtime.backend || {}, credentials = s.credentials || {};
     const state = runtime.state || 'stopped', running = state === 'running', transitioning = state === 'starting' || state === 'stopping';
+    const settingsSaving = busy.has('save-config') || busy.has('tokens') || s.settingsBusy === true;
     const connected = backend.connected === true;
     const tone = connected ? 'good' : state === 'failed' ? 'error' : running || transitioning ? 'warning' : 'neutral';
     $('connection-badge').className = `badge ${tone}`;
     text('connection-badge', connected ? '共享 Codex 已连接' : running ? '本地已启动 · Codex 待连接' : runtimeNames[state] || state);
     text('connection-title', connected ? '连接已就绪，开始协作吧' : running ? '服务在运行，继续检查 Codex' : state === 'failed' ? '连接尚未完成，一起检查原因' : transitioning ? '正在安全地处理连接' : '准备好，让工作接上话');
     text('connection-description', connected ? '下一步：在测试频道发送 help，选择并绑定一个明确的 Codex 会话。不要把已连接当作所有会话都可接管。' : running ? '本地服务启动不等于共享会话连接成功。下方诊断会显示当前版本、失败原因和可采取的下一步。' : '先完成本机配置。连接器不会替你关闭 Codex 沙箱，也不会自动批准操作。');
-    $('start-button').disabled = transitioning || running || busy.has('start') || busy.has('stop');
-    $('stop-button').disabled = state === 'stopping' || !runtime.owned || busy.has('stop');
+    $('start-button').disabled = transitioning || running || settingsSaving || busy.has('start') || busy.has('stop');
+    $('stop-button').disabled = busy.has('stop') || (!settingsSaving && (state === 'stopping' || !runtime.owned));
     $('settings-stop-button').disabled = $('stop-button').disabled;
     text('local-status', runtimeNames[state] || state); dot('local-dot', running ? 'good' : state === 'failed' ? 'error' : transitioning ? 'warning' : '');
     text('local-detail', runtime.owned ? '由本应用管理；停止不会关闭共享 Codex daemon。' : '仅管理本应用启动的连接，不会接管其他进程。');
@@ -145,7 +147,8 @@
     text('diagnostic-daemon', daemon.enabled ? daemon.result || (daemon.attempted ? '已经尝试' : '等待启动') : '自动启动已关闭');
     text('diagnostic-guidance', failureHelp[failure] || (failure ? '先检查设置中的具体参数和 Codex 能力。不要发送令牌或完整配置；错误代码通常已经足够排查。' : connected ? '共享连接已建立。首次只选一个测试会话，验证 thread、回复与人工审批，然后再投入日常使用。' : running ? '如果共享连接持续未建立，请到设置向导检查 Codex 路径与能力，不要把共享目录改成宽松权限。' : '先点击「设置向导」，完成身份与项目选择，再启动连接。'));
     $('secure-storage-warning').hidden = credentials.secureStorage !== false;
-    $('save-tokens-button').disabled = credentials.secureStorage === false || busy.has('tokens');
+    $('save-tokens-button').disabled = credentials.secureStorage === false || settingsSaving;
+    $('save-config-button').disabled = settingsSaving;
     $('test-slack-button').disabled = !tokensReady || busy.has('slack-test');
     text('tokens-status', `App Token：${credentials.appToken ? '已保存' : '未保存'} · Bot Token：${credentials.botToken ? '已保存' : '未保存'}`);
     const login = s.login || {};
@@ -160,18 +163,21 @@
   async function refresh({ showError = false, forceForm = false } = {}) {
     if (polling || disposed) return;
     polling = true;
+    const epoch = snapshotEpoch;
     try {
-      const next = await invoke('snapshot'); snapshot = next;
+      const next = await invoke('snapshot');
+      if (epoch !== snapshotEpoch || disposed) return;
+      snapshot = next;
       if (forceForm || !editingConfig || (!dirty && JSON.stringify(editingConfig) !== JSON.stringify(next.config))) populate(next.config);
       renderState(next);
     } catch (error) { if (showError || !snapshot) notice(errorMessage(error), 'error'); }
     finally { polling = false; }
   }
   async function start() {
-    if (busy.has('start') || busy.has('stop')) return;
+    if (busy.has('start') || busy.has('stop') || savingSettings()) return;
     if (dirty) { notice('设置还有未保存的修改。请先保存配置，再启动连接。', 'error'); go('setup'); return; }
     await task('start', ['start-button'], async () => {
-      const runtime = await invoke('start');
+      const runtime = await invoke('start'); snapshotEpoch++;
       if (snapshot && runtime) { snapshot.runtime = runtime; renderState(snapshot); }
       await refresh({ showError: true });
       notice('启动请求已完成，请查看本地服务与共享 Codex 各自的状态。');
@@ -181,7 +187,7 @@
   async function stop() {
     if (busy.has('stop')) return;
     await task('stop', ['start-button', 'stop-button', 'settings-stop-button'], async () => {
-      const runtime = await invoke('stop'); if (snapshot && runtime) snapshot.runtime = runtime;
+      const runtime = await invoke('stop'); snapshotEpoch++; if (snapshot && runtime) snapshot.runtime = runtime;
       await refresh({ showError: true }); notice('本应用的连接已停止。共享 Codex daemon 和其他客户端不会被关闭。');
     });
     if (snapshot) renderState(snapshot);
@@ -201,33 +207,55 @@
     const result = await invoke('openHelp', { topic: b.dataset.help });
     if (result?.manifestCopied) notice('App 清单已复制到剪贴板。在 Slack 选择 Create New App → From a manifest，再粘贴清单。');
   }));
+  function savingSettings() { return busy.has('save-config') || busy.has('tokens') || snapshot?.settingsBusy === true; }
+  function savedNotice(label, result, changed = false, snapshotUnavailable = false) {
+    const suffix = (changed ? '之后的新修改仍留在表单中，尚未保存。' : '') +
+      (snapshotUnavailable ? '暂未能刷新完整连接概览。' : '');
+    if (result?.reconnect === 'failed') {
+      notice(`${label}已保存，但自动重连未能启动。${result.error?.message || '请检查连接诊断后手动连接。'}${suffix}`, 'error');
+    } else if (result?.reconnect === 'starting') {
+      notice(`${label}已保存，正在使用新设置重新连接。请在连接概览确认连接结果。${suffix}`);
+    } else if (result?.reconnect === 'cancelled') {
+      notice(`${label}已保存；已按停止请求保持断开。${suffix}`);
+    } else notice(`${label}已保存，连接保持停止。需要时可在连接概览启动。${suffix}`);
+  }
   $('config-form').addEventListener('input', markDirty);
   $('config-form').addEventListener('change', markDirty);
   $('config-form').addEventListener('submit', event => {
     event.preventDefault();
-    if (!$('config-form').reportValidity()) return;
+    if (savingSettings() || !$('config-form').reportValidity()) return;
     task('save-config', ['save-config-button'], async () => {
       const versionAtSave = revision, config = formConfig();
-      const result = await invoke('saveConfig', config);
-      if (revision === versionAtSave) {
+      let result;
+      try { result = await invoke('saveConfig', config); } catch (error) { snapshotEpoch++; await refresh(); throw error; }
+      snapshotEpoch++;
+      const changedAfterSubmit = revision !== versionAtSave;
+      if (!changedAfterSubmit) {
         dirty = false; populate(result?.config || config); $('import-notice').hidden = true;
         text('dirty-label', '配置已保存');
       }
-      if (result?.runtime) { snapshot = result; renderState(snapshot); }
-      notice(revision === versionAtSave + 1 ? '配置已保存。可以回到连接概览启动服务。' : '本次提交的配置已保存；之后的新修改仍留在表单中。');
+      if (result?.runtime) {
+        if (!result.snapshotUnavailable) snapshot = result;
+        else if (snapshot) snapshot.runtime = result.runtime;
+        if (snapshot) renderState(snapshot);
+      }
+      savedNotice('配置', result?.save, changedAfterSubmit, result?.snapshotUnavailable);
       await refresh();
     });
   });
   $('save-tokens-button').addEventListener('click', () => {
+    if (savingSettings()) return;
     const payload = {};
     if ($('app-token').value.trim()) payload.appToken = $('app-token').value.trim();
     if ($('bot-token').value.trim()) payload.botToken = $('bot-token').value.trim();
     for (const f of tokenFields) f.value = '';
     if (!Object.keys(payload).length) { notice('请先填写至少一种新令牌。空白字段会保留已保存的令牌。', 'error'); return; }
     task('tokens', ['save-tokens-button'], async () => {
-      const credentials = await invoke('saveCredentials', payload);
-      if (snapshot) snapshot.credentials = credentials;
-      notice('令牌已提交安全存储，输入框已清空。已保存的令牌不会再次显示。');
+      let credentials;
+      try { credentials = await invoke('saveCredentials', payload); } catch (error) { snapshotEpoch++; await refresh(); throw error; }
+      snapshotEpoch++;
+      if (snapshot) { snapshot.credentials = credentials; if (credentials.runtime) snapshot.runtime = credentials.runtime; }
+      savedNotice('令牌（安全存储）', credentials.save);
       await refresh();
     });
   });

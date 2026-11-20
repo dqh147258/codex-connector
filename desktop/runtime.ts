@@ -21,7 +21,10 @@ export class DesktopRuntime {
     if(this.child||this.stopping)throw Error('ALREADY_RUNNING');
     if(existsSync(join(this.home,'daemon.lock')))throw Error('LOCK_EXISTS');
     this.config=structuredClone(config);this.state='starting';this.backend=undefined;this.lastError=undefined;
-    const child=this.spawnChild(this.executable,[this.cliPath,'start','--home',this.home],{env:desktopChildEnvironment(this.home,tokens),shell:false,windowsHide:true,stdio:['ignore','pipe','pipe','ipc']});this.child=child;
+    let child:ChildProcess;
+    try{child=this.spawnChild(this.executable,[this.cliPath,'start','--home',this.home],{env:desktopChildEnvironment(this.home,tokens),shell:false,windowsHide:true,stdio:['ignore','pipe','pipe','ipc']});}
+    catch{this.state='failed';this.lastError='SERVER_START_FAILED';throw Error('SERVER_START_FAILED');}
+    this.child=child;
     // Never forward stdout/stderr: upstream diagnostics can contain private data.
     child.stdout?.on('data',()=>{});child.stderr?.on('data',()=>{});
     child.on('message',(m:any)=>{if(this.child!==child)return;if(m?.type==='connector:screens'){void this.screenRequest(child,m);return;}if(m?.type==='connector:ready'&&this.state==='starting')this.state='running';if(m?.type==='connector:stopping')this.state='stopping';if(m?.type==='connector:failure'&&['LOCK_EXISTS','CONFIGURATION_INVALID','LOCAL_PORT_IN_USE','WORKSPACE_MISMATCH','SLACK_AUTH_FAILED','SERVER_START_FAILED'].includes(m.code)){this.lastError=m.code;this.state='failed';}});
