@@ -92,7 +92,12 @@ export class DesktopSettings {
     if(!existsSync(join(this.homeDir,'config.json')))return this.defaultConfig();
     return importConfigPreview(join(this.homeDir,'config.json'));
   }
-  saveConfig(raw:unknown): void { const value=safeConfig(raw);atomicWrite(this.homeDir,'config.json',JSON.stringify(value,null,2)+'\n'); }
+  prepareConfig(raw:unknown): () => void {
+    const bytes=JSON.stringify(safeConfig(raw),null,2)+'\n';
+    if(Buffer.byteLength(bytes)>MAX_FILE)fail('SETTINGS_TOO_LARGE');
+    return ()=>atomicWrite(this.homeDir,'config.json',bytes);
+  }
+  saveConfig(raw:unknown): void { this.prepareConfig(raw)(); }
   readPreferences(): DesktopPreferences {
     const path=join(this.homeDir,'desktop-preferences.json');if(!existsSync(path))return {autoConnect:false,closeToTray:true};
     try{return this.validatePreferences(JSON.parse(boundedRead(path).toString('utf8')));}catch{return fail('PREFERENCES_INVALID');}
@@ -104,7 +109,8 @@ export class DesktopSettings {
     const secureStorageAvailable=this.secureAvailable();if(!secureStorageAvailable)return{appToken:false,botToken:false,secureStorageAvailable};
     try{const value=this.getCredentials();return {appToken:!!value?.appToken,botToken:!!value?.botToken,secureStorageAvailable};}catch{return {appToken:false,botToken:false,secureStorageAvailable};}
   }
-  saveCredentials(value:unknown):void {
+  saveCredentials(value:unknown):void { this.prepareCredentials(value)(); }
+  prepareCredentials(value:unknown):()=>void {
     keys(value,['appToken','botToken']);
     if(!Object.keys(value).length)fail('INVALID_CREDENTIALS');
     if(!this.secureAvailable())fail('SECURE_STORAGE_UNAVAILABLE');
@@ -112,7 +118,9 @@ export class DesktopSettings {
     const appToken=value.appToken===undefined?previous?.appToken:value.appToken;
     const botToken=value.botToken===undefined?previous?.botToken:value.botToken;
     if(typeof appToken!=='string'||!/^xapp-[A-Za-z0-9-]{8,4096}$/.test(appToken)||typeof botToken!=='string'||!/^xoxb-[A-Za-z0-9-]{8,4096}$/.test(botToken))fail('INVALID_CREDENTIALS');
-    try{atomicWrite(this.homeDir,'credentials.enc',this.cipher.encryptString(JSON.stringify({appToken,botToken})));}catch{return fail('CREDENTIAL_SAVE_FAILED');}
+    let encrypted:Buffer;
+    try{encrypted=this.cipher.encryptString(JSON.stringify({appToken,botToken}));}catch{return fail('CREDENTIAL_SAVE_FAILED');}
+    return ()=>{try{atomicWrite(this.homeDir,'credentials.enc',encrypted);}catch{return fail('CREDENTIAL_SAVE_FAILED');}};
   }
   getCredentials():Credentials|null {
     const path=join(this.homeDir,'credentials.enc');if(!existsSync(path))return null;

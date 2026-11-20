@@ -1,4 +1,5 @@
 import { DesktopRuntime } from '../desktop/runtime.js';
+import { DesktopConnection } from '../desktop/connection.js';
 import { Store } from '../src/store.js';
 import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
@@ -145,7 +146,8 @@ test('native settings opt-in prompts once, cancellation never saves, unchanged t
   const f=fixture();try{
     const source=readFileSync('desktop/main.ts','utf8'),start=source.indexOf('saveConfig:async value=>')+'saveConfig:'.length,end=source.indexOf(',\n  saveCredentials:',start);
     let saved=0,asked=0,cancel=true,previous:any={...f.config,screenPolicy:{enabled:false}};
-    const handler=runInNewContext('('+source.slice(start,end)+')',{ensureStopped:()=>{},settings:{readConfig:()=>previous,saveConfig:()=>{saved++;}},snapshot:()=>({}),confirm:async(title:string,message:string)=>{asked++;assert.match(title,/截图/);assert.match(message,/密码/);assert.match(message,/无需逐次/);if(cancel)throw Error('CANCELLED');}});
+    const connection=new DesktopConnection({snapshot:()=>({state:'stopped',owned:false}),stop:async()=>({state:'stopped',owned:false})},()=>({state:'starting',owned:true}),()=>false);
+    const handler=runInNewContext('('+source.slice(start,end)+')',{connection,settings:{readConfig:()=>previous,prepareConfig:()=>()=>{saved++;}},snapshot:()=>({}),confirm:async(title:string,message:string)=>{asked++;assert.match(title,/截图/);assert.match(message,/密码/);assert.match(message,/无需逐次/);if(cancel)throw Error('CANCELLED');}});
     const next={...f.config,screenPolicy:{enabled:true}};await assert.rejects(handler(next),/CANCELLED/);assert.equal(saved,0);
     cancel=false;await handler(next);assert.equal(saved,1);previous=next;await handler(next);assert.equal(saved,2);assert.equal(asked,2);
   }finally{await f.cleanup();}

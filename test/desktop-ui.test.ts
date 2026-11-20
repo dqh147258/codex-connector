@@ -100,3 +100,69 @@ test('partial Slack lists disclose truncation and retain manual ID fallback', as
   const f = fixture({ listUsers: () => ({ users: [], hasMore: true }), listChannels: () => ({ channels: [], hasMore: true }) });
   try { await settle(); f.$('list-users-button').click(); f.$('list-channels-button').click(); await settle(); assert.match(f.$('dot-result').textContent, /并非完整/); assert.match(f.$('channel-result').textContent, /并非完整/); } finally { f.close(); }
 });
+
+test('connected save remains available, blocks overlapping save/start, and preserves newer edits', async () => {
+  const state: any = initial(); state.runtime = { state: 'running', owned: true, backend: { connected: true } };
+  let resolve!: (value: any) => void;
+  const f = fixture({ saveConfig: () => new Promise(r => { resolve = r; }) }, state);
+  try {
+    await settle(); assert.equal(f.$('save-config-button').disabled, false);
+    f.input('team-id', 'TSUBMITTED'); f.$('config-form').dispatchEvent(new f.w.Event('submit', { bubbles: true, cancelable: true }));
+    assert.equal(f.$('save-config-button').disabled, true); assert.equal(f.$('save-tokens-button').disabled, true); assert.equal(f.$('start-button').disabled, true);
+    f.$('config-form').dispatchEvent(new f.w.Event('submit', { bubbles: true, cancelable: true })); assert.equal(f.calls.filter(c => c.name === 'saveConfig').length, 1);
+    f.state.runtime = { state: 'stopping', owned: true }; await f.tick(); assert.equal(f.$('stop-button').disabled, false);
+    f.input('team-id', 'TNEWER'); state.config.slack.teamId = 'TSUBMITTED'; state.runtime = { state: 'starting', owned: true };
+    resolve({ ...copy(state), save: { saved: true, reconnect: 'starting' } }); await settle();
+    assert.equal(f.$('team-id').value, 'TNEWER'); assert.match(f.$('dirty-label').textContent, /尚未保存/);
+    assert.match(f.$('global-notice').textContent, /重新连接/); assert.match(f.$('global-notice').textContent, /新修改.*尚未保存/);
+    assert.ok(!f.$('global-notice').textContent.includes('连接成功'));
+  } finally { f.close(); }
+});
+test('saved config with restart failure is marked saved and shows retry guidance without secrets', async () => {
+  const state: any = initial();
+  const f = fixture({ saveConfig: c => { state.config = copy(c); state.runtime = { state: 'failed', owned: false }; return { ...copy(state), save: { saved: true, reconnect: 'failed', error: { message: '启动失败 xoxb-dummy-private' } } }; } }, state);
+  try { await settle(); f.input('team-id', 'TNEW'); f.$('config-form').dispatchEvent(new f.w.Event('submit', { bubbles: true, cancelable: true })); await settle();
+    assert.equal(f.$('dirty-label').textContent, '配置已保存'); assert.match(f.$('global-notice').textContent, /已保存.*重连未能启动/); assert.equal(f.$('global-notice').classList.contains('error'), true); assert.ok(!f.w.document.body.textContent.includes('xoxb-dummy-private')); assert.equal(f.$('start-button').disabled, false);
+  } finally { f.close(); }
+});
+test('a missing post-save snapshot still reports save success without clearing known credential status', async () => {
+  const state: any = initial(); state.runtime = { state: 'running', owned: true };
+  let polls = 0;
+  const f = fixture({
+    snapshot: () => { if (++polls > 1) throw Error('snapshot unavailable'); return copy(state); },
+    saveConfig: () => ({ save: { saved: true, reconnect: 'starting' }, snapshotUnavailable: true, runtime: { state: 'starting', owned: true } })
+  }, state);
+  try {
+    await settle();
+    const tokens = f.$('tokens-status').textContent;
+    f.input('team-id', 'TSAVED'); f.$('config-form').dispatchEvent(new f.w.Event('submit', { bubbles: true, cancelable: true })); await settle();
+    assert.equal(f.$('dirty-label').textContent, '配置已保存');
+    assert.equal(f.$('tokens-status').textContent, tokens);
+    assert.match(f.$('global-notice').textContent, /正在使用新设置重新连接.*暂未能刷新完整连接概览/);
+    assert.match(f.$('connection-badge').textContent, /启动/);
+  } finally { f.close(); }
+});
+test('token save reports restart intent and keeps token fields empty', async () => {
+  const state: any = initial(); state.runtime = { state: 'running', owned: true };
+  const f = fixture({ saveCredentials: () => ({ ...state.credentials, runtime: { state: 'starting', owned: true }, save: { saved: true, reconnect: 'starting' } }) }, state);
+  try { await settle(); f.$('bot-token').value = 'xoxb-replacement-dummy'; f.$('save-tokens-button').click(); await settle(); assert.equal(f.$('bot-token').value, ''); assert.match(f.$('global-notice').textContent, /安全存储.*重新连接/); } finally { f.close(); }
+});
+test('save cancelled by manual stop never implies reconnection', async () => {
+  const state: any = initial(); const f = fixture({ saveConfig: c => { state.config = copy(c); return { ...copy(state), save: { saved: true, reconnect: 'cancelled' } }; } }, state);
+  try { await settle(); f.input('team-id', 'TNEW'); f.$('config-form').dispatchEvent(new f.w.Event('submit', { bubbles: true, cancelable: true })); await settle(); assert.match(f.$('global-notice').textContent, /已按停止请求保持断开/); assert.equal(f.$('start-button').disabled, false); } finally { f.close(); }
+});
+
+test('a delayed pre-save poll cannot restore stale config or runtime after a successful connected save', async () => {
+  const state: any = initial(); state.runtime = { state: 'running', owned: true };
+  let release!: (value: any) => void, polls = 0;
+  const f = fixture({ snapshot: () => { if (++polls === 2) return new Promise(r => { release = r; }); return copy(state); }, saveConfig: c => { state.config = copy(c); state.runtime = { state: 'starting', owned: true }; return { ...copy(state), save: { saved: true, reconnect: 'starting' } }; } }, state);
+  try {
+    await settle(); const old = copy(state); await f.tick();
+    f.input('team-id', 'TSAVED'); f.$('config-form').dispatchEvent(new f.w.Event('submit', { bubbles: true, cancelable: true })); await settle();
+    assert.equal(f.$('team-id').value, 'TSAVED'); assert.equal(f.$('dirty-label').textContent, '配置已保存');
+    release(old); await settle();
+    assert.equal(f.$('team-id').value, 'TSAVED'); assert.match(f.$('connection-badge').textContent, /启动/);
+    f.input('expected-version', '1.2.3'); f.$('config-form').dispatchEvent(new f.w.Event('submit', { bubbles: true, cancelable: true })); await settle();
+    assert.equal(f.calls.filter(c => c.name === 'saveConfig').at(-1)?.arg.slack.teamId, 'TSAVED');
+  } finally { f.close(); }
+});
