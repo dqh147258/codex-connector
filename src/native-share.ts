@@ -6,7 +6,7 @@ import type { Store } from './store.js';
 import { projectNativeMessage, projectNativeItem, projectNativeInput, renderNativeProjection, type NativeProjection } from './shared-native-content.js';
 
 export const nativeOutboxMarker = '[Native content record: matching Connector version and grant required]';
-export const sharingDisclosure = 'Share future eligible Codex replies and questions with readers of this exact Slack thread. Input entered locally or through another client can affect the shared replies. No earlier or currently running turn is shared. Answer requests in the original Codex app.';
+export const sharingDisclosure = 'Share future eligible Codex replies and questions with readers of this exact Slack thread. Input entered locally or through another client can affect the shared replies. No earlier or currently running turn is shared. Confirmation alone does not open delivery: wait until the verified native boundary is active. Answer requests in the original Codex app.';
 export class NativeShareError extends Error {}
 interface Route {
   serverId: string; backendFingerprint: string; workspaceId: string; channel: string; rootThreadTs: string;
@@ -19,7 +19,12 @@ export interface NativeShare extends Route {
   anchor: string | null;
   frontier: string | null;
   grantedAt: string;
-  state: 'active' | 'retired';
+  state: 'pending' | 'active' | 'retired';
+  consentVersion?: 2;
+  activatedAt?: string;
+  // Only opaque item and original connection hashes, never a tool body.
+  questionDeny?: {item:string;connection:string}[];
+  questionDenySaturated?: true;
   reason?: string;
   observationalGap?: string;
   seenActive: string[];
@@ -40,7 +45,7 @@ type Callback = {
   flush(): void;
 };
 const MAX_PREVIEWS = 64, PREVIEW_TTL = 120_000, MAX_BYTES = 4 * 1024 * 1024;
-const PAGE = 8, MAX_PAGES = 5, MAX_ACTIVE_KEYS = 256, PENDING_LIMIT = 64, RESOLVED_LIMIT = 512;
+const PAGE = 8, MAX_PAGES = 5, MAX_ACTIVE_KEYS = 256, PENDING_LIMIT = 64, RESOLVED_LIMIT = 512, MAX_QUESTION_DENIALS = 512;
 const hash = (x: unknown) => createHash('sha256').update(JSON.stringify(x)).digest('hex');
 const cursor = (x: unknown): x is string | null => x===null||typeof x==='string'&&x.length>0&&x.length<=1024&&!/[\x00-\x1f\x7f]/.test(x);
 const fail = (reason: string): never => {throw new NativeShareError(reason);};
@@ -68,7 +73,7 @@ interface PendingNative {
   key: { epoch: string; rpcId: string | number };
   answerDeadline?:number;
 }
-interface Preview {expires:number; connection:number; revision:number; route:Route}
+interface Preview {expires:number; connection:number; revision:number; nativeEpoch:string; nativeCreatedAt:number; route:Route}
 interface TurnRow {id:string;status:string;itemsView:string;items:any[]}
 const revokedCodes = new Set(['NATIVE_SHARE_THREAD_CHANGED','NATIVE_SHARE_SCOPE_CHANGED','NATIVE_SHARE_DESTINATION_UNVERIFIED']);
 export function validateNativeShareState(s:State){
@@ -79,8 +84,24 @@ export function validateNativeShareState(s:State){
     !/^\d{1,20}\.\d{1,10}$/.test(r.rootThreadTs)||!digest(r.backendFingerprint)||!digest(r.policy)||!digest(r.scope)||!digest(r.slackIdentity)||
     !Number.isSafeInteger(r.nativeCreatedAt)||r.nativeCreatedAt<=0||typeof r.grantedAt!=='string'||!Number.isFinite(Date.parse(r.grantedAt))||
     r.anchor!==null&&!deliveryId(r.anchor)||r.frontier!==null&&!deliveryId(r.frontier)||r.anchor!==null&&r.frontier===null||
-    !['active','retired'].includes(r.state)||!Array.isArray(r.seenActive)||r.seenActive.length>MAX_ACTIVE_KEYS||!r.seenActive.every(digest))||
+    !['active','pending','retired'].includes(r.state)||!Array.isArray(r.seenActive)||r.seenActive.length>MAX_ACTIVE_KEYS||!r.seenActive.every(digest)||
+    r.consentVersion!==undefined&&r.consentVersion!==2||
+    r.state==='pending'&&(r.consentVersion!==2||r.anchor!==null||r.frontier!==null||r.activatedAt!==undefined||r.seenActive.length!==0)||
+    r.state==='active'&&r.consentVersion===2&&(typeof r.activatedAt!=='string'||!Number.isFinite(Date.parse(r.activatedAt)))||
+    r.questionDenySaturated!==undefined&&r.questionDenySaturated!==true||
+    r.questionDeny!==undefined&&(!Array.isArray(r.questionDeny)||r.questionDeny.length>MAX_QUESTION_DENIALS||
+      r.questionDeny.some(e=>!e||!digest(e.item)||!digest(e.connection))||new Set(r.questionDeny.map(e=>e.item)).size!==r.questionDeny.length))||
     new Set(list.map(r=>r.id)).size!==list.length||new Set(list.map(r=>r.subscriptionId)).size!==list.length)throw new NativeShareError('NATIVE_SHARE_STATE_INVALID');
+}
+// Earlier candidates had no durable pre-anchor gate. Keep their status for
+// audit, but never activate their existing grants or restore queued content.
+export function retirePreGateSharing(s:State) {
+  for(const grant of s.nativeShares??[])if(grant.consentVersion!==2&&grant.state!=='retired'){
+    grant.state='retired';grant.reason='NATIVE_SHARE_EXPLICIT_REAUTHORIZATION_REQUIRED';
+  }
+  for(const o of s.outbox)if(o.nativeShare&&!s.nativeShares?.some(r=>r.id===o.nativeShare!.grantId&&r.consentVersion===2)&&o.status==='queued'){
+    o.status='failed';o.error='NATIVE_SHARE_EXPLICIT_REAUTHORIZATION_REQUIRED';o.text='';delete o.nativeShare;
+  }
 }
 export class NativeSharing {
   // Pending input is never reconstructed from historical item text. Only a
@@ -93,6 +114,7 @@ export class NativeSharing {
   private previews = new Map<string,Preview>();
   private consentRevision = new Map<string,number>();
   private ready = new Map<string,string>();
+  private activating = new Map<string,Promise<void>>();
   private sweep?:Promise<void>;
   private dirty = false;
   private lastSweep = 0;
@@ -149,7 +171,7 @@ export class NativeSharing {
     const sub=this.findSub(state,r.subscriptionId);
     if(!sub||!this.hooks.online()||this.blocked.has(r.nativeThreadId))return;
     const route=this.hooks.route(sub);
-    if(r.state==='active'&&route&&equalRoute(route,r))return sub;
+    if(r.consentVersion===2&&r.state!=='retired'&&route&&equalRoute(route,r))return sub;
   }
   view(id: string) {
     const d=this.store.state,sub=this.findSub(d,id);
@@ -157,23 +179,31 @@ export class NativeSharing {
     const row=d.nativeShares?.find(r=>r.subscriptionId===id);
     const scope=this.hooks.route(sub);
     return {...(scope?publicRoute(scope):row?publicRoute(row):{subscriptionId:id,nativeThreadId:sub.threadId,channel:sub.owner.channel,rootThreadTs:sub.owner.threadTs}),
-      status:!row?'unshared':row.state==='retired'?'retired':!scope||!equalRoute(scope,row)||!this.backend.connected||!this.hooks.online()||!this.hooks.joined(id)?'paused':row.observationalGap?'gap':this.ready.get(row.id)===this.backend.epoch?'active':'checking',
+      status:!row?'unshared':row.state==='retired'?'retired':row.state==='pending'?'pending':!scope||!equalRoute(scope,row)||!this.backend.connected||!this.hooks.online()||!this.hooks.joined(id)?'paused':row.observationalGap?'gap':this.ready.get(row.id)===this.backend.epoch?'active':'checking',
       reason:row?.reason??row?.observationalGap??null,
+      activation:row?{consentRecordedAt:row.grantedAt,verifiedAnchorRecordedAt:row.activatedAt??null}:null,
       questionsAfterReconnect:'Only if the official App Server provides a current outstanding request; historical question text is never replayed.',
       disclosure:sharingDisclosure};
   }
-  preview(id: string){
+  async preview(id: string){
     const d=this.store.state,sub=this.findSub(d,id);
     if(!sub)return fail('NATIVE_SHARE_SUBSCRIPTION_NOT_FOUND');
     if(!this.hooks.online()||!this.backend.connected||!this.hooks.joined(id))return fail('NATIVE_SHARE_NOT_READY');
     const route=this.hooks.route(sub);
     if(!route)return fail('NATIVE_SHARE_IDENTITY_UNVERIFIED');
     const prior=d.nativeShares?.find(r=>r.subscriptionId===id);
-    if(prior?.state==='active'&&equalRoute(prior,route))return fail('NATIVE_SHARE_ALREADY_GRANTED');
+    if(prior&&prior.state!=='retired'&&equalRoute(prior,route))return fail('NATIVE_SHARE_ALREADY_GRANTED');
     for(const [key,value] of this.previews)if(value.expires<Date.now())this.previews.delete(key);
     if(this.previews.size>=MAX_PREVIEWS)return fail('NATIVE_SHARE_PREVIEW_LIMIT');
+    const w=this.window(),connection=this.hooks.sameSlackConnection(),revision=this.consentRevision.get(id)??0;
+    // This is only to identify the thread presented for consent. No history
+    // or cursor obtained before consent can become an activation anchor.
+    const meta=await this.metadata(sub,w);
+    const current=this.findSub(this.store.state,id),latest=current&&this.hooks.route(current);
+    if(!this.current(w)||!latest||!equalRoute(latest,route)||!this.hooks.joined(id)||connection!==this.hooks.sameSlackConnection()||revision!==(this.consentRevision.get(id)??0))return fail('NATIVE_SHARE_SCOPE_CHANGED');
+    if(this.previews.size>=MAX_PREVIEWS)return fail('NATIVE_SHARE_PREVIEW_LIMIT');
     const confirmationId=randomUUID();
-    this.previews.set(confirmationId,{expires:Date.now()+PREVIEW_TTL,connection:this.hooks.sameSlackConnection(),revision:this.consentRevision.get(id)??0,route});
+    this.previews.set(confirmationId,{expires:Date.now()+PREVIEW_TTL,connection,revision,nativeEpoch:w.epoch,nativeCreatedAt:meta.createdAt,route});
     return {...publicRoute(route),confirmationId,confirmationPhrase:'SHARE FUTURE '+route.nativeThreadId+' TO '+route.workspaceId+'/'+route.channel+'/'+route.rootThreadTs,disclosure:sharingDisclosure};
   }
   private async destination(r:Route) {
@@ -185,38 +215,72 @@ export class NativeSharing {
     const r=approval?.route;
     if(!approval||!r||r.subscriptionId!==id||approval.expires<Date.now()||!this.hooks.online()||approval.connection!==this.hooks.sameSlackConnection()||
       phrase!=='SHARE FUTURE '+r.nativeThreadId+' TO '+r.workspaceId+'/'+r.channel+'/'+r.rootThreadTs)return fail('NATIVE_SHARE_CONFIRMATION_REQUIRED');
-    const sub=this.findSub(this.store.state,id),route=sub&&this.hooks.route(sub);
-    if(!sub||!route||!equalRoute(route,r)||!this.hooks.joined(id))return fail('NATIVE_SHARE_SCOPE_CHANGED');
-    const w=this.window();
-    await this.destination(r);
-    // An idle native thread before the ordered head read is essential: a
-    // pre-consent active turn can otherwise appear in persistence after the
-    // snapshot and be mistaken for a new turn. Do not auto-activate later.
-    const meta=await this.metadata(sub,w);
-    if(meta.status?.type!=='idle')return fail('NATIVE_SHARE_WAIT_UNTIL_IDLE');
-    const {data}=await this.turns(sub,w,'notLoaded',1);
-    if(data[0]&&!terminalExecution(data[0].status))return fail('NATIVE_SHARE_WAIT_UNTIL_IDLE');
-    if(!data[0]&&!this.store.state.work.some(x=>x.source.kind==='local'&&x.source.userId==='local'&&x.request.command==='session.create'&&x.status==='completed'&&
-      x.resultRef?.threadId===r.nativeThreadId&&Math.abs(meta.createdAt*1000-Date.parse(x.createdAt))<60_000&&Date.now()-Date.parse(x.createdAt)<15*60_000)){
-      return fail('NATIVE_SHARE_USE_DEDICATED_THREAD');
-    }
-    const finalMeta=await this.metadata(sub,w);
-    if(finalMeta.createdAt!==meta.createdAt)return fail('NATIVE_SHARE_THREAD_CHANGED');
-    if(finalMeta.status?.type!=='idle')return fail('NATIVE_SHARE_WAIT_UNTIL_IDLE');
-    const anchor=data[0]?.id??null;
-    const created:NativeShare={...r,id:randomUUID(),nativeCreatedAt:meta.createdAt,anchor,frontier:anchor,grantedAt:new Date().toISOString(),state:'active',seenActive:[]};
+    const created:NativeShare={...r,id:randomUUID(),nativeCreatedAt:approval.nativeCreatedAt,anchor:null,frontier:null,
+      grantedAt:new Date().toISOString(),consentVersion:2,state:'pending',seenActive:[],observationalGap:'NATIVE_SHARE_VERIFYING_ANCHOR'};
+    // The owner consent is durable before *any* activation RPC. Pending
+    // rows cannot queue, restore or deliver bodies, even after a crash.
     this.store.transaction(d=>{
-      const current=this.findSub(d,id),bound=current&&this.hooks.route(current);
-      if(!this.current(w)||!this.hooks.online()||approval.revision!==(this.consentRevision.get(id)??0)||approval.connection!==this.hooks.sameSlackConnection()||!bound||!equalRoute(bound,r)||!this.hooks.joined(id)||this.blocked.has(r.nativeThreadId))fail('NATIVE_SHARE_SCOPE_CHANGED');
-      const old=d.nativeShares?.find(r=>r.subscriptionId===id);
-      if(old?.state==='active'&&equalRoute(old,r))fail('NATIVE_SHARE_ALREADY_GRANTED');
+      const sub=this.findSub(d,id),route=sub&&this.hooks.route(sub);
+      if(!route||!equalRoute(route,r)||!this.hooks.joined(id)||!this.backend.connected||approval.nativeEpoch!==this.backend.epoch||
+        approval.revision!==(this.consentRevision.get(id)??0)||approval.connection!==this.hooks.sameSlackConnection()||this.blocked.has(r.nativeThreadId))fail('NATIVE_SHARE_SCOPE_CHANGED');
+      const old=d.nativeShares?.find(x=>x.subscriptionId===id);
+      if(old&&old.state!=='retired'&&equalRoute(old,r))fail('NATIVE_SHARE_ALREADY_GRANTED');
       if(old)this.retire(d,old,'NATIVE_SHARE_REPLACED');
       d.nativeShares=(d.nativeShares??[]).filter(x=>x.subscriptionId!==id);
       d.nativeShares.push(created);
     });
-    this.ready.set(created.id,w.epoch);
-    this.kick();
+    await this.activate(created);
+    // The original authorization's response must not report a newer grant as
+    // its own when the owner revoked and reconfirmed during the proof read.
+    if(!this.store.state.nativeShares?.some(x=>x.id===created.id)){
+      return {...publicRoute(created),status:'retired',reason:'NATIVE_SHARE_REPLACED',disclosure:sharingDisclosure,
+        activation:{consentRecordedAt:created.grantedAt,verifiedAnchorRecordedAt:null}};
+    }
     return this.view(id);
+  }
+  private activate(row:NativeShare){
+    const existing=this.activating.get(row.id);if(existing)return existing;
+    const next=this.activateOne(row).finally(()=>this.activating.delete(row.id));
+    this.activating.set(row.id,next);return next;
+  }
+  private async activateOne(row:NativeShare) {
+    const d=this.store.state,w=this.window();
+    if(!this.current(w)||!this.hooks.online())return;
+    const actual=d.nativeShares?.find(x=>x.id===row.id&&x.state==='pending');
+    if(!actual)return;
+    const sub=this.currentRoute(actual,d);
+    if(!sub)return this.failRefresh(row,'NATIVE_SHARE_SCOPE_CHANGED');
+    if(!this.hooks.joined(sub.id))return;
+    const slackConnection=this.hooks.sameSlackConnection();
+    try{
+      await this.destination(actual);
+      // Native idle and the first official ordered head are observed only
+      // AFTER the durable consent. The entire recorded prefix is private,
+      // including turns that finish between consent and this snapshot.
+      const meta=await this.metadata(sub,w);
+      if(meta.createdAt!==row.nativeCreatedAt)fail('NATIVE_SHARE_THREAD_CHANGED');
+      if(meta.status?.type!=='idle')fail('NATIVE_SHARE_WAIT_UNTIL_IDLE');
+      const {data}=await this.turns(sub,w,'notLoaded',1);
+      if(data[0]&&!terminalExecution(data[0].status))fail('NATIVE_SHARE_WAIT_UNTIL_IDLE');
+      if(!data[0]&&!this.store.state.work.some(x=>x.source.kind==='local'&&x.source.userId==='local'&&x.request.command==='session.create'&&x.status==='completed'&&
+        x.resultRef?.threadId===row.nativeThreadId&&Math.abs(meta.createdAt*1000-Date.parse(x.createdAt))<60_000&&Date.parse(x.createdAt)<=Date.parse(row.grantedAt)&&Date.parse(row.grantedAt)-Date.parse(x.createdAt)<15*60_000)){
+        fail('NATIVE_SHARE_USE_DEDICATED_THREAD');
+      }
+      const after=await this.metadata(sub,w);
+      if(after.createdAt!==row.nativeCreatedAt)fail('NATIVE_SHARE_THREAD_CHANGED');
+      if(after.status?.type!=='idle')fail('NATIVE_SHARE_WAIT_UNTIL_IDLE');
+      if(!this.current(w)||slackConnection!==this.hooks.sameSlackConnection())return;
+      const didActivate=this.store.transaction(draft=>{
+        const latest=draft.nativeShares?.find(x=>x.id===row.id&&x.state==='pending');
+        if(!latest||!this.currentRoute(latest,draft)||!this.hooks.joined(latest.subscriptionId))return false;
+        latest.state='active';latest.anchor=data[0]?.id??null;latest.frontier=latest.anchor;latest.activatedAt=new Date().toISOString();
+        delete latest.observationalGap;
+        return true;
+      });
+      if(didActivate){this.ready.set(row.id,w.epoch);this.kick(row.nativeThreadId);}
+    }catch(e){
+      if(this.current(w)&&slackConnection===this.hooks.sameSlackConnection())this.failRefresh(row,e instanceof NativeShareError?e.message:'NATIVE_SHARE_HISTORY_GAP');
+    }
   }
   revoke(id:string){
     const inFlightMayStillArrive=this.store.transaction(d=>{
@@ -239,6 +303,41 @@ export class NativeSharing {
     }
     this.ready.delete(row.id);
   }
+  private questionKey(row:NativeShare,turnId:string,itemId:string){
+    // A freshly joined transport has its own RPC IDs, but the verified native
+    // thread incarnation and its item IDs survive transport reconnects.
+    return hash([row.backendFingerprint,row.nativeThreadId,row.nativeCreatedAt,turnId,itemId]);
+  }
+  private questionAllowed(row:NativeShare,turnId:string,itemId:string){
+    return !row.questionDenySaturated&&!row.questionDeny?.some(e=>e.item===this.questionKey(row,turnId,itemId));
+  }
+  private rememberNonQuestions(threadId:unknown,turnId:unknown,itemIds:readonly unknown[],epoch:string){
+    if(epoch!==this.backend.epoch||!this.backend.connected||!deliveryId(threadId)||!deliveryId(turnId))return;
+    const ids=new Set(itemIds.filter(deliveryId));
+    if(!ids.size)return;
+    for(const [key,q] of this.pending)if(q.threadId===threadId&&q.projection.turnId===turnId&&ids.has(q.projection.itemId))this.pending.delete(key);
+    const applicable=(r:NativeShare)=>r.consentVersion===2&&r.state!=='retired'&&r.nativeThreadId===threadId&&r.frontier!==turnId&&!r.questionDenySaturated;
+    if(!this.store.state.nativeShares?.some(r=>applicable(r)&&[...ids].some(id=>this.questionAllowed(r,turnId,id))))return;
+    const connection=hash(epoch);
+    this.store.transaction(d=>{
+      for(const row of d.nativeShares??[])if(applicable(row)){
+        const observed=row.questionDeny??=[];
+        const keys=new Set(observed.map(e=>e.item));
+        for(const id of ids){
+          const item=this.questionKey(row,turnId,id);
+          if(keys.has(item))continue;
+          if(observed.length>=MAX_QUESTION_DENIALS){
+            // Never forget a known deny to make room for an ambiguous request.
+            // Reply bodies stay available; structured input is closed until
+            // an operator explicitly starts a new verified boundary.
+            row.questionDenySaturated=true;
+            break;
+          }
+          keys.add(item);observed.push({item,connection});
+        }
+      }
+    });
+  }
   /** Hard invalidation on the frame callback, before any async event work. */
   observe(method:string,p:any,epoch:string){
     if(epoch!==this.backend.epoch)return;
@@ -255,14 +354,14 @@ export class NativeSharing {
       return;
     }
     if((method==='item/started'||method==='item/completed')&&typeof p?.item?.type==='string'&&!['agentMessage','userMessage'].includes(p.item.type)){
-      for(const [k,q] of this.pending)if(q.threadId===p.threadId&&q.projection.turnId===p.turnId&&q.projection.itemId===p.item.id)this.pending.delete(k);
+      this.rememberNonQuestions(p.threadId,p.turnId,[p.item.id],epoch);
     }
     if(method==='turn/completed')for(const [k,q] of this.pending)if(q.threadId===p?.threadId&&q.projection.turnId===p?.turn?.id)this.pending.delete(k);
     if(['thread/rolledBack','thread/reverted','thread/archived','thread/closed'].includes(method)&&deliveryId(p?.threadId)){
-      const affected=this.store.state.nativeShares?.filter(r=>r.state==='active'&&r.nativeThreadId===p.threadId);
+      const affected=this.store.state.nativeShares?.filter(r=>r.state!=='retired'&&r.nativeThreadId===p.threadId);
       if(affected?.length){
         this.blocked.add(p.threadId);
-        this.store.transaction(d=>{for(const row of d.nativeShares??[])if(row.state==='active'&&row.nativeThreadId===p.threadId)this.retire(d,row,'NATIVE_SHARE_THREAD_CHANGED');});
+        this.store.transaction(d=>{for(const row of d.nativeShares??[])if(row.state!=='retired'&&row.nativeThreadId===p.threadId)this.retire(d,row,'NATIVE_SHARE_THREAD_CHANGED');});
         this.blocked.delete(p.threadId);
       }
     }
@@ -271,7 +370,8 @@ export class NativeSharing {
   request(r:any){
     if(this.closed||this.questionCoverageLost||!this.backend.connected||r?.epoch!==this.backend.epoch||!validRequest(r.id)||!deliveryId(r.params?.threadId)||!this.store.state.nativeShares?.some(row=>row.state==='active'&&row.nativeThreadId===r.params.threadId))return;
     const projection=projectNativeInput(r.method,r.params);
-    if(!projection)return;
+    if(!projection||!this.store.state.nativeShares?.some(row=>row.consentVersion===2&&row.state==='active'&&row.nativeThreadId===r.params.threadId&&
+      this.questionAllowed(row,projection.turnId,projection.itemId)))return;
     const key={epoch:r.epoch,rpcId:r.id},k=reqKey(key),prior=this.pending.get(k);
     if(this.resolved.has(JSON.stringify([r.params.threadId,k])))return;
     if(prior){
@@ -289,14 +389,14 @@ export class NativeSharing {
   }
   tick(){if(Date.now()-this.lastSweep>=5000)this.kick();}
   private kick(threadId?:string) {
-    if(this.closed||!this.hooks.online()||!this.backend.connected||!this.store.state.nativeShares?.some(r=>r.state==='active'&&(!threadId||r.nativeThreadId===threadId)))return;
+    if(this.closed||!this.hooks.online()||!this.backend.connected||!this.store.state.nativeShares?.some(r=>r.state!=='retired'&&(!threadId||r.nativeThreadId===threadId)))return;
     if(this.sweep){this.dirty=true;return;}
     this.lastSweep=Date.now();
     this.sweep=Promise.resolve().then(async()=>{
-      const rows=this.store.state.nativeShares?.filter(r=>r.state==='active')??[];
+      const rows=this.store.state.nativeShares?.filter(r=>r.state!=='retired')??[];
       // Small independent batches. A single unsupported history RPC cannot
       // block other registries or make unbounded in-flight calls.
-      for(let i=0;i<rows.length&&!this.closed;i+=3)await Promise.all(rows.slice(i,i+3).map(r=>this.refresh(r)));
+      for(let i=0;i<rows.length&&!this.closed;i+=3)await Promise.all(rows.slice(i,i+3).map(r=>r.state==='pending'?this.activate(r):this.refresh(r)));
     }).catch(()=>{/* no raw backend errors in logs */}).finally(()=>{
       this.sweep=undefined;this.hooks.flush();
       if(this.dirty){this.dirty=false;this.kick();}
@@ -311,7 +411,8 @@ export class NativeSharing {
     // A native or Slack disconnect between scheduling and entering a sweep
     // pauses this grant. It must not turn a transient disconnect into revocation.
     if(!this.current(w)||!this.hooks.online())return;
-    const d=this.store.state,sub=this.currentRoute(row,d);
+    const d=this.store.state,actual=d.nativeShares?.find(x=>x.id===row.id&&x.state==='active'),sub=actual&&this.currentRoute(actual,d);
+    if(!actual)return;
     if(!sub)return this.failRefresh(row,'NATIVE_SHARE_SCOPE_CHANGED');
     if(!this.hooks.joined(sub.id))return;
     try{
@@ -327,7 +428,7 @@ export class NativeSharing {
           if(t.id===row.frontier){known=true;break;}
           frame.push(t);
         }
-        if(!upstream.next){if(row.frontier===null)known=true;break;}
+        if(!upstream.next){if(row.frontier===null)known=true;else if(!known)fail('NATIVE_SHARE_THREAD_CHANGED');break;}
         if(pageCursors.has(upstream.next))fail('NATIVE_SHARE_HISTORY_GAP');
         pageCursors.add(upstream.next);after=upstream.next;
       }
@@ -365,6 +466,7 @@ export class NativeSharing {
             if(!['agentMessage','userMessage'].includes(entry.item.type))nativeToolItems.add(entry.item.id);
           }
         }catch{activeContinuity=false;}
+        this.rememberNonQuestions(sub.threadId,a.id,[...nativeToolItems],w.epoch);
         // Official structured requests do not expose their text via readback.
         // This one was received for an eligible live turn and is still pending
         // on this connection. Absent native pending evidence means no body.
@@ -374,11 +476,11 @@ export class NativeSharing {
       if(fresh.createdAt!==row.nativeCreatedAt)fail('NATIVE_SHARE_THREAD_CHANGED');
       this.store.transaction(draft=>{
         const current=draft.nativeShares?.find(r=>r.id===row.id),actual=current&&this.currentRoute(current,draft);
-        if(!current||!actual||!this.current(w)||!this.hooks.joined(sub.id)||current.frontier!==row.frontier)return;
+        if(!current||current.state!=='active'||!actual||!this.current(w)||!this.hooks.joined(sub.id)||current.frontier!==row.frontier)return;
         const activeSeen=new Set(current.seenActive);
         for(const {p,current:q} of projections){
           const key=dedupe(current.id,p);
-          if(q&&!this.keyLive(q,actual))continue;
+          if(q&&(!this.keyLive(q,actual)||!this.questionAllowed(current,p.turnId,p.itemId)))continue;
           const previous=draft.outbox.filter(o=>o.nativeShare?.grantId===current.id&&o.nativeShare.key===key);
           if(previous.length||activeSeen.has(key)){
             // An unattempted question may have been paused by a lost connection.
@@ -398,7 +500,7 @@ export class NativeSharing {
         }
         current.frontier=frontier;
         current.seenActive=[...activeSeen].filter(key=>draft.outbox.some(o=>o.nativeShare?.grantId===current.id&&o.nativeShare.key===key&&o.nativeShare.projection.turnId===a?.id));
-        if(this.questionCoverageLost)current.observationalGap='NATIVE_SHARE_QUESTION_GAP';
+        if(this.questionCoverageLost||current.questionDenySaturated)current.observationalGap='NATIVE_SHARE_QUESTION_GAP';
         else if(activeContinuity)delete current.observationalGap;
         else current.observationalGap='NATIVE_SHARE_ACTIVE_ITEMS_GAP';
       });
@@ -408,10 +510,10 @@ export class NativeSharing {
   private failRefresh(row:NativeShare,reason:string) {
     this.ready.delete(row.id);
     const saved=this.store.state.nativeShares?.find(r=>r.id===row.id);
-    if(!saved||saved.state!=='active'||saved.observationalGap===reason)return;
+    if(!saved||saved.state==='retired'||saved.observationalGap===reason)return;
     this.store.transaction(d=>{
       const current=d.nativeShares?.find(r=>r.id===row.id);
-      if(current?.state!=='active')return;
+      if(!current||current.state==='retired')return;
       if(revokedCodes.has(reason))this.retire(d,current,reason);
       else current.observationalGap=reason;
     });
@@ -421,12 +523,13 @@ export class NativeSharing {
    * a cached arbitrary command result or a forged notification body. */
   deliveryAllowed(o:Delivery,d:Readonly<State>) {
     const n=o.nativeShare,row=n&&d.nativeShares?.find(r=>r.id===n.grantId),sub=row&&this.currentRoute(row,d);
-    if(!n||!row||!sub||!this.backend.connected||this.ready.get(row.id)!==this.backend.epoch||!this.hooks.joined(sub.id)||
+    if(!n||!row||row.state!=='active'||!sub||!this.backend.connected||this.ready.get(row.id)!==this.backend.epoch||!this.hooks.joined(sub.id)||
       o.subscriptionId!==sub.id||o.notificationThreadId!==row.nativeThreadId||o.channel!==row.channel||o.threadTs!==row.rootThreadTs||
       !o.origin||o.origin.kind!==sub.owner.kind||o.origin.userId!==sub.owner.userId||o.origin.channel!==sub.owner.channel||o.origin.threadTs!==sub.owner.threadTs||o.root)return false;
     const cols=parts(n.projection);
     if(o.text!==nativeOutboxMarker||!Number.isSafeInteger(n.part)||n.part<0||cols.length!==n.parts||!cols[n.part]||n.key!==dedupe(row.id,n.projection))return false;
     if(n.projection.kind==='input'){
+      if(!this.questionAllowed(row,n.projection.turnId,n.projection.itemId))return false;
       const pending=n.request&&this.pending.get(reqKey(n.request));
       return !!pending&&this.keyLive(pending,sub)&&hash(pending.projection)===hash(n.projection);
     }
@@ -458,10 +561,12 @@ export class NativeSharing {
         // A matching tool item or unknown shape can arrive while the Slack
         // root read is in progress. Never mistake it for a regular question.
         const input=n!.projection;
-        if((await this.items(sub,input.turnId,w)).some(entry=>entry.item.id===input.itemId&&!['agentMessage','userMessage'].includes(entry.item.type)))return 'refuse';
+        const nonQuestions=(await this.items(sub,input.turnId,w)).filter(entry=>!['agentMessage','userMessage'].includes(entry.item.type)).map(entry=>entry.item.id);
+        this.rememberNonQuestions(sub.threadId,input.turnId,nonQuestions,w.epoch);
+        if(nonQuestions.includes(input.itemId))return 'refuse';
       }
       return this.current(w)&&connection===this.hooks.sameSlackConnection()?'ready':'pause';
     }catch(e){const code=e instanceof NativeShareError?e.message:'NATIVE_SHARE_HISTORY_GAP';this.failRefresh(row,code);return revokedCodes.has(code)?'refuse':'pause';}
   }
-  async close(){this.closed=true;this.disconnected();await this.sweep;}
+  async close(){this.closed=true;this.disconnected();await this.sweep;await Promise.allSettled(this.activating.values());}
 }

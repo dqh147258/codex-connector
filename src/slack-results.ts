@@ -4,7 +4,7 @@ import { COMMANDS } from './protocol.js';
 import { formatRpcDiagnostic } from './rpc-diagnostics.js';
 import type { Config, ResultSnapshot, SlackVisibilityScope, Source, State, Work } from './types.js';
 
-export const SLACK_SCOPE_VERSION=5;
+export const SLACK_SCOPE_VERSION=6;
 export const RESULT_TTL_MS=15*60*1000;
 export const RESULT_PAGE_SIZE=1600;
 export const RESULT_MAX_CHARS=250000;
@@ -74,7 +74,7 @@ export function compactResult(work:Work,result:any,snapshot?:ResultSnapshot):str
   else if(['session.send','session.queue','session.delivery'].includes(c))summary=`Message evidence: ${clean(result.deliveryStatus,30)}; command=${clean(result.commandStatus,30)}; admission=${clean(result.admission,30)}; start=${clean(result.start,30)}; execution=${clean(result.execution,30)}\nworkId=${clean(result.workId,128)}; turnId=${clean(result.turnId??'unconfirmed',128)}${result.admissionError?`\nAdmission request: ${clean(result.admissionError,80)} (${formatRpcDiagnostic(result.admissionDiagnostic)}).`:''}${result.startError?`\nExplicit start request: ${clean(result.startError,80)} (${formatRpcDiagnostic(result.startDiagnostic)}); this does not establish current queue position or non-delivery. Start result and execution evidence are independent.`:''}\nAccepted means queue admission, not completion. Do not resend. Check session.delivery {\"sessionId\":\"${clean(result.sessionId,128)}\",\"workId\":\"${clean(result.workId,128)}\"}.${result.correlationConflict?' Conflicting correlation evidence; inspect the original session.':''}${result.observationGap?' Observation gap: events may have been missed.':''}${result.coverage?.errors?.length?' Readback incomplete; inspect detail.':''}`;
   else if(c==='session.attach'||c==='session.create')summary=`Control binding: session=${clean(result.sessionId,128)}; thread=${clean(result.threadId,128)}\nOutput: ${clean(result.outputChannel,128)}, thread ${clean(result.outputThread,128)}. This does not move an existing binding.\nAttach/create does NOT subscribe to commentary/partial answers, including ordinary questions. Existing subscriptions/cancellations are unchanged.\nFor observation in this Slack thread: session.subscribe ${JSON.stringify({threadId:result.threadId})}; verify enabled/status with session.subscriptions.`;
   else if(c==='session.subscribe'&&typeof result.nativeContent==='string')summary=`Observation: ${clean(result.status,30)}; future replies/questions: ${clean(result.nativeContent,30)}
-Subscription ID: ${clean(result.subscriptionId,128)}. This does not share native content. The local operator can grant future content separately for this Slack thread.`;
+Subscription ID: ${clean(result.subscriptionId,128)}. Subscribing alone does not grant native content. The local operator can grant future content separately for this Slack thread.`;
   else if(c==='session.reply')summary=`Reply queued; session=${clean(result.sessionId,128)}.`;
   else summary=typeof result==='string'?result:JSON.stringify(result,null,2);
   const full=typeof result==='string'?result:JSON.stringify(result);

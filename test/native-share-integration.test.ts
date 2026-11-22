@@ -90,10 +90,10 @@ async function fixture(homes=1) {
     await waitFor(()=>core.store.state.work.some(w=>w.request.id===q.id&&w.status==='completed'));
     return core.store.state.subscriptions!.find(s=>s.owner.threadTs===root)!.id;
   };
-  const preview=(id:string,target='default')=>runtime.nativeShare(target,'preview',id) as {
+  const preview=async(id:string,target='default')=>await runtime.nativeShare(target,'preview',id) as {
     confirmationId:string;confirmationPhrase:string;disclosure:string;serverId:string;nativeThreadId:string;workspaceId:string;channel:string;rootThreadTs:string
   };
-  const grant=async(id:string,target='default')=>{const p=preview(id,target);return runtime.nativeShare(target,'grant',id,p.confirmationId,p.confirmationPhrase);};
+  const grant=async(id:string,target='default')=>{const p=await preview(id,target);return runtime.nativeShare(target,'grant',id,p.confirmationId,p.confirmationPhrase);};
   const inspection=(id:string,target='default')=>runtime.nativeShare(target,'inspect',id) as {status:string;reason:string|null};
   return {root,project,ids,config:cfg,posts,start,backends,subscribe,preview,grant,inspection,get runtime(){return runtime;},
     pause(fn?:typeof pauseRoot){pauseRoot=fn;},markUncertain(marker:string){postError=marker;},deny(marker:string){denial=marker;},
@@ -114,11 +114,13 @@ test('explicit owner grant forwards future reply, ordinary question and structur
     // An eligible-looking native reply and old live turn receive no default grant.
     b.publish('before-grant',[reply('no-consent','A reply before the owner accepted.')]);
     b.ongoing('in-flight-before-grant');
-    const rejected=f.preview(id);
-    await assert.rejects(async()=>f.runtime.nativeShare('default','grant',id,rejected.confirmationId,rejected.confirmationPhrase),/WAIT_UNTIL_IDLE/);
+    await f.grant(id);
+    assert.equal(f.inspection(id).status,'pending');
+    assert.equal(f.inspection(id).reason,'NATIVE_SHARE_WAIT_UNTIL_IDLE');
+    await f.runtime.nativeShare('default','revoke',id);
     b.history[0]=turn('in-flight-before-grant','completed',[reply('finished-private','A private turn that was already running.')]);
     b.threads.get(THREAD).status={type:'idle'};
-    const offer=f.preview(id);
+    const offer=await f.preview(id);
     assert.deepEqual([offer.serverId,offer.nativeThreadId,offer.workspaceId,offer.channel,offer.rootThreadTs],['default',THREAD,'T1','CIN',EMPLOYEES_ROOT]);
     assert.match(offer.disclosure,/entered locally or through another client/);
     await assert.rejects(async()=>f.runtime.nativeShare('default','grant',spectator,offer.confirmationId,offer.confirmationPhrase),/CONFIRMATION_REQUIRED/);
@@ -168,10 +170,11 @@ test('revocation, in-flight confirmation, stale structured request and exact Sla
     await f.start();const sub=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
     let release!:(v:boolean)=>void,checks=0;
     f.pause(()=>new Promise(r=>{release=r;checks++;}));
-    const p=f.preview(sub);
+    const p=await f.preview(sub);
     const race=Promise.resolve(f.runtime.nativeShare('default','grant',sub,p.confirmationId,p.confirmationPhrase));
     await waitFor(()=>checks===1);f.runtime.nativeShare('default','revoke',sub);release(true);
-    await assert.rejects(race,/SCOPE_CHANGED/);
+    await race;
+    assert.equal(f.inspection(sub).status,'retired');
     f.pause();await f.grant(sub);
     let started=false;f.pause(()=>new Promise(r=>{release=r;started=true;}));
     b.ongoing('live',[reply('action-ready','Ready for presentation feedback.','commentary')],true);
@@ -247,12 +250,14 @@ test('unproven activation, lost frontier and operator HTTP isolation stay closed
     assert.deepEqual(await noHome.json(),{error:'NATIVE_SHARE_IDENTITY_UNVERIFIED'});
     b.homeMatch=true;
     b.overridePage={data:[{id:'wrong-shape',status:'completed',items:[]}],nextCursor:null};
-    const p=f.preview(sub);await assert.rejects(async()=>f.runtime.nativeShare('default','grant',sub,p.confirmationId,p.confirmationPhrase),/HISTORY_GAP/);
+    await f.grant(sub);
+    assert.equal(f.inspection(sub).status,'pending');assert.equal(f.inspection(sub).reason,'NATIVE_SHARE_HISTORY_GAP');
+    await f.runtime.nativeShare('default','revoke',sub);
     b.overridePage=undefined;
     await f.grant(sub);
     b.history.splice(0,b.history.length,turn('not-an-anchor','completed',[reply('private-gap','Unverifiable gap message.')]));
     b.notice('turn/completed',{turn:{id:'not-an-anchor',status:'completed'}});
-    await waitFor(()=>f.inspection(sub).status==='gap');never(f,'Unverifiable gap message.');
+    await waitFor(()=>f.inspection(sub).status==='retired');never(f,'Unverifiable gap message.');
     // Rollback/unload signals hard invalidate the prior grant. No fallback or auto-recreate.
     b.notice('thread/rolledBack',{});
     await waitFor(()=>f.inspection(sub).status==='retired');
@@ -265,8 +270,9 @@ test('existing empty history needs a known boundary; a newly created owner dedic
     await f.start();
     const b=f.backends.get('default')!,sub=await f.subscribe(EMPLOYEES_ROOT);
     b.history.length=0;
-    const p=f.preview(sub);
-    await assert.rejects(async()=>f.runtime.nativeShare('default','grant',sub,p.confirmationId,p.confirmationPhrase),/USE_DEDICATED_THREAD/);
+    await f.grant(sub);
+    assert.equal(f.inspection(sub).status,'pending');
+    assert.equal(f.inspection(sub).reason,'NATIVE_SHARE_USE_DEDICATED_THREAD');
     const accepted=f.runtime.local(request('session.create',{project:'demo'}));
     await waitFor(()=>f.runtime.core('default').store.state.work.some(w=>w.id===accepted.id&&w.status==='completed'));
     const row=f.runtime.core('default').store.state.work.find(w=>w.id===accepted.id)!;
@@ -275,7 +281,7 @@ test('existing empty history needs a known boundary; a newly created owner dedic
     const id=await f.subscribe(SPECTATOR_ROOT,'default',dedicated);
     await f.grant(id);
     assert.equal(f.inspection(id).status,'active');
-    assert.equal(f.inspection(sub).status,'unshared');
+    assert.equal(f.inspection(sub).status,'pending');
     assert.equal(b.calls.filter(c=>c.method==='thread/start').length,1);
     assert.equal(b.responses.length,0);
   }finally{await f.close();}
@@ -342,5 +348,111 @@ test('same native thread, turn, item and request IDs across three Homes: open qu
     assert.ok(!f.posts.some(p=>p.text.includes('Home 2.')&&p.threadTs!==roots[1]));
     assert.ok(!f.posts.some(p=>p.text.includes('Home 3.')&&p.threadTs!==roots[2]));
     assert.ok([...f.backends.values()].every(x=>x.responses.length===0));
+  }finally{await f.close();}
+});
+
+test('consent is durable before reading the frontier; excluded turns stay private across a pending restart',async()=>{
+  const f=await fixture();try{
+    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
+    const offer=await f.preview(id);
+    assert.equal(b.calls.filter(x=>x.method==='thread/turns/list').length,0,'preview identifies thread only');
+    // This completes before owner confirmation, after the identity preview.
+    b.publish('complete-before-confirm',[reply('prewrite','Pre-consent content is not shared.')]);
+    let release!:(v:boolean)=>void,held=false;
+    f.pause(()=>new Promise(r=>{release=r;held=true;}));
+    const accepted=Promise.resolve(f.runtime.nativeShare('default','grant',id,offer.confirmationId,offer.confirmationPhrase));
+    const saved=f.runtime.core('default').store.state.nativeShares![0]!;
+    assert.equal(saved.state,'pending');assert.equal(saved.anchor,null);assert.equal(saved.activatedAt,undefined);
+    assert.equal(f.inspection(id).status,'pending');
+    await waitFor(()=>held);
+    assert.equal(b.calls.filter(x=>x.method==='thread/turns/list').length,0);
+    // Busy before the first verified frontier: stay pending, no historical fetch.
+    b.ongoing('active-during-consent',[reply('during-hold','Pending-stage content also stays private.','commentary')],true);
+    release(true);await accepted;
+    assert.equal(f.inspection(id).reason,'NATIVE_SHARE_WAIT_UNTIL_IDLE');
+    f.pause();
+    // Restart with the confirmed pending row. The first eligible ordered
+    // checkpoint includes everything through this now-completed turn.
+    b.history[0]=turn('active-during-consent','completed',[reply('during-finished','This was still before the verified snapshot.')]);
+    await f.restart();
+    await waitFor(()=>f.inspection(id).status==='active');
+    assert.equal(f.runtime.core('default').store.state.nativeShares![0]!.anchor,'active-during-consent');
+    f.backends.get('default')!.publish('after-activation',[reply('approved-final','The new overview is ready to read.')]);
+    await observe(f,'The new overview is ready to read.');
+    ['Pre-consent content','Pending-stage content','before the verified snapshot'].forEach(text=>never(f,text));
+  }finally{await f.close();}
+});
+
+test('tool evidence observed before a same-item question survives reconnect and stays inside its verified Home',async()=>{
+  const f=await fixture(3);try{
+    await f.start();const roots=['101.2','211.2','311.2'];
+    const subs=await Promise.all(f.ids.map((id,index)=>f.subscribe(roots[index]!,id)));
+    await Promise.all(subs.map((sub,i)=>f.grant(sub,f.ids[i])));
+    const special=f.backends.get('default')!;
+    special.ongoing('same-turn',[],true);
+    // No body/related item in bounded readback, but the exact MCP item
+    // notification arrives before an ordinary-shaped request.
+    special.notice('item/started',{turnId:'same-turn',item:{id:'identical-item',type:'mcpToolCall'}});
+    special.ask('same-turn','identical-item',101,false,{questions:[{id:'unclassified',header:'Layout',question:'A prior tool would get exposed?',isOther:false,isSecret:false,options:null}]});
+    await sleep(30);never(f,'prior tool would');
+    const before=f.runtime.core('default').store.state.nativeShares![0]!.questionDeny;
+    assert.equal(before?.length,1);
+    assert.ok(before?.every(x=>/^[a-f0-9]{64}$/.test(x.item)&&/^[a-f0-9]{64}$/.test(x.connection)));
+    await f.restart();
+    await Promise.all(subs.map((sub,i)=>waitFor(()=>f.inspection(sub,f.ids[i]!).status==='active')));
+    f.ids.forEach((id,i)=>{
+      const b=f.backends.get(id)!;
+      if(i===0)b.threads.get(THREAD).status={type:'active',activeFlags:['waitingOnUserInput']};
+      else b.ongoing('same-turn',[],true);
+      b.ask('same-turn','identical-item',101,false,{questions:[{id:'unclassified',header:'Layout',question:'Select an arrangement for workspace '+(i+1)+'.',isOther:false,isSecret:false,options:null}]});
+    });
+    await observe(f,'for workspace 2.',roots[1]);await observe(f,'for workspace 3.',roots[2]);
+    never(f,'for workspace 1.');
+    assert.deepEqual(f.runtime.core('default').store.state.nativeShares![0]!.questionDeny,before);
+    assert.ok(f.ids.slice(1).every(id=>!f.runtime.core(id).store.state.nativeShares![0]!.questionDeny?.length));
+  }finally{await f.close();}
+});
+
+test('an earlier candidate cannot resume content on an old pre-gate grant or cached outbox',async()=>{
+  const f=await fixture();try{
+    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
+    await f.grant(id);
+    let release!:(v:boolean)=>void,held=false;f.pause(()=>new Promise(r=>{release=r;held=true;}));
+    b.publish('old-revision-delivery',[reply('old-projection','No older candidate writes from an unsafe gate.')]);
+    await waitFor(()=>held);
+    const core=f.runtime.core('default');
+    // Trusted on-disk upgrade fixture, not a caller bypass of the auth API.
+    core.store.transaction(d=>{const row=d.nativeShares![0]!;delete row.consentVersion;delete row.activatedAt;});
+    f.runtime.disableSlack();release(true);f.pause();
+    await f.restart();
+    assert.equal(f.inspection(id).status,'retired');assert.equal(f.inspection(id).reason,'NATIVE_SHARE_EXPLICIT_REAUTHORIZATION_REQUIRED');
+    await sleep(30);never(f,'No older candidate writes');
+    assert.ok(!f.runtime.core('default').store.state.outbox.some(o=>o.nativeShare&&o.status==='queued'));
+  }finally{await f.close();}
+});
+
+test('pending verification cannot cross Slack identity change or survive native rollback',async()=>{
+  const f=await fixture();try{
+    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
+    const first=await f.preview(id);
+    let release!:(v:boolean)=>void,held=false;
+    f.pause(()=>new Promise(r=>{release=r;held=true;}));
+    const old=f.runtime.nativeShare('default','grant',id,first.confirmationId,first.confirmationPhrase);
+    await waitFor(()=>held);
+    await f.runtime.enableSlack('USELF','NEWIDENTITY');
+    release(true);f.pause();await old;
+    assert.notEqual(f.inspection(id).status,'active');
+    b.publish('new-identity-current',[reply('recipient-changed','A previous authorization cannot follow recipient changes.')]);
+    await waitFor(()=>f.inspection(id).status==='retired');
+    never(f,'cannot follow recipient');
+    held=false;const fresh=await f.preview(id);
+    f.pause(()=>new Promise(r=>{release=r;held=true;}));
+    const rolling=f.runtime.nativeShare('default','grant',id,fresh.confirmationId,fresh.confirmationPhrase);
+    await waitFor(()=>held);
+    b.notice('thread/rolledBack',{});
+    release(true);f.pause();await rolling;
+    assert.equal(f.inspection(id).status,'retired');
+    b.publish('rolled-boundary',[reply('rolled-no-output','Rollback will not reopen the content gate.')]);
+    await sleep(25);never(f,'will not reopen');
   }finally{await f.close();}
 });

@@ -1,6 +1,6 @@
 import { closeSync, copyFileSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { validateNativeShareState } from './native-share.js';
+import { validateNativeShareState, retirePreGateSharing } from './native-share.js';
 import { validateMessageDelivery } from './session-delivery.js';
 import { validateActivityRecords } from './session-activity.js';
 import type { State } from './types.js';
@@ -22,6 +22,7 @@ export class Store {
       validateNativeShareState(this.value);
       for (const work of this.value.work) validateMessageDelivery(work);
       this.transaction(s => {
+        retirePreGateSharing(s);
         if(pin)(s as State & {targetPin?:unknown}).targetPin={id:pin.id,fingerprint:pin.fingerprint};
         if(legacy){
           for(const w of s.work)if(w.status==='queued'){w.status='uncertain';w.error='MIGRATION_REQUIRES_RECONCILIATION';}
