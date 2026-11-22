@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SessionContent } from '../src/session-content.js';
 import { BackendError } from '../src/codex.js';
-import { FakeBackend,fixture,event,request,waitFor } from './helpers.js';
+import { FakeBackend,fixture,event,request,waitFor,rootThread,ready,run } from './helpers.js';
 import { validateCommand } from '../src/protocol.js';
 import { compactResult,readResult } from '../src/slack-results.js';
 const entry=(n:number,type:string,text='message '+n,extra:any={})=>({turnId:'turn-'+n,item:{id:'item-'+n,type,...(type==='userMessage'?{content:[{type:'text',text}]}:{text}),...extra},startedAtMs:n===1?null:1000+n,completedAtMs:null});
@@ -45,4 +45,41 @@ test('joined user text parts are sensitivity checked before excerpt clipping',as
   const messages=await content.messages({threadId:'chosen'});
   assert.equal(messages.items[0].textStatus,'withheld');assert.equal(messages.items[0].excerpt,null);
   assert.ok(!JSON.stringify(messages).includes('split-sensitive-value'));
+});
+
+
+test('named child and unverified native threads are denied before loading any text; normal roots still work',async()=>{
+  const f=fixture();try{
+    await f.connector.initialize();
+    f.backend.threads.set('child',rootThread('child',f.dir,{source:{subAgent:{other:'helper'}},canAcceptDirectInput:true}));
+    f.backend.threads.raw('unknown-root',{id:'unknown-root',cwd:f.dir,parentThreadId:null,source:'unknown'});
+    f.backend.threads.set('root',rootThread('root',f.dir,{source:{custom:'chatgpt'}}));
+    const before=f.backend.calls.length;
+    const a=await f.connector.content.overview(['child','unknown-root','root']);
+    assert.equal(a.items[0].error,'SUBAGENT_THREAD_NOT_SUPPORTED');
+    assert.equal(a.items[1].error,'NATIVE_THREAD_ROOT_UNVERIFIED');
+    assert.equal(a.items[2].error,null);
+    await assert.rejects(f.connector.content.messages({threadId:'child'}),/SUBAGENT_THREAD_NOT_SUPPORTED/);
+    await assert.rejects(f.connector.content.messages({threadId:'unknown-root'}),/NATIVE_THREAD_ROOT_UNVERIFIED/);
+    const body=f.backend.calls.slice(before).filter(c=>c.method==='thread/items/list');
+    assert.ok(body.length>0&&body.every(c=>c.params.threadId==='root'));
+  }finally{await f.cleanup();}
+});
+
+test('a saved binding and older message continuation do not bypass later unverified lineage',async()=>{
+  const f=fixture();try{
+    const binding=await ready(f),rpc=f.backend.rpc.bind(f.backend);
+    f.backend.rpc=async(m,p)=>{
+      if(m==='thread/items/list'){f.backend.calls.push({method:m,params:p});return{data:[entry(1,'userMessage','Root first page')],nextCursor:p.cursor?null:'more'};}
+      return rpc(m,p);
+    };
+    const page=await f.connector.content.messages({threadId:binding.threadId,limit:1});
+    assert.ok(page.nextCursor);
+    f.backend.threads.get(binding.threadId).parentThreadId='unexpected-parent';
+    const before=f.backend.calls.length;
+    await assert.rejects(f.connector.content.messages({threadId:binding.threadId,limit:1,cursor:page.nextCursor!}),/SUBAGENT_THREAD_NOT_SUPPORTED/);
+    const history=await run(f,'session.history',{sessionId:binding.id});
+    assert.equal(history.status,'failed');assert.equal(history.error,'SUBAGENT_THREAD_NOT_SUPPORTED');
+    assert.ok(!f.backend.calls.slice(before).some(c=>c.method==='thread/items/list'));
+  }finally{await f.cleanup();}
 });

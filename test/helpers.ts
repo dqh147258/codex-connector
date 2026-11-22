@@ -7,15 +7,29 @@ import { Store } from '../src/store.js';
 import { Connector } from '../src/connector.js';
 import { START_MARKER, END_MARKER, type CommandEnvelope } from '../src/protocol.js';
 import type { Backend, Config, SlackPort } from '../src/types.js';
+// Intentional interactive roots use the App Server v2 wire-shaped lineage.
+// Use threads.raw() for unsupported/absent source or malformed metadata cases.
+export const rootThread=(id:string,cwd:string,extra:Record<string,unknown>={})=>({
+  id,cwd,sessionId:id,source:'cli',threadSource:'user',parentThreadId:null,forkedFromId:null,...extra});
+export class FakeThreads extends Map<string,any> {
+  override set(id:string,value:any):this {
+    if(value&&typeof value==='object'&&!Array.isArray(value)){
+      const defaults=rootThread(id,value.cwd);
+      for(const [k,v] of Object.entries(defaults))if(!Object.hasOwn(value,k)&&k!=='id'&&k!=='cwd')value[k]=v;
+    }
+    return super.set(id,value);
+  }
+  raw(id:string,value:any):this{return super.set(id,value);}
+}
 export class FakeBackend extends EventEmitter implements Backend {
-  connected=false;epoch='epoch-1';calls:{method:string;params:any}[]=[];responses:any[]=[];threads=new Map<string,any>();fault?:string;
+  connected=false;epoch='epoch-1';calls:{method:string;params:any}[]=[];responses:any[]=[];threads=new FakeThreads();fault?:string;
   async connect(){this.connected=true;}async close(){this.connected=false;this.emit('disconnect',this.epoch);}
   capabilities(){return{connected:this.connected,epoch:this.epoch,transport:'fake-shared'};}
   async rpc(method:string,params:any):Promise<any>{this.calls.push({method,params});if(this.fault===method)throw Error('fake fault');
     if(method==='thread/list')return{data:[...this.threads.values()],nextCursor:null};
     if(method==='thread/loaded/list')return{data:[...this.threads.keys()],nextCursor:null};
     if(method==='thread/read'||method==='thread/resume'){const thread=this.threads.get(params.threadId);if(!thread)throw Error('not found');return{thread};}
-    if(method==='thread/start'){const thread={id:randomUUID(),cwd:params.cwd,canAcceptDirectInput:true,status:{type:'idle'},model:'configured-model'};this.threads.set(thread.id,thread);return{thread};}
+    if(method==='thread/start'){const thread=rootThread(randomUUID(),params.cwd,{source:'appServer',canAcceptDirectInput:true,status:{type:'idle'},model:'configured-model'});this.threads.set(thread.id,thread);return{thread};}
     if(method==='thread/items/list')return{data:[{turnId:'turn-1',item:{type:'agentMessage',text:'safe history'}}],nextCursor:null};
     if(method==='thread/queue/list'||method==='thread/turns/list')return{data:[],nextCursor:null};
     if(method==='thread/queue/add')return{queuedSubmission:{id:'queued-1',clientUserMessageId:params.clientUserMessageId,input:params.input}};

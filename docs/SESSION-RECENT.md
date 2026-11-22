@@ -13,7 +13,7 @@
 
 ## 范围与限制
 
-最多交错选取 40 个候选：本地已记录活动、共享 daemon 当前 loaded 的一页、按 updated_at 降序的 indexed interactive/nonarchived history 一页（所有 provider）。这是有界候选集合内的排名，`coverage.globalTopN` 始终为 false，不保证全机器、所有历史或所有独立 Codex 实例的全局前 N。默认后端历史 source 筛选仍适用，loaded 页不靠该历史筛选。输出列出每来源扫描数、是否还有页、已检查数、失败与未知数。不会为了凑 N 个结果无限翻页。
+最多交错选取 40 个候选：本地已记录活动、共享 daemon 当前 loaded 页、按 updated_at 降序的 indexed interactive/nonarchived history 页（所有 provider）。这是有界候选集合内的排名，`coverage.globalTopN` 始终为 false，不保证全机器、所有历史或所有独立 Codex 实例的全局前 N。默认后端历史 source 筛选仍适用，loaded 页不靠该历史筛选。先确认主会话血缘，再读取轮次和排序；子 Agent、血缘未知和无法读取的候选不会算进 N。两个来源游标独立按已有预算查下一页。输出列出每来源扫描数、是否还有页、已检查数、失败与未知数。不会为了凑 N 个结果无限翻页。
 
 每次查询上限 20 秒、100 次只读 RPC、每次最多等待 3 秒、累计响应 2 MiB；不提供完整历史游标。候选跨来源交错选择，以免历史把当前会话或已观察活动完全挤掉。状态和时间不是原子快照，查询期间可能变化。时间并列使用客户端精确 ID 规则，仅对真实活动证据排序；后端 updated_at 可能有未暴露的毫秒精度，参考列表不会用秒精度擅自重排。
 

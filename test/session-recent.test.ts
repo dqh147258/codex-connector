@@ -5,8 +5,8 @@ import { FakeBackend,fixture,event,request,waitFor } from './helpers.js';
 import { validateCommand } from '../src/protocol.js';
 import { compactResult,readResult } from '../src/slack-results.js';
 import { BackendError } from '../src/codex.js';
-const metadata=(id:string,updatedAt=100)=>({id,name:`Task ${id}`,cwd:'/tmp',updatedAt,status:{type:'idle'}});
-function setup(threads:any[],turns:Record<string,any>={},loaded:string[]=[],records:any[]=[],limits:any={}){const backend=new FakeBackend();backend.connected=true;backend.rpc=async(m,p)=>{backend.calls.push({method:m,params:p});if(m==='thread/list')return{data:threads.slice(0,p.limit),nextCursor:threads.length>p.limit?'more':null};if(m==='thread/loaded/list')return{data:loaded.slice(0,p.limit),nextCursor:loaded.length>p.limit?'more':null};if(m==='thread/read'){const thread=threads.find(t=>t.id===p.threadId);if(!thread)throw Error('gone');return{thread};}if(m==='thread/turns/list')return{data:turns[p.threadId]?[turns[p.threadId]]:[],nextCursor:null};throw Error('MUTATION FORBIDDEN');};return{backend,recent:new RecentSessions(backend,()=>records,t=>({id:t.id,name:t.name,cwd:t.cwd,status:t.status}),limits)};}
+const metadata=(id:string,updatedAt=100)=>({id,name:`Task ${id}`,source:'cli',parentThreadId:null,cwd:'/tmp',updatedAt,status:{type:'idle'}});
+function setup(threads:any[],turns:Record<string,any>={},loaded:string[]=[],records:any[]=[],limits:any={}){const backend=new FakeBackend();backend.connected=true;backend.rpc=async(m,p)=>{backend.calls.push({method:m,params:p});if(m==='thread/list'||m==='thread/loaded/list'){const rows=m==='thread/list'?threads:loaded,start=p.cursor?Number(p.cursor):0;return{data:rows.slice(start,start+p.limit),nextCursor:start+p.limit<rows.length?String(start+p.limit):null};}if(m==='thread/read'){const thread=threads.find(t=>t.id===p.threadId);if(!thread)throw Error('gone');return{thread};}if(m==='thread/turns/list')return{data:turns[p.threadId]?[turns[p.threadId]]:[],nextCursor:null};throw Error('MUTATION FORBIDDEN');};return{backend,recent:new RecentSessions(backend,()=>records,t=>({id:t.id,name:t.name,cwd:t.cwd,status:t.status}),limits)};}
 
 test('recent ranks genuine latest lifecycle evidence, separates generic updates and preserves backend tie order',async()=>{const {backend,recent}=setup([metadata('z',1000),metadata('unknown-z',999),metadata('unknown-a',999),metadata('a',50),metadata('old',10)],{z:{id:'tz',startedAt:90,completedAt:95},a:{id:'ta',startedAt:95,completedAt:null},old:{id:'to',startedAt:5,completedAt:10}},['z']);const r=await recent.query(5);assert.deepEqual(r.sessions.map(s=>s.id),['a','z','old']);assert.equal(r.sessions[0].lastActivityAtMs,95000);assert.equal(r.sessions[0].activitySource,'latest-turn-lifecycle');assert.deepEqual(r.updatedCandidates.map((s:any)=>s.id),['unknown-z','unknown-a']);assert.equal(r.unknownActivityCount,2);assert.equal(r.coverage.globalTopN,false);assert.ok(backend.calls.every(c=>['thread/list','thread/loaded/list','thread/read','thread/turns/list'].includes(c.method)));assert.ok(backend.calls.filter(c=>c.method==='thread/turns/list').every(c=>c.params.itemsView==='notLoaded'&&c.params.limit===1));assert.deepEqual(backend.calls[0]!.params,{limit:40,sortKey:'updated_at',sortDirection:'desc',useStateDbOnly:true,modelProviders:[]});});
 
@@ -24,7 +24,7 @@ test('timeouts, oversized pages, malformed source and epoch changes remain bound
 
 test('strict recent params reject arbitrary filters/toggles and boundedN before RPC',async()=>{for(const p of [{limit:0},{limit:21},{limit:2.2},{view:'all'},{autoAttach:true}])assert.throws(()=>validateCommand('session.recent',p));assert.deepEqual(validateCommand('session.recent',{}),{limit:5});const {backend,recent}=setup([]);await assert.rejects(recent.query(0));assert.equal(backend.calls.length,0);});
 
-test('recent command snapshot remains origin scoped and queries never update ledger or subscribe',async()=>{const f=fixture();try{await f.connector.initialize();f.backend.threads.set('a',{id:'a',name:'Task',cwd:f.dir,status:{type:'idle'},updatedAt:123});const original=f.backend.rpc.bind(f.backend);f.backend.rpc=async(m,p)=>m==='thread/turns/list'?{data:[{id:'turn',startedAt:1,completedAt:2}],nextCursor:null}:original(m,p);const req=request('session.recent',{limit:5});f.connector.accept(event(req,{thread_ts:'200.1'}));f.connector.pump();await waitFor(()=>f.store.state.work.some(w=>w.request.id===req.id&&w.status==='completed'));const w=f.store.state.work.find(w=>w.request.id===req.id)!;assert.equal(f.store.state.activity,undefined);assert.equal(f.store.state.sessions.length,0);assert.equal(f.store.state.subscriptions,undefined);assert.ok(!f.backend.calls.some(c=>c.method==='thread/resume'));assert.ok(readResult(f.store.state,w.resultRef!.resultId!,1,w.source,f.config).text.includes('session.recent'));assert.throws(()=>readResult(f.store.state,w.resultRef!.resultId!,1,{...w.source,threadTs:'201.1'},f.config));}finally{await f.cleanup();}});
+test('recent command snapshot remains origin scoped and queries never update ledger or subscribe',async()=>{const f=fixture();try{await f.connector.initialize();f.backend.threads.set('a',{id:'a',name:'Task',cwd:f.dir,source:'cli',parentThreadId:null,status:{type:'idle'},updatedAt:123});const original=f.backend.rpc.bind(f.backend);f.backend.rpc=async(m,p)=>m==='thread/turns/list'?{data:[{id:'turn',startedAt:1,completedAt:2}],nextCursor:null}:original(m,p);const req=request('session.recent',{limit:5});f.connector.accept(event(req,{thread_ts:'200.1'}));f.connector.pump();await waitFor(()=>f.store.state.work.some(w=>w.request.id===req.id&&w.status==='completed'));const w=f.store.state.work.find(w=>w.request.id===req.id)!;assert.equal(f.store.state.activity,undefined);assert.equal(f.store.state.sessions.length,0);assert.equal(f.store.state.subscriptions,undefined);assert.ok(!f.backend.calls.some(c=>c.method==='thread/resume'));assert.ok(readResult(f.store.state,w.resultRef!.resultId!,1,w.source,f.config).text.includes('session.recent'));assert.throws(()=>readResult(f.store.state,w.resultRef!.resultId!,1,{...w.source,threadTs:'201.1'},f.config));}finally{await f.cleanup();}});
 
 test('compact recent output distinguishes execution from backend updates and preserves detail flow',async()=>{const {recent}=setup([metadata('a'),metadata('b')],{a:{id:'t',startedAt:10,completedAt:20}});const r=await recent.query();const text=compactResult({request:request('session.recent',{limit:5})} as any,r);assert.match(text,/NOT global top N/);assert.match(text,/NOT execution/);assert.match(text,/session.overview/);assert.ok(text.length<2400);});
 
@@ -35,3 +35,58 @@ test('actual notification ledger persists unbound activity and never freshens on
 
 
 test('newer latest-turn evidence never borrows observation time from an older ledger event',async()=>{const records=[{threadId:'a',activityAtMs:1000,observedAtMs:999999,eventKind:'item/completed'}];const {recent}=setup([metadata('a')],{a:{id:'t',startedAt:3,completedAt:4}},[],records);const row=(await recent.query()).sessions[0];assert.equal(row.activitySource,'latest-turn-lifecycle');assert.equal(row.lastActivityAtMs,4000);assert.equal(row.observedAtMs,null);});
+
+test('recent filters lineage before turn reads and rotates across independently paged loaded and indexed IDs',async()=>{
+  const threads=[
+    {...metadata('private-child-review'),source:{subAgent:'review'}},
+    {...metadata('private-child-parent'),parentThreadId:'parent'},
+    {...metadata('private-unverified-source'),source:{custom:'not-official'}},
+    {...metadata('allowed-atlas'),source:{custom:'atlas'}},
+    {...metadata('allowed-app-server'),source:'appServer',sessionId:'allowed-app-server'},
+  ];
+  const turns=Object.fromEntries(threads.map((t,i)=>[t.id,{id:'turn-'+i,startedAt:i+1}]));
+  const records=[{threadId:'private-child-parent',activityAtMs:50000,observedAtMs:60000,eventKind:'turn/completed'},
+    {threadId:'private-unverified-source',activityAtMs:70000,observedAtMs:80000,eventKind:'turn/completed'}];
+  const {recent,backend}=setup(threads,turns,['private-child-review','private-child-parent','private-gone','allowed-app-server'],records,{candidates:2,calls:30});
+  const result=await recent.query(2);
+  assert.deepEqual(result.sessions.map(s=>s.threadId),['allowed-app-server','allowed-atlas']);
+  assert.equal(result.returnedCount,2);
+  assert.equal(result.coverage.candidateCount,2);
+  assert.equal(result.coverage.childCount,2);
+  assert.equal(result.coverage.lineageUnverifiedCount,1);
+  assert.ok(backend.calls.some(c=>c.method==='thread/list'&&c.params.cursor==='2'));
+  assert.ok(backend.calls.some(c=>c.method==='thread/loaded/list'&&c.params.cursor==='2'));
+  assert.ok(backend.calls.length<=30);
+  assert.deepEqual(backend.calls.filter(c=>c.method==='thread/turns/list').map(c=>c.params.threadId).sort(),['allowed-app-server','allowed-atlas']);
+  assert.ok(backend.calls.filter(c=>c.method==='thread/read').every(c=>c.params.includeTurns===false));
+  assert.deepEqual(result.failures,[{error:'METADATA_UNAVAILABLE'}]);
+  assert.doesNotMatch(JSON.stringify(result),/private-/);
+});
+
+test('recent does not misclassify a human fork, spoofed title or malformed lineage',async()=>{
+  const rows=[
+    {...metadata('manual-fork'),forkedFromId:'copied-root',name:'Review agent title'},
+    {...metadata('private-spoof'),threadSource:'subagent',name:'Manual top level task'},
+    {...metadata('private-bare'),source:undefined},
+    {...metadata('private-unpinned-app'),source:'appServer'},
+    {...metadata('private-malformed'),parentThreadId:42},
+  ];
+  const {recent,backend}=setup(rows,{'manual-fork':{id:'t',startedAt:1}});
+  const result=await recent.query();
+  assert.deepEqual(result.sessions.map(s=>s.threadId),['manual-fork']);
+  assert.equal(result.coverage.childCount,1);
+  assert.equal(result.coverage.lineageUnverifiedCount,3);
+  assert.ok(!backend.calls.some(c=>c.method==='thread/turns/list'&&c.params.threadId!=='manual-fork'));
+  assert.doesNotMatch(JSON.stringify(result),/private-/);
+});
+
+test('recent spends the same finite call budget when a native source offers only empty pages',async()=>{
+  const {recent,backend}=setup([],{},[],[],{calls:5});let serial=0;
+  backend.rpc=async(method,params)=>{backend.calls.push({method,params});return {data:[],nextCursor:String(++serial)};};
+  const result=await recent.query();
+  assert.equal(result.returnedCount,0);
+  assert.equal(backend.calls.length,5);
+  assert.deepEqual(backend.calls.slice(2,4),[{method:'thread/loaded/list',params:{limit:40,cursor:'2'}},
+    {method:'thread/list',params:{limit:40,cursor:'1',sortKey:'updated_at',sortDirection:'desc',useStateDbOnly:true,modelProviders:[]}}]);
+  assert.ok(result.coverage.loadedHasMore&&result.coverage.historyHasMore);
+});

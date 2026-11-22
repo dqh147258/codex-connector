@@ -31,6 +31,11 @@ export interface SubscriptionHooks {
   /** Append deliveries synchronously in this transaction; tag every one with subscriptionId. */
   output(state: State, text: string, subscription: Subscription): void;
 }
+function subscriptionPolicyError(error:unknown,fallback:string):string{
+  if(error instanceof SubscriptionError)return error.code;
+  const code=(error as {code?:unknown}|undefined)?.code;
+  return code==='SUBAGENT_THREAD_NOT_SUPPORTED'||code==='NATIVE_THREAD_ROOT_UNVERIFIED'?code:fallback;
+}
 export class SubscriptionError extends Error {
   constructor(readonly code: string) { super(code); this.name = 'SubscriptionError'; }
 }
@@ -195,7 +200,7 @@ export class SessionSubscriptions {
       const scope = this.hooks.validate(response.thread, owner);
       if (!scope || typeof scope.cwd !== 'string' || !scope.cwd) fail('SUBSCRIPTION_SCOPE_REVOKED');
       return scope;
-    } catch { return fail('SUBSCRIPTION_SCOPE_REVOKED'); }
+    } catch (error) { return fail(subscriptionPolicyError(error,'SUBSCRIPTION_SCOPE_REVOKED')); }
   }
   private join(id: string, epoch: string): Promise<void> {
     const pending = this.joining.get(id);
@@ -229,7 +234,7 @@ export class SessionSubscriptions {
       else this.joined.delete(id);
 
     } catch (error) {
-      const code = error instanceof SubscriptionError ? error.code : 'SUBSCRIPTION_JOIN_FAILED';
+      const code = subscriptionPolicyError(error,'SUBSCRIPTION_JOIN_FAILED');
       this.disable(id, code); throw new SubscriptionError(code);
     }
   }
@@ -290,7 +295,7 @@ export class SessionSubscriptions {
       this.store.transaction(state => { const s = state.subscriptions!.find(s => s.id === id)!; if (s.enabled) s.status = 'joining'; });
       await this.join(id, epoch);
     } catch (error) {
-      const code = error instanceof SubscriptionError ? error.code : 'SUBSCRIPTION_JOIN_FAILED';
+      const code = subscriptionPolicyError(error,'SUBSCRIPTION_JOIN_FAILED');
       this.disable(id, code); throw new SubscriptionError(code);
     }
   }

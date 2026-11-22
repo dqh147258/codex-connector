@@ -36,7 +36,7 @@ Expiry applies to the Connector reminder, not to the App Server request or turn.
 
 Work inbox and Slack outbox are independent. Connector handler completion and response enqueue commit together. This is not model-turn completion; message delivery has its own evidence fields. A Slack failure never retries the backend action. Each session's outbox preserves order even across rate backoff or uncertain deliveries; unrelated sessions can progress. Transient known rate limits may retry; network/unknown outcomes require local operator recovery. Exactly-once Slack delivery is not claimed.
 
-Discovery exposes all shared-visible metadata with manageability reasons. Session control defaults to configured project roots/subdirectories; a local-only allowAllSharedSessions opt-in can authorize other shared sessions without expanding readonly file roots. Ordinary Slack RPC results, search, views and pagination remain safe metadata only. A separate local operator grant permits prospective reply/question delivery, not historical or arbitrary results. Unknown or revoked routes are not given a fallback destination.
+Discovery returns verified user/root sessions visible to the selected backend and scope, with manageability reasons. Child agents and unverified lineage are kept out of normal results and control. Session control defaults to configured project roots/subdirectories; a local-only allowAllSharedSessions opt-in can authorize other shared sessions without expanding readonly file roots. Ordinary Slack RPC results, search, views and pagination remain safe metadata only. A separate local operator grant permits prospective reply/question delivery, not historical or arbitrary results. Unknown or revoked routes are not given a fallback destination.
 
 ## Tests versus evidence
 
@@ -59,7 +59,9 @@ Local/Skill `session.create` and `session.attach` do not require a Slack destina
 
 文件命令保留 `{root:"项目别名",path:"相对路径"}`，新增省略 `root` 的原生绝对路径模式，例如 `files.list {"path":"/Volumes/Code/My/Skills","limit":20}`。仅本地 `filePolicy.allowAbsolutePaths:true` 生效，默认关闭；远程参数不能启用。完整边界见 [READONLY-FILES.md](READONLY-FILES.md)。
 
-`session.list` 每次分别读取最多 `limit` 条 indexed interactive history 与 loaded ID，合并可达 `2*limit`。`nextCursor` 为复合不透明游标；跨页按 ID 去重。`loaded:true` 只说明本轮服务观察，stored-only `loaded:null` 不证明当前未加载。读取 loaded 元数据失败保留 ID / `METADATA_UNAVAILABLE` / unknown，不擅自 resume。`binding` 仅返回仍授权的既有映射。不同服务、CODEX_HOME 或 `--no-daemon` 的独立进程不保证可见。
+`session.list` 分别读取 indexed interactive history 与 loaded ID，每个来源最多检查四个上游页，并最多输出 `limit` 个已核实主会话；合并至多 `2*limit`。`nextCursor` 保存各来源的原生游标；过滤后空页仍可能有下一页。`loaded:true` 只说明本轮服务观察，stored-only `loaded:null` 不证明当前未加载。子 Agent、血缘未核实和读取失败只计入诊断，不伪造普通行、不自动恢复。不同服务、CODEX_HOME 或 `--no-daemon` 的独立进程不保证可见。
+
+子 Agent 由官方 `source.subAgent`、`parentThreadId` 或 `threadSource: "subagent"` 识别；手工 fork 的 `forkedFromId` 不等于父子关系。保留官方 `cli`、`vscode`、`custom.atlas` 和 `custom.chatgpt` 主会话，`appServer` 需要确认来自自己的原生会话根；不可根据标题、路径或活动状态推断。订阅、绑定及重连重新查证，未核实旧记录不自动恢复或投递。参见[固定版本 wire 协议](https://github.com/openai/codex/blob/581161ab41e643d942e1e1b5f561034060bf18e3/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs)。
 
 桌面使用认证 loopback API `action:"sessions",params:{limit,cursor}`，仅返回元数据，不经过模型命令队列、不发送 Slack、不隐式绑定。
 

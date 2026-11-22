@@ -1,5 +1,6 @@
 import { BackendError } from './codex.js';
 import { resultSensitive } from './slack-results.js';
+import { classifyNativeThread, nativeRootError } from './thread-classification.js';
 import type { Backend } from './types.js';
 
 export class SessionContentError extends Error { constructor(readonly code:string){super(code);} }
@@ -35,6 +36,8 @@ export class SessionContent {
     if(!id(threadId))fail('INVALID_THREAD_ID');
     const response=await this.rpc('thread/read',{threadId,includeTurns:false},b),thread=response?.thread;
     if(!thread||thread.id!==threadId)fail('INVALID_THREAD_METADATA');
+    const classification=classifyNativeThread(thread);
+    if(classification!=='root')fail(nativeRootError(classification));
     let meta:Record<string,unknown>;try{meta=this.authorize(thread);}catch{fail('SESSION_SCOPE_NOT_ALLOWED');}
     if(resultSensitive({name:thread.name,cwd:thread.cwd,model:thread.model})||resultSensitive(meta!))fail('SENSITIVE_CONTENT');
     const field=(value:unknown,max:number)=>typeof value==='string'?[...value].slice(0,max).join(''):null;

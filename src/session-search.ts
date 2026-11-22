@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { BackendError } from './codex.js';
 import { SessionContent, SessionContentError, type ContentLimits, type VisibleMessage } from './session-content.js';
 import { resultSensitive } from './slack-results.js';
+import { classifyNativeThread, nativeRootError } from './thread-classification.js';
 import type { Backend } from './types.js';
 
 export interface SearchQuery {
@@ -10,15 +11,18 @@ export interface SearchQuery {
 }
 interface PendingSession { threadId: string; cursor?: string; cwd?: unknown; seen: string[]; pages: number }
 interface Discovery {
-  pages: number; scannedSessions: number; excludedSessions: number; hasMore: boolean;
+  pages: number; scannedSessions: number; excludedSessions: number; childSessions: number; unverifiedSessions: number; hasMore: boolean;
   selectionComplete: boolean; error: string|null;
 }
 interface Continuation {
   query: string; scope: string; epoch: string; expiresAt: number;
   selectedCount: number; pending: PendingSession[]; discovery: Discovery;
-  failedSessions: number; withheldMessages: number;
+  indexCursor?: string; indexCursors: string[]; indexIds: string[];
+  failedSessions: number; withheldMessages: number; noLongerRoot: { childSessions:number; unverifiedSessions:number };
 }
 interface SearchLimits extends ContentLimits { discoveryPages: number; totalPagesPerSession: number }
+// Bound retained index evidence even across repeated discovery continuations.
+const MAX_DISCOVERY_PAGES=60;
 const DEFAULTS: SearchLimits = { timeoutMs:30000,rpcTimeoutMs:5000,maxBytes:2*1024*1024,maxPages:3,pageSize:20,maxCalls:100,discoveryPages:3,totalPagesPerSession:100 };
 const fail=(code:string):never=>{throw new SessionContentError(code);};
 const id=(v:unknown):v is string=>typeof v==='string'&&/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(v);
@@ -39,6 +43,9 @@ export class SessionSearch extends SessionContent {
     this.searchLimits={...DEFAULTS,...limits};
     for(const [k,v] of Object.entries(this.searchLimits))if(!integer(v,1,DEFAULTS[k as keyof SearchLimits]))fail('INVALID_SEARCH_LIMIT');
   }
+  private canDiscover(state:Continuation):boolean {
+    return !state.discovery.selectionComplete&&!state.discovery.error&&state.discovery.pages<MAX_DISCOVERY_PAGES;
+  }
   private save(state:Continuation):string {
     for(const [key,value] of this.continuations)if(value.expiresAt<=Date.now())this.continuations.delete(key);
     while(this.continuations.size>=20)this.continuations.delete(this.continuations.keys().next().value!);
@@ -57,34 +64,54 @@ export class SessionSearch extends SessionContent {
       if(!saved||saved.query!==query||saved.scope!==scope||saved.epoch!==b.epoch||saved.expiresAt<=Date.now())fail('INVALID_SEARCH_CURSOR');
       state=structuredClone(saved!);
     }else{
-      state={query,scope,epoch:b.epoch,expiresAt:Date.now()+15*60*1000,selectedCount:0,pending:[],discovery:{pages:0,scannedSessions:0,excludedSessions:0,hasMore:false,selectionComplete:false,error:null},failedSessions:0,withheldMessages:0};
-      let cursor:string|undefined;const seen=new Set<string>(),ids=new Set<string>();
+      state={query,scope,epoch:b.epoch,expiresAt:Date.now()+15*60*1000,selectedCount:0,pending:[],discovery:{pages:0,scannedSessions:0,excludedSessions:0,childSessions:0,unverifiedSessions:0,hasMore:false,selectionComplete:false,error:null},indexCursors:[],indexIds:[],failedSessions:0,withheldMessages:0,noLongerRoot:{childSessions:0,unverifiedSessions:0}};
+    }
+    // Finish pending history before advancing the independent index cursor. A
+    // filtered/empty index page must not be interpreted as end of selection.
+    if(!state.pending.length&&this.canDiscover(state)){
+      const seen=new Set(state.indexCursors),ids=new Set(state.indexIds);
       try {
-        for(let n=0;n<this.searchLimits.discoveryPages;n++){
+        for(let n=0;n<this.searchLimits.discoveryPages&&this.canDiscover(state)&&b.calls<b.maxCalls;n++){
+          const cursor=state.indexCursor;
           const response=await this.rpc('thread/list',{limit:this.searchLimits.pageSize,sortKey:'updated_at',sortDirection:'desc',useStateDbOnly:true,modelProviders:[],...(cursor?{cursor}:{})},b);
           if(!response||!Array.isArray(response.data)||response.data.length>this.searchLimits.pageSize||!cursorValid(response.nextCursor)||response.data.some((t:any)=>!t||!id(t.id)))fail('INVALID_SEARCH_DISCOVERY');
-          const next=response.nextCursor as string|null;
-          if(next&&(next===cursor||seen.has(next)))fail('INVALID_SEARCH_DISCOVERY');
+          const next=response.nextCursor as string|null,nextKey=next===null?null:hash(next);
+          if(nextKey!==null&&seen.has(nextKey))fail('INVALID_SEARCH_DISCOVERY');
           state.discovery.pages++;state.discovery.hasMore=next!==null;
           for(let index=0;index<response.data.length;index++){
             const thread=response.data[index];state.discovery.scannedSessions++;
-            if(ids.has(thread.id))continue;ids.add(thread.id);
-            // Do not read message bodies for candidates outside allowed scope.
+            const key=hash(thread.id);
+            if(ids.has(key))continue;ids.add(key);
+            const classification=classifyNativeThread(thread);
+            if(classification!=='root'){
+              state.discovery[classification==='child'?'childSessions':'unverifiedSessions']++;
+              continue;
+            }
+            // Discovery is metadata-only. Exact current metadata is checked
+            // again independently before any item RPC, including resumption.
             try {const metadata=this.authorize(thread);if(resultSensitive({id:thread.id,name:thread.name,cwd:thread.cwd,model:thread.model})||resultSensitive(metadata))throw Error();}
             catch {state.discovery.excludedSessions++;continue;}
-            state.pending.push({threadId:thread.id,seen:[],pages:0});
-            if(state.pending.length===sessionLimit){state.discovery.hasMore=next!==null||index+1<response.data.length;break;}
+            state.pending.push({threadId:thread.id,seen:[],pages:0});state.selectedCount++;
+            if(state.selectedCount===sessionLimit){state.discovery.hasMore=next!==null||index+1<response.data.length;break;}
           }
-          if(state.pending.length===sessionLimit||next===null){state.discovery.selectionComplete=true;break;}
-          seen.add(next);cursor=next;
+          state.indexCursor=next??undefined;
+          if(nextKey!==null)seen.add(nextKey);
+          if(state.selectedCount===sessionLimit||next===null)state.discovery.selectionComplete=true;
         }
       }catch(e){state.discovery.error=errorCode(e);}
-      state.selectedCount=state.pending.length;
+      state.indexCursors=[...seen];state.indexIds=[...ids];
     }
     const matches:{threadId:string;metadata:Record<string,unknown>;message:VisibleMessage&{matchedTerms:string[];excerptStart:number;excerptEnd:number;totalChars:number}}[]=[];
     const sessions:{threadId:string;metadata?:Record<string,unknown>;pages:number;scannedItems:number;withheldMessages:number;exhausted:boolean;error:string|null}[]=[];
     const nextPending:PendingSession[]=[],visited=new Map<string,{cwd:unknown;row:typeof sessions[number]}>();
-    let stop='end',scannedItems=0;
+    let stop='end';
+    const noLongerRoot=new Set<string>();
+    const classifyFailure=(threadId:string,code:string)=>{
+      if(code!==nativeRootError('child')&&code!==nativeRootError('unknown'))return;
+      if(noLongerRoot.has(threadId))return;
+      noLongerRoot.add(threadId);
+      state.noLongerRoot[code===nativeRootError('child')?'childSessions':'unverifiedSessions']++;
+    };
     const normalized=terms.map(t=>t.toLowerCase());
     for(let index=0;index<state.pending.length;index++){
       const pending=structuredClone(state.pending[index]!);
@@ -104,7 +131,7 @@ export class SessionSearch extends SessionContent {
           // Thus we finish every accepted raw page; no page-tail matches are lost.
           const page=await this.page(pending.threadId,'desc',pending.cursor,Math.min(this.searchLimits.pageSize,limit-matches.length),b);
           if(page.nextCursor&&pending.seen.includes(hash(page.nextCursor)))fail('INVALID_HISTORY_PAGE');
-          row.pages++;pending.pages++;row.scannedItems+=page.data.length;scannedItems+=page.data.length;
+          row.pages++;pending.pages++;row.scannedItems+=page.data.length;
           for(const entry of page.data){
             if(!['userMessage','agentMessage'].includes(entry.item.type))continue;
             const wantedRole=entry.item.type==='userMessage'?'user':'assistant';
@@ -133,24 +160,27 @@ export class SessionSearch extends SessionContent {
           if(matches.length>=limit){stop='match-limit';break;}
         }
         if(!row.exhausted)nextPending.push(pending);
-      }catch(e){row.error=errorCode(e);state.failedSessions++;}
+      }catch(e){row.error=errorCode(e);classifyFailure(pending.threadId,row.error);state.failedSessions++;}
     }
     // Recheck every scanned session after the entire multi-session read, not
     // merely just after each page. Drop its data if policy/cwd changed meanwhile.
     for(const [threadId,{cwd,row}] of visited){
       try{const current=await this.metadata(threadId,b);if(current.cwd!==cwd)fail('SESSION_SCOPE_CHANGED');row.metadata=current;for(const match of matches)if(match.threadId===threadId)match.metadata=current;}
-      catch(e){if(!row.error)state.failedSessions++;row.error=errorCode(e);row.metadata=undefined;for(let i=matches.length-1;i>=0;i--)if(matches[i]!.threadId===threadId)matches.splice(i,1);const at=nextPending.findIndex(p=>p.threadId===threadId);if(at>=0)nextPending.splice(at,1);}
+      catch(e){if(!row.error)state.failedSessions++;row.error=errorCode(e);classifyFailure(threadId,row.error);row.metadata=undefined;for(let i=matches.length-1;i>=0;i--)if(matches[i]!.threadId===threadId)matches.splice(i,1);const at=nextPending.findIndex(p=>p.threadId===threadId);if(at>=0)nextPending.splice(at,1);}
     }
     if(!this.backend.connected||this.backend.epoch!==b.epoch)fail('CONTENT_BACKEND_CHANGED');
-    const withheld=sessions.reduce((n,s)=>n+s.withheldMessages,0);state.withheldMessages+=withheld;state.pending=nextPending;
-    const nextCursor=nextPending.length?this.save(state):null;
-    const selectedTraversalComplete=!nextCursor&&state.failedSessions===0;
+    const visibleSessions=sessions.filter(row=>!noLongerRoot.has(row.threadId));
+    const withheld=visibleSessions.reduce((n,s)=>n+s.withheldMessages,0);
+    state.withheldMessages+=withheld;state.pending=nextPending;
+    const discoveryPending=this.canDiscover(state)&&Boolean(state.indexCursor);
+    const nextCursor=nextPending.length||discoveryPending?this.save(state):null;
+    const selectedTraversalComplete=!nextPending.length&&state.failedSessions===0;
     const traversalComplete=selectedTraversalComplete&&state.discovery.selectionComplete&&!state.discovery.error;
-    return{kind:'session.search',asOf:startedAt,terms,mode,role,sessionLimit,limit,maxChars,selectedSessionCount:state.selectedCount,matches,returnedCount:matches.length,sessions,nextCursor,hasMore:nextCursor!==null,
-      coverage:{discovery:state.discovery,scannedItems,scannedSessions:sessions.length,pendingSessions:nextPending.length,failedSessions:state.failedSessions,withheldMessages:state.withheldMessages,selectedTraversalComplete,traversalComplete,searchableContentComplete:traversalComplete&&state.withheldMessages===0,stop:nextCursor?(stop==='end'?'page-budget':stop):state.failedSessions?'errors':state.discovery.error?'discovery-error':!state.discovery.selectionComplete?'discovery-limit':'end',limits:{...this.searchLimits},globalSearch:false},
-      ordering:'Fixed bounded selection from indexed interactive nonarchived history, backend updated_at descending (NOT execution activity); item creation ordinal descending per session. Continuations visit pending sessions in selection order.',
+    return{kind:'session.search',asOf:startedAt,terms,mode,role,sessionLimit,limit,maxChars,selectedSessionCount:state.selectedCount-state.noLongerRoot.childSessions-state.noLongerRoot.unverifiedSessions,matches,returnedCount:matches.length,sessions:visibleSessions,nextCursor,hasMore:nextCursor!==null,
+      coverage:{discovery:state.discovery,noLongerRoot:state.noLongerRoot,scannedItems:visibleSessions.reduce((n,s)=>n+s.scannedItems,0),scannedSessions:visibleSessions.length,pendingSessions:nextPending.length,failedSessions:state.failedSessions,withheldMessages:state.withheldMessages,selectedTraversalComplete,traversalComplete,searchableContentComplete:traversalComplete&&state.withheldMessages===0,stop:nextPending.length?(stop==='end'?'page-budget':stop):state.discovery.error?'discovery-error':!state.discovery.selectionComplete?'discovery-limit':state.failedSessions?'errors':'end',limits:{...this.searchLimits,totalDiscoveryPages:MAX_DISCOVERY_PAGES},globalSearch:false},
+      ordering:'Bounded verified root selection from indexed interactive nonarchived history, backend updated_at descending (NOT execution activity); item creation ordinal descending per session. Continuations finish pending sessions before advancing the index.',
       matching:'Case-insensitive literal substrings, AND/OR within one visible message. No regex, stemming, cross-message conjunction or semantic model summary. Excerpts center the first hit; other matched terms may be outside the excerpt.',
-      consistency:'Separate live reads, not an atomic snapshot. Tool/reasoning/system/non-text content excluded; sensitive-looking messages withheld before matching. Empty partial results do not establish no matches.',
+      consistency:'Separate live reads, not an atomic snapshot. Child and lineage-unverified sessions excluded; tool/reasoning/system/non-text content excluded; sensitive-looking messages withheld before matching. Empty partial results do not establish no matches.',
       continuation:nextCursor?{expiresAt:new Date(state.expiresAt).toISOString(),scope:'Same query, authenticated actor/channel/thread, permission policy and backend epoch; process-local, bounded cache may evict early. Use result.next.'}:null};
   }
 }

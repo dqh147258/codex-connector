@@ -10,7 +10,7 @@ const entry=(n:number,type:string,text='needle',extra:any={})=>({
 });
 function setup(histories:Record<string,any[]>={chosen:[]},limits:any={}) {
   const backend=new FakeBackend();backend.connected=true;
-  for(const [index,threadId] of Object.keys(histories).entries())backend.threads.set(threadId,{id:threadId,cwd:'/allowed',name:`Task ${threadId}`,status:{type:'idle'},createdAt:10,updatedAt:100-index});
+  for(const [index,threadId] of Object.keys(histories).entries())backend.threads.set(threadId,{id:threadId,cwd:'/allowed',source:'cli',parentThreadId:null,name:`Task ${threadId}`,status:{type:'idle'},createdAt:10,updatedAt:100-index});
   backend.rpc=async(method,p)=>{
     backend.calls.push({method,params:p});
     if(method==='thread/list'){
@@ -158,7 +158,8 @@ test('discovery failures are explicit and do not falsely report complete search'
 
 test('bounded incomplete discovery reports partial coverage even when selected histories end',async()=>{
   const {search,backend}=setup({outside:[],chosen:[entry(1,'userMessage')],later:[entry(2,'userMessage')]},{pageSize:1,discoveryPages:2});backend.threads.get('outside')!.cwd='/outside';
-  const r=await search.query({terms:['needle'],sessionLimit:2});assert.equal(r.selectedSessionCount,1);assert.equal(r.coverage.discovery.pages,2);assert.equal(r.coverage.discovery.selectionComplete,false);assert.equal(r.coverage.discovery.hasMore,true);assert.equal(r.nextCursor,null);assert.equal(r.coverage.traversalComplete,false);assert.equal(r.coverage.searchableContentComplete,false);
+  const r=await search.query({terms:['needle'],sessionLimit:2});assert.equal(r.selectedSessionCount,1);assert.equal(r.coverage.discovery.pages,2);assert.equal(r.coverage.discovery.selectionComplete,false);assert.equal(r.coverage.discovery.hasMore,true);assert.ok(r.nextCursor);assert.equal(r.coverage.traversalComplete,false);assert.equal(r.coverage.searchableContentComplete,false);
+  const next=await search.query({terms:['needle'],sessionLimit:2,cursor:r.nextCursor!});assert.deepEqual(next.matches.map(m=>m.threadId),['later']);assert.equal(next.selectedSessionCount,2);assert.equal(next.coverage.traversalComplete,true);
 });
 
 test('byte, timeout, per-invocation call and total-page budgets remain bounded',async()=>{
@@ -201,4 +202,90 @@ test('sensitive assignments formed by joined text parts are withheld before matc
     assert.equal(result.coverage.searchableContentComplete,false);
     assert.ok(!JSON.stringify(result).includes('split-sensitive-value'));
   }
+});
+
+test('search filters official child and unknown sources, preserves custom roots and human forks, and never reads blocked bodies',async()=>{
+  const lineage:Record<string,object> = {
+    'private-review':{source:{subAgent:'review'}},
+    'private-compact':{source:{subAgent:'compact'}},
+    'private-consolidation':{source:{subAgent:'memory_consolidation'}},
+    'private-other':{source:{subAgent:{other:'helper'}}},
+    'private-spawn':{source:{subAgent:{thread_spawn:{parent_thread_id:'parent',depth:1}}}},
+    'private-parent-only':{parentThreadId:'parent'},
+    'private-thread-source':{threadSource:'subagent'},
+    'private-unknown':{source:'unknown'},
+    'private-custom':{source:{custom:'other'}},
+    'private-bare':{parentThreadId:undefined},
+    'private-app-unverified':{source:'appServer',sessionId:undefined},
+    'allowed-chatgpt':{source:{custom:'chatgpt'}},
+    'allowed-fork':{source:'vscode',forkedFromId:'old-root'},
+    'allowed-app':{source:'appServer',sessionId:'allowed-app'},
+  };
+  const {search,backend}=setup(Object.fromEntries(Object.keys(lineage).map((id,i)=>[id,[entry(i,'agentMessage','needle '+id)]])));
+  for(const [id,metadata] of Object.entries(lineage))Object.assign(backend.threads.get(id),metadata);
+  const result=await search.query({terms:['needle']});
+  assert.deepEqual(result.matches.map(m=>m.threadId),['allowed-chatgpt','allowed-fork','allowed-app']);
+  assert.equal(result.selectedSessionCount,3);
+  assert.equal(result.coverage.discovery.childSessions,7);
+  assert.equal(result.coverage.discovery.unverifiedSessions,4);
+  assert.ok(!backend.calls.some(c=>c.method!=='thread/list'&&c.params.threadId.startsWith('private-')));
+  assert.doesNotMatch(JSON.stringify(result),/private-/);
+});
+
+test('search follows empty filtered raw index pages across bounded continuations using only the original opaque cursor',async()=>{
+  const {search,backend}=setup({'private-child':[entry(1,'userMessage','needle private')],'private-unknown':[entry(2,'userMessage','needle private')],allowed:[entry(3,'agentMessage','needle visible')]},{pageSize:1,discoveryPages:1});
+  Object.assign(backend.threads.get('private-child'),{threadSource:'subagent'});
+  Object.assign(backend.threads.get('private-unknown'),{source:'unknown'});
+  const query={terms:['needle']};
+  const first=await search.query(query);
+  assert.equal(first.returnedCount,0);assert.ok(first.nextCursor);assert.equal(first.coverage.discovery.childSessions,1);assert.equal(first.coverage.traversalComplete,false);
+  const second=await search.query({...query,cursor:first.nextCursor!});
+  assert.equal(second.returnedCount,0);assert.ok(second.nextCursor);assert.equal(second.coverage.discovery.unverifiedSessions,1);
+  const final=await search.query({...query,cursor:second.nextCursor!});
+  assert.deepEqual(excerpts(final),['needle visible']);assert.equal(final.nextCursor,null);assert.equal(final.coverage.traversalComplete,true);
+  assert.deepEqual(backend.calls.filter(c=>c.method==='thread/list').map(c=>c.params.cursor),[undefined,'1','2']);
+  assert.ok(!backend.calls.some(c=>c.method!=='thread/list'&&c.params.threadId.startsWith('private-')));
+  assert.doesNotMatch(JSON.stringify([first,second,final]),/private-/);
+});
+
+test('search revalidates indexed and resumed selections before bodies, then discards observations if final root proof ceases',async()=>{
+  for(const stage of ['initial','continuation','final'] as const){
+    const threadId='private-unverified-thread',f=setup({[threadId]:[entry(1,'userMessage','needle private'),entry(2,'userMessage','needle private')]});
+    const original=f.backend.rpc.bind(f.backend);
+    f.backend.rpc=async(method,p)=>{
+      const r=await original(method,p);
+      if(stage==='initial'&&method==='thread/read')return {thread:{...r.thread,parentThreadId:'parent'}};
+      if(stage==='final'&&method==='thread/items/list')f.backend.threads.get(threadId)!.source='unknown';
+      return r;
+    };
+    const q={terms:['needle'],limit:1},p=stage==='continuation'?await f.search.query(q):null;
+    if(p){assert.ok(p.nextCursor);f.backend.threads.get(threadId)!.parentThreadId='parent';}
+    const before=f.backend.calls.filter(c=>c.method==='thread/items/list').length;
+    const result=await f.search.query({...q,...(p?{cursor:p.nextCursor!}:{})});
+    assert.equal(result.returnedCount,0);assert.equal(result.selectedSessionCount,0);
+    assert.equal(result.sessions.length,0);assert.equal(result.nextCursor,null);
+    assert.equal(result.coverage.noLongerRoot[stage==='final'?'unverifiedSessions':'childSessions'],1);
+    assert.equal(result.coverage.traversalComplete,false);
+    assert.equal(f.backend.calls.filter(c=>c.method==='thread/items/list').length-before,stage==='final'?1:0);
+    assert.doesNotMatch(JSON.stringify(result),/private/);
+  }
+});
+
+test('across search continuations, repeated raw cursors fail closed and empty discovery has a total cap',async()=>{
+  const repeated=setup({}, {discoveryPages:1});
+  repeated.backend.rpc=async()=>({data:[],nextCursor:'repeat'});
+  const query={terms:['needle']};
+  const first=await repeated.search.query(query);assert.ok(first.nextCursor);
+  const rejected=await repeated.search.query({...query,cursor:first.nextCursor!});
+  assert.equal(rejected.coverage.discovery.error,'INVALID_SEARCH_DISCOVERY');assert.equal(rejected.nextCursor,null);
+  const bounded=setup({});let pages=0;
+  bounded.backend.rpc=async(method)=>{assert.equal(method,'thread/list');return{data:[],nextCursor:'index-'+(++pages)};};
+  let cursor:string|undefined;
+  do{
+    const result=await bounded.search.query({...query,...(cursor?{cursor}:{})});
+    cursor=result.nextCursor??undefined;
+    assert.equal(result.coverage.traversalComplete,false);
+    assert.ok(pages<=result.coverage.limits.totalDiscoveryPages);
+  }while(cursor);
+  assert.equal(pages,60);
 });

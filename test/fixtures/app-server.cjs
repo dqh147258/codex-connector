@@ -16,6 +16,10 @@ if (process.env.SLACK_APP_TOKEN || process.env.SLACK_BOT_TOKEN || process.env.CO
 let socket;
 const reply = value => socket.send(JSON.stringify(value));
 const forbidden = ['sandbox', 'sandboxPolicy', 'approvalPolicy', 'permissions', 'config', 'model', 'effort'];
+const thread = (id, cwd, source = 'cli') => ({
+  id, cwd, status: { type: 'idle' }, source, threadSource: 'user', sessionId: id,
+  parentThreadId: null, forkedFromId: null,
+});
 let initialized = false, turnSequence = 0;
 const message = line => {
   let m; try { m = JSON.parse(line); } catch { process.exit(93); }
@@ -49,9 +53,9 @@ const message = line => {
   if (m.params?.threadId === 'fixture-null-error') { reply({ id: m.id, error: null }); return; }
   if (m.params?.threadId === 'fixture-malformed-error') { reply({ id: m.id, error: { code: 'not-a-number', message: 'invalid code' } }); return; }
   if (m.params?.threadId === 'fixture-rpc-error') { reply({ id: m.id, error: m.params.fixtureError }); return; }
-  if (m.method === 'thread/list') { reply({ id: m.id, result: { data: [{ id: 'shared-thread-1', cwd: '/fixture/project', status: { type: 'idle' } }], nextCursor: null } }); return; }
+  if (m.method === 'thread/list') { reply({ id: m.id, result: { data: [thread('shared-thread-1', '/fixture/project')], nextCursor: null } }); return; }
   if (m.method === 'thread/loaded/list') { reply({ id: m.id, result: { data: ['shared-thread-1'], nextCursor: null } }); return; }
-  if (['thread/start', 'thread/read', 'thread/resume'].includes(m.method)) { reply({ id: m.id, result: { thread: { id: m.params.threadId || 'created-thread', cwd: m.params.cwd || '/fixture/project', status: { type: 'idle' } } } }); return; }
+  if (['thread/start', 'thread/read', 'thread/resume'].includes(m.method)) { reply({ id: m.id, result: { thread: thread(m.params.threadId || 'created-thread', m.params.cwd || '/fixture/project', m.method === 'thread/start' ? 'appServer' : 'cli') } }); return; }
   if (['thread/turns/list', 'thread/items/list'].includes(m.method)) { reply({ id: m.id, result: { data: [], nextCursor: null } }); return; }
   if (m.method === 'thread/queue/add' || m.method === 'thread/queue/start') { reply({ id: m.id, error: { code: -32601, message: 'Fixture does not support this capability' } }); return; }
   if (m.method === 'turn/start') {

@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fixture,event,request,waitFor,ready } from './helpers.js';
+import { Connector } from '../src/connector.js';
+import { Store } from '../src/store.js';
+import { fixture,event,request,waitFor,ready,FakeBackend,rootThread } from './helpers.js';
 async function invoke(f:ReturnType<typeof fixture>,command:string,params:any={},patch:any={}){const r=request(command,params);f.connector.accept(event(r,{thread_ts:'200.1',...patch}));f.connector.pump();await waitFor(()=>['completed','failed','uncertain'].includes(f.store.state.work.find(w=>w.request.id===r.id)?.status||''));return f.store.state.work.find(w=>w.request.id===r.id)!;}
 const report=(f:ReturnType<typeof fixture>,id:string,phase='commentary',threadId='observed')=>f.backend.emit('notification','item/completed',{threadId,turnId:'turn-1',item:{id,type:'agentMessage',phase,text:'Progress '+id}},f.backend.epoch);
 
@@ -16,7 +18,7 @@ test('cancel during pacing prevents queued post; another actor/thread cannot can
 
 test('subscription policy revocation and stale epoch suppress content; absolute file access never grants observation scope',async()=>{const f=fixture();try{await f.connector.initialize();f.config.filePolicy={allowAbsolutePaths:true};f.backend.threads.set('outside',{id:'outside',cwd:'/outside-scope',status:{type:'active'}});assert.equal((await invoke(f,'session.subscribe',{threadId:'outside'})).error,'SUBSCRIPTION_SCOPE_REVOKED');assert.equal(f.backend.calls.some(c=>c.method==='thread/resume'),false);f.backend.threads.set('observed',{id:'observed',cwd:f.dir,status:{type:'active'}});await invoke(f,'session.subscribe',{threadId:'observed'});const before=f.store.state.outbox.length;f.config.slack.trustedBots=[];report(f,'revoked');await new Promise(r=>setTimeout(r,10));assert.equal(f.store.state.outbox.length,before);}finally{await f.cleanup();}});
 
-test('early reconnect event is not consumed; validated replay waits for join success and scope failure cancels it',async()=>{for(const scopeFails of [false,true]){const f=fixture();try{await f.connector.initialize();f.backend.threads.set('observed',{id:'observed',cwd:f.dir,status:{type:'active'}});await invoke(f,'session.subscribe',{threadId:'observed'});await waitFor(()=>f.store.state.outbox.every(o=>o.status==='sent'));f.backend.epoch='epoch-2';report(f,'replay');await new Promise(r=>setTimeout(r,10));assert.equal(f.store.state.seenNotifications['observed:turn-1:replay'],undefined);const original=f.backend.rpc.bind(f.backend);let release!:()=>void;const blocked=new Promise<void>(r=>{release=r;});f.backend.rpc=async(method,p)=>{if(method==='thread/resume'){report(f,'replay');await blocked;return{thread:{id:'observed',cwd:scopeFails?'/outside-scope':f.dir,status:{type:'active'}}};}return original(method,p);};const reconnect=f.connector.reconnect();await waitFor(()=>f.store.state.outbox.some(o=>o.subscriptionId&&o.text.includes('Progress replay')));f.connector.flush();await new Promise(r=>setTimeout(r,10));assert.equal(f.posts.some(p=>p.text.includes('Progress replay')),false);release();await reconnect;if(scopeFails){assert.equal(f.posts.some(p=>p.text.includes('Progress replay')),false);assert.ok(f.store.state.outbox.some(o=>o.subscriptionId&&o.status==='failed'));}else{await waitFor(()=>f.posts.some(p=>p.text.includes('Progress replay')));assert.equal(f.posts.filter(p=>p.text.includes('Progress replay')).length,1);}}finally{await f.cleanup();}}});
+test('early reconnect event is not consumed; validated replay waits for join success and scope failure cancels it',async()=>{for(const scopeFails of [false,true]){const f=fixture();try{await f.connector.initialize();f.backend.threads.set('observed',{id:'observed',cwd:f.dir,status:{type:'active'}});await invoke(f,'session.subscribe',{threadId:'observed'});await waitFor(()=>f.store.state.outbox.every(o=>o.status==='sent'));f.backend.epoch='epoch-2';report(f,'replay');await new Promise(r=>setTimeout(r,10));assert.equal(f.store.state.seenNotifications['observed:turn-1:replay'],undefined);const original=f.backend.rpc.bind(f.backend);let release!:()=>void;const blocked=new Promise<void>(r=>{release=r;});f.backend.rpc=async(method,p)=>{if(method==='thread/resume'){report(f,'replay');await blocked;return{thread:rootThread('observed',scopeFails?'/outside-scope':f.dir,{status:{type:'active'}})};}return original(method,p);};const reconnect=f.connector.reconnect();await waitFor(()=>f.store.state.outbox.some(o=>o.subscriptionId&&o.text.includes('Progress replay')));f.connector.flush();await new Promise(r=>setTimeout(r,10));assert.equal(f.posts.some(p=>p.text.includes('Progress replay')),false);release();await reconnect;if(scopeFails){assert.equal(f.posts.some(p=>p.text.includes('Progress replay')),false);assert.ok(f.store.state.outbox.some(o=>o.subscriptionId&&o.status==='failed'));}else{await waitFor(()=>f.posts.some(p=>p.text.includes('Progress replay')));assert.equal(f.posts.filter(p=>p.text.includes('Progress replay')).length,1);}}finally{await f.cleanup();}}});
 
 test('each existing subscriber receives reconnect replay after its own join, once per destination', async () => {
   const f = fixture();
@@ -156,3 +158,86 @@ for (const secret of [false, true]) for (const terminal of ['resolved', 'complet
     } finally { await f.cleanup(); }
   });
 }
+
+
+test('loaded child and unknown sessions cannot establish a Slack subscription or trigger observation resume',async()=>{
+  const f=fixture();try{
+    await f.connector.initialize();
+    f.backend.threads.set('hidden-child',rootThread('hidden-child',f.dir,{threadSource:'subagent',canAcceptDirectInput:true}));
+    f.backend.threads.raw('missing-source',{id:'missing-source',cwd:f.dir,parentThreadId:null,canAcceptDirectInput:true});
+    for(const [id,code] of [['hidden-child','SUBAGENT_THREAD_NOT_SUPPORTED'],['missing-source','NATIVE_THREAD_ROOT_UNVERIFIED']] as const){
+      const row=await invoke(f,'session.subscribe',{threadId:id});
+      assert.equal(row.status,'failed');assert.equal(row.error,code);
+      assert.ok(!f.backend.calls.some(c=>c.method==='thread/resume'&&c.params.threadId===id));
+    }
+    assert.equal(f.store.state.subscriptions?.length??0,0);
+    assert.equal(f.store.state.sessions.length,0);
+  }finally{await f.cleanup();}
+});
+
+test('restoring old subscription and binding requires fresh root classification; no replay or legacy fallback',async()=>{
+  const f=fixture();let restarted:Connector|undefined,reopened:Store|undefined;
+  try{
+    await f.connector.initialize();
+    await invoke(f,'session.create',{project:'repo'},{thread_ts:'300.1'});
+    await invoke(f,'session.create',{project:'repo'},{thread_ts:'400.1'});
+    const [bound,legacy]=f.store.state.sessions;
+    assert.ok(bound&&legacy);
+    await invoke(f,'session.subscribe',{threadId:bound.threadId},{thread_ts:bound.threadTs});
+    const sub=f.store.state.subscriptions![0]!;
+    await waitFor(()=>f.store.state.outbox.every(o=>o.status==='sent'));
+    await f.connector.close();
+    f.store.transaction(s=>{
+      for(const [session,subscriptionId] of [[bound,sub.id],[legacy,undefined]] as const){
+        s.outbox.push({id:'old-delivery-'+session.id,sessionId:session.id,
+          notificationThreadId:session.threadId,subscriptionId,channel:session.channel,threadTs:session.threadTs,
+          root:false,text:'PERSISTED_BRANCH_ONLY',status:'queued',attempts:0,nextAttemptAt:0});
+      }
+    });
+    f.store.close();
+    const backend=new FakeBackend();backend.epoch='new-epoch';
+    backend.threads.set(bound.threadId,rootThread(bound.threadId,f.dir,{source:{subAgent:'compact'}}));
+    backend.threads.raw(legacy.threadId,{id:legacy.threadId,cwd:f.dir,canAcceptDirectInput:true});
+    reopened=new Store(f.dir);
+    restarted=new Connector(f.config,reopened,backend,f.slack,0);
+    restarted.selfUserId='USELF';restarted.selfBotId='BSELF';
+    await restarted.initialize();
+    await waitFor(()=>reopened!.state.outbox.filter(o=>o.id.startsWith('old-delivery')).every(o=>o.status==='failed'));
+    const saved=reopened.state.subscriptions?.find(s=>s.id===sub.id);
+    assert.equal(saved?.enabled,false);assert.equal(saved?.error,'SUBAGENT_THREAD_NOT_SUPPORTED');
+    assert.deepEqual(reopened.state.sessions.map(s=>s.id).sort(),[bound.id,legacy.id].sort());
+    assert.ok(!backend.calls.some(c=>c.method==='thread/resume'));
+    const deliverCount=f.posts.length;
+    for(const s of [bound,legacy]){
+      backend.emit('notification','item/completed',{threadId:s.threadId,turnId:'t',item:{
+        type:'agentMessage',id:'i',phase:'final_answer',text:'LATE_BRANCH_ONLY'}},backend.epoch);
+      backend.emit('request',{id:123,epoch:backend.epoch,method:'item/commandExecution/requestApproval',
+        params:{threadId:s.threadId,turnId:'t',itemId:'j',command:'LATE_BRANCH_ONLY'}});
+    }
+    await (restarted as unknown as {events:Promise<void>}).events;
+    assert.equal(f.posts.length,deliverCount);
+    assert.ok(!f.posts.some(p=>/PERSISTED_BRANCH_ONLY|LATE_BRANCH_ONLY/.test(p.text)));
+    assert.equal(reopened.state.pending.length,0);
+    assert.equal(backend.responses.length,0);
+  }finally{await restarted?.close();reopened?.close();await f.cleanup();}
+});
+
+
+test('a mismatched child result on observation resume retires the route and never posts buffered text',async()=>{
+  const f=fixture();try{
+    await f.connector.initialize();
+    f.backend.threads.set('observed',rootThread('observed',f.dir,{status:{type:'active'}}));
+    const rpc=f.backend.rpc.bind(f.backend);
+    f.backend.rpc=async(method,params)=>{
+      if(method!=='thread/resume')return rpc(method,params);
+      report(f,'became-child');
+      await (f.connector as unknown as {events:Promise<void>}).events;
+      return {thread:rootThread('observed',f.dir,{source:{subAgent:'compact'}})};
+    };
+    const w=await invoke(f,'session.subscribe',{threadId:'observed'});
+    assert.equal(w.error,'SUBAGENT_THREAD_NOT_SUPPORTED');
+    assert.equal(f.store.state.subscriptions?.[0]?.enabled,false);
+    assert.ok(!f.posts.some(o=>o.text.includes('Progress became-child')));
+    assert.ok(f.store.state.outbox.filter(o=>o.text.includes('Progress became-child')).every(o=>o.status==='failed'));
+  }finally{await f.cleanup();}
+});

@@ -4,6 +4,7 @@ import { realpathSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { resolve,relative,isAbsolute,sep } from 'node:path';
 import { RecentSessions, RecentError } from './session-recent.js';
+import { classifyNativeThread,nativeRootError } from './thread-classification.js';
 import { deliveryId, deliveryStatus, deliveryView, observeMessage, observeTurn, terminalExecution, type MessageDelivery } from './session-delivery.js';
 import { recordActivity } from './session-activity.js';
 import { SessionSearch } from './session-search.js';
@@ -49,7 +50,7 @@ export class Connector {
   private running=new Map<string,Promise<void>>();private delivering?:Promise<void>;private closing=false;private lastPost=0;
   private deliveryTurns=new Map<string,{threadId:string;turn:{id:string;status:string};conflict?:true}>();
   private events=Promise.resolve();
-  private slackInputs=new Map<string,{items:Map<string,string|null>;overflow:boolean}>();private attached=new Set<string>();private items=new Map<string,any>();
+  private slackInputs=new Map<string,{items:Map<string,string|null>;overflow:boolean}>();private attached=new Set<string>();private verifiedRoots=new Map<string,string>();private items=new Map<string,any>();
   readonly localEvents?:LocalEvents;
   readonly nativeSharing?:NativeSharing;
   readonly files:ReadonlyFiles;
@@ -72,12 +73,12 @@ export class Connector {
     }
     this.files=new ReadonlyFiles(config.projects,{},config.filePolicy?.allowAbsolutePaths===true,runtime?.protectedHomes);
     this.recent=new RecentSessions(backend,()=>this.store.state.activity||[],t=>this.threadSummary(t));
-    const authorizeContent=(thread:any)=>{const cwd=this.canonicalCwd(thread?.cwd);if(!cwd||(!this.config.sessionPolicy?.allowAllSharedSessions&&!this.projectFor(cwd)))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');return this.threadSummary({...thread,cwd});};
+    const authorizeContent=(thread:any)=>{this.requireNativeRoot(thread);const cwd=this.canonicalCwd(thread?.cwd);if(!cwd||(!this.config.sessionPolicy?.allowAllSharedSessions&&!this.projectFor(cwd)))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');return this.threadSummary({...thread,cwd});};
     this.content=new SessionContent(backend,authorizeContent);
     this.search=new SessionSearch(backend,authorizeContent);
     this.subscriptions=new SessionSubscriptions(store,backend,{
       policy:()=>resultPolicy(this.config),
-      validate:(thread,owner)=>{this.subscriptionActor(owner);const cwd=this.canonicalCwd(thread?.cwd);if(!cwd||(!this.config.sessionPolicy?.allowAllSharedSessions&&!this.projectFor(cwd)))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');return{cwd,project:this.projectFor(cwd)};},
+      validate:(thread,owner)=>{this.subscriptionActor(owner);this.requireNativeRoot(thread);const cwd=this.canonicalCwd(thread?.cwd);if(!cwd||(!this.config.sessionPolicy?.allowAllSharedSessions&&!this.projectFor(cwd)))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');return{cwd,project:this.projectFor(cwd)};},
       allow:sub=>{try{this.subscriptionActor(sub.owner);return this.validCwd(sub.cwd)&&(this.config.sessionPolicy?.allowAllSharedSessions===true||Boolean(this.projectFor(sub.cwd)));}catch{return false;}},
       output:(state,text,sub)=>{const start=state.outbox.length;this.sessionText(state,text,'',sub.owner);for(const out of state.outbox.slice(start)){out.subscriptionId=sub.id;out.notificationThreadId=sub.threadId;}}
     });
@@ -90,7 +91,7 @@ export class Connector {
           scope:createHash('sha256').update(stable([sub.cwd,sub.project,sub.owner.kind,sub.owner.userId,sub.owner.ts,sub.owner.eventId])).digest('hex'),
           slackIdentity:createHash('sha256').update(stable([this.selfUserId,this.selfBotId,this.store.state.dot.userId])).digest('hex')};
       },
-      validateThread:(sub,raw)=>{const thread=raw as {cwd?:string}|undefined,cwd=thread?.cwd&&this.canonicalCwd(thread.cwd);return !!cwd&&cwd===sub.cwd&&this.projectFor(cwd)===sub.project;},
+      validateThread:(sub,raw)=>{const thread=raw as {cwd?:string}|undefined,cwd=thread?.cwd&&this.canonicalCwd(thread.cwd);return classifyNativeThread(thread)==='root'&&!!cwd&&cwd===sub.cwd&&this.projectFor(cwd)===sub.project;},
       projectPath:alias=>this.canonicalCwd(this.config.projects[alias]!),
       adoptFresh:(thread,actor,epoch,record)=>this.subscriptions.adoptCreated(thread,actor,epoch,record),
       online:()=>runtime.slackReady(),
@@ -121,7 +122,7 @@ export class Connector {
           // A new connection does not prove continuity of the previous writer. Recover
           // observations read-only; require a fresh explicit attach before writes.
           if(this.runtime){for(const {principal:owner} of this.localEvents!.list().filter(row=>row.sessionId===s.id)){const p=this.runtime.principal(owner);if(p&&this.localBinding(p,s)&&(p.role==='operator'||p.servers?.includes(this.runtime.id)&&p.commands?.includes('session.events')))await this.localEvents!.recover({principal:owner,sessionId:s.id,project:s.project,threadId:s.threadId});}continue;}
-          await this.backend.rpc('thread/resume',{threadId:s.threadId,excludeTurns:true});this.attached.add(s.threadId);}catch{/* Capabilities/status exposes unavailable attachment; never starts a replacement thread. */}
+          const resumed=await this.backend.rpc('thread/resume',{threadId:s.threadId,excludeTurns:true});this.checkSessionThread(resumed.thread,s);this.attached.add(s.threadId);}catch{/* Capabilities/status exposes unavailable attachment; never starts a replacement thread. */}
       }
     }catch{/* Server remains usable for help/files/status. No independent fallback. */}
     this.nativeSharing?.tick();this.pump();this.flush();
@@ -320,10 +321,35 @@ export class Connector {
   private projectFor(cwd:string){return Object.entries(this.config.projects).find(([,root])=>this.within(root,cwd))?.[0];}
   private validCwd(cwd:unknown):cwd is string{return typeof cwd==='string'&&isAbsolute(cwd)&&!/[\x00-\x1f]/.test(cwd)&&!/[\\/]\.codex[\\/]sessions(?:[\\/]|$)/i.test(cwd);}
   private authorizedSession(s:Session){const cwd=s.cwd||this.config.projects[s.project];return (this.validChannel(s.channel)||Boolean(this.runtime&&!s.channel&&s.localOwners?.length))&&this.validCwd(cwd)&&(this.config.sessionPolicy?.allowAllSharedSessions===true||Boolean(this.projectFor(cwd)));}
-  private checkSessionThread(thread:any,s:Session){const cwd=s.cwd||this.config.projects[s.project];if(thread?.id!==s.threadId||!this.authorizedSession(s)||!this.validCwd(thread?.cwd)||(this.canonicalCwd(thread.cwd)||resolve(thread.cwd))!==(this.canonicalCwd(cwd!)||resolve(cwd!)))throw new ConnectorError('THREAD_PROJECT_MISMATCH');}
+  private requireNativeRoot(thread:any,acknowledgedThreadId?:string){
+    const kind=classifyNativeThread(thread,acknowledgedThreadId?{acknowledgedThreadId}:undefined);
+    if(kind!=='root'){
+      if(typeof thread?.id==='string'){this.verifiedRoots.delete(thread.id);this.attached.delete(thread.id);}
+      throw new ConnectorError(nativeRootError(kind));
+    }
+    // Only positive fresh metadata is cached, local process + backend epoch.
+    // This lets normal observation stay cheap without restoring old bindings
+    // based on a persisted thread ID or a title.
+    if(this.backend.connected){
+      if(this.verifiedRoots.size>=4096&&!this.verifiedRoots.has(thread.id))this.verifiedRoots.delete(this.verifiedRoots.keys().next().value!);
+      this.verifiedRoots.set(thread.id,this.backend.epoch);
+    }
+  }
+  private rootObserved(id:unknown){return typeof id==='string'&&this.backend.connected&&this.verifiedRoots.get(id)===this.backend.epoch;}
+  private async canObserveRoot(id:unknown,epoch:string){
+    if(this.rootObserved(id))return this.backend.epoch===epoch;
+    const binding=this.store.state.sessions.find(s=>s.threadId===id&&this.authorizedSession(s));
+    if(!binding||!this.backend.connected||this.backend.epoch!==epoch)return false;
+    try{await this.metadata(binding);return this.rootObserved(id)&&this.backend.epoch===epoch;}catch{return false;}
+  }
+  private checkSessionThread(thread:any,s:Session){
+    const cwd=s.cwd||this.config.projects[s.project];
+    if(thread?.id!==s.threadId||!this.authorizedSession(s)||!this.validCwd(thread?.cwd)||(this.canonicalCwd(thread.cwd)||resolve(thread.cwd))!==(this.canonicalCwd(cwd!)||resolve(cwd!)))throw new ConnectorError('THREAD_PROJECT_MISMATCH');
+    this.requireNativeRoot(thread);
+  }
   private project(alias:unknown){if(typeof alias!=='string'||!Object.hasOwn(this.config.projects,alias))throw new ConnectorError('PROJECT_NOT_ALLOWED');return this.config.projects[alias]!;}
   private checkProject(thread:any,alias:string){if(!this.validCwd(thread?.cwd)||!this.within(this.project(alias),thread.cwd))throw new ConnectorError('THREAD_PROJECT_MISMATCH');}
-  private async metadata(s:Session){const r=await this.backend.rpc('thread/read',{threadId:s.threadId,includeTurns:false});this.checkSessionThread(r.thread,s);return r.thread;}
+  private async metadata(s:Session){const epoch=this.backend.epoch,r=await this.backend.rpc('thread/read',{threadId:s.threadId,includeTurns:false});if(!this.backend.connected||this.backend.epoch!==epoch)throw new ConnectorError('SERVER_UNAVAILABLE');this.checkSessionThread(r.thread,s);return r.thread;}
   private threadSummary(t:any){const project=this.validCwd(t.cwd)?this.projectFor(t.cwd):undefined,allowed=this.validCwd(t.cwd)&&(Boolean(project)||this.config.sessionPolicy?.allowAllSharedSessions===true);return{id:t.id,name:typeof t.name==='string'?t.name.slice(0,200):null,cwd:typeof t.cwd==='string'?t.cwd.slice(0,1024):null,project:project||null,manageable:allowed&&t.canAcceptDirectInput===true,reason:!allowed?'SESSION_SCOPE_NOT_ALLOWED':t.canAcceptDirectInput===false?'DIRECT_INPUT_UNAVAILABLE':t.canAcceptDirectInput!==true?'ATTACH_TO_CHECK_CAPABILITY':null,canAcceptDirectInput:t.canAcceptDirectInput??null,status:{type:t.status?.type||'unknown'},model:typeof t.model==='string'?t.model.slice(0,100):null,reasoningEffort:t.reasoningEffort??null,source:typeof t.source==='string'?t.source:'structured-source',connectorSessionId:this.store.state.sessions.find(s=>s.threadId===t.id)?.id||null};}
   private safeSlackMetadata(raw:any){
     return {name:null,cwd:null,model:null,reasoningEffort:null,source:'shared',
@@ -513,7 +539,7 @@ export class Connector {
     const s=this.session(p.sessionId);
     if(this.runtime&&w.source.kind!=='local'&&!s.channel)throw new ConnectorError('SLACK_EXPLICIT_BINDING_REQUIRED');
     if(c==='session.delivery')return this.messageDelivery(w,s);
-    if(c==='session.reply'){if(this.runtime&&(!s.channel||!this.runtime.slackReady()))throw new ConnectorError('SLACK_EXPLICIT_BINDING_UNAVAILABLE');this.store.transaction(state=>this.sessionText(state,p.text,s.id,w.source.kind==='local'&&this.runtime?undefined:w.source));return{sessionId:s.id,queued:true};}
+    if(c==='session.reply'){await this.metadata(s);if(this.runtime&&(!s.channel||!this.runtime.slackReady()))throw new ConnectorError('SLACK_EXPLICIT_BINDING_UNAVAILABLE');this.store.transaction(state=>this.sessionText(state,p.text,s.id,w.source.kind==='local'&&this.runtime?undefined:w.source));return{sessionId:s.id,queued:true};}
     if(c==='session.info'){
       const meta=await this.metadata(s),protectedSlack=slackCommand;
       const turns=await this.backend.rpc('thread/turns/list',{threadId:s.threadId,limit:3,itemsView:'notLoaded',sortDirection:'desc'});
@@ -573,35 +599,69 @@ export class Connector {
       }
       if(cursor.storedDone&&cursor.stored||cursor.loadedDone&&cursor.loaded||cursor.storedDone&&cursor.loadedDone)throw Error();
     }catch{throw new ConnectorError('INVALID_CURSOR');}}
-    const stored=(view==='loaded'||view==='active'||cursor.storedDone)?{data:[],nextCursor:null}:await this.backend.rpc('thread/list',{limit,cursor:cursor.stored,useStateDbOnly:true});
-    const loaded=(view==='history'||cursor.loadedDone)?{data:[],nextCursor:null}:await this.backend.rpc('thread/loaded/list',{limit,cursor:cursor.loaded});
-    for(const [page,previous] of [[stored,cursor.stored],[loaded,cursor.loaded]] as const){
-      if(!page||!Array.isArray(page.data)||page.data.length>limit||page.nextCursor!=null&&(!validBackendCursor(page.nextCursor)||page.nextCursor===previous))throw new ConnectorError('INVALID_SESSION_PAGE');
-    }
-    const byId=new Map<string,{thread:any;loaded:boolean|null;sources:string[];unavailable?:boolean}>();
+    const byId=new Map<string,{thread:any;loaded:boolean|null;sources:string[]}>();
     const visible=(t:any)=>!roots||this.validCwd(t?.cwd)&&roots.some(root=>this.within(root,t.cwd));
-    for(const t of stored.data){if(!t||typeof t.id!=='string'||!t.id||t.id.length>512)throw new ConnectorError('INVALID_SESSION_PAGE');if(visible(t))byId.set(t.id,{thread:t,loaded:null,sources:['indexed-history']});}
-    const unresolvedLoadedIds:string[]=[],unknownLoadedIds=new Set<string>();
-    for(const id of new Set(loaded.data)){
-      if(typeof id!=='string'||!id||id.length>512)throw new ConnectorError('INVALID_SESSION_PAGE');
-      const previous=byId.get(id),sources=[...new Set([...(previous?.sources||[]),'loaded'])];
-      try{
-        const r=await this.backend.rpc('thread/read',{threadId:id,includeTurns:false});if(!r?.thread||r.thread.id!==id)throw Error('Invalid thread metadata');
-        if(!r.thread.status?.type||r.thread.status.type==='unknown')unknownLoadedIds.add(id);
-        if(visible(r.thread)&&(view!=='active'||r.thread.status?.type==='active'))byId.set(id,{thread:r.thread,loaded:true,sources});else byId.delete(id);
-      }catch{
-        unresolvedLoadedIds.push(id);unknownLoadedIds.add(id);
-        if(view!=='active'&&(!roots||previous))byId.set(id,{thread:previous?.thread||{id},loaded:true,sources,unavailable:true});
+    const unresolvedLoadedIds=new Set<string>(),unknownLoadedIds=new Set<string>(),skippedChildIds=new Set<string>(),unverifiedIds=new Set<string>();
+    const classify=(thread:any)=>{
+      const kind=classifyNativeThread(thread);
+      if(kind==='child')skippedChildIds.add(thread.id);
+      if(kind==='unknown')unverifiedIds.add(thread.id);
+      return kind;
+    };
+    // Keep each raw upstream cursor. Request only remaining capacity so no
+    // admitted root is discarded if children filled previous pages. Each
+    // source is bounded to four pages and at most four times the row limit.
+    const scan=async(mode:'stored'|'loaded',start:string|undefined,done:boolean)=>{
+      const seen=new Set<string>(),accepted=new Set<string>(),visited=new Set<string>();
+      if(start)visited.add(start);
+      let nextCursor:string|undefined=start,scanned=0;
+      if(done)return {nextCursor:undefined,scanned};
+      for(let i=0;i<4&&accepted.size<limit;i++){
+        const step=limit-accepted.size;
+        const page=mode==='stored'?await this.backend.rpc('thread/list',{limit:step,cursor:nextCursor,useStateDbOnly:true}):
+          await this.backend.rpc('thread/loaded/list',{limit:step,cursor:nextCursor});
+        if(!page||!Array.isArray(page.data)||page.data.length>step||page.nextCursor!=null&&(!validBackendCursor(page.nextCursor)||visited.has(page.nextCursor)))throw new ConnectorError('INVALID_SESSION_PAGE');
+        scanned+=page.data.length;
+        for(const entry of page.data){
+          const id=mode==='stored'?entry?.id:entry;
+          if(typeof id!=='string'||!id||id.length>512)throw new ConnectorError('INVALID_SESSION_PAGE');
+          if(seen.has(id))continue;
+          seen.add(id);
+          if(mode==='stored'){
+            if(classify(entry)==='root'&&visible(entry)){byId.set(id,{thread:entry,loaded:null,sources:['indexed-history']});accepted.add(id);}
+          }else{
+            const previous=byId.get(id);
+            try{
+              const r=await this.backend.rpc('thread/read',{threadId:id,includeTurns:false});
+              if(!r?.thread||r.thread.id!==id)throw Error('Invalid thread metadata');
+              if(classify(r.thread)!=='root'){byId.delete(id);unknownLoadedIds.add(id);continue;}
+              if(!r.thread.status?.type||r.thread.status.type==='unknown')unknownLoadedIds.add(id);
+              if(visible(r.thread)&&(view!=='active'||r.thread.status?.type==='active')){
+                byId.set(id,{thread:r.thread,loaded:true,sources:[...new Set([...(previous?.sources||[]),'loaded'])]});accepted.add(id);
+              }else byId.delete(id);
+            }catch{
+              unresolvedLoadedIds.add(id);unknownLoadedIds.add(id);
+              // No fabricated {id} row. A separate successfully indexed
+              // root, if present, remains stored-only with loaded unknown.
+            }
+          }
+        }
+        nextCursor=page.nextCursor??undefined;
+        if(!nextCursor)break;
+        visited.add(nextCursor);
       }
-    }
+      return {nextCursor,scanned};
+    };
+    const stored=await scan('stored',cursor.stored,view==='loaded'||view==='active'||cursor.storedDone===true);
+    const loaded=await scan('loaded',cursor.loaded,view==='history'||cursor.loadedDone===true);
     const next=stored.nextCursor||loaded.nextCursor?Buffer.from(JSON.stringify({v:2,view,project,scope,server:this.runtime?.id,stored:stored.nextCursor||undefined,loaded:loaded.nextCursor||undefined,storedDone:!stored.nextCursor,loadedDone:!loaded.nextCursor})).toString('base64url'):null;
     if(next&&next.length>2048)throw new ConnectorError('INVALID_SESSION_PAGE');
     const sessions=[...byId.values()].map(row=>{
       const summary=this.threadSummary(row.thread),binding=this.store.state.sessions.find(s=>s.threadId===summary.id&&this.authorizedSession(s));
-      return{...summary,...(this.runtime&&source&&source.kind!=='local'?{...this.safeSlackMetadata(summary),connectorSessionId:binding?.channel?summary.connectorSessionId:null}:{}),...(scope!==undefined&&!binding?.localOwners?.includes(scope)?{connectorSessionId:null}:{}),...(row.unavailable?{manageable:null,reason:'METADATA_UNAVAILABLE',canAcceptDirectInput:null,status:{type:'unknown'}}:{}),loaded:row.loaded,discoverySources:row.sources,binding:binding&&scope===undefined&&(!source||source.kind==='local'||!!binding.channel)?{channel:binding.channel,threadTs:binding.threadTs}:null};
+      return{...summary,...(this.runtime&&source&&source.kind!=='local'?{...this.safeSlackMetadata(summary),connectorSessionId:binding?.channel?summary.connectorSessionId:null}:{}),...(scope!==undefined&&!binding?.localOwners?.includes(scope)?{connectorSessionId:null}:{}),loaded:row.loaded,discoverySources:row.sources,binding:binding&&scope===undefined&&(!source||source.kind==='local'||!!binding.channel)?{channel:binding.channel,threadTs:binding.threadTs}:null};
     });
     const sources=view==='all'?'Current shared-daemon loaded IDs plus indexed interactive history (default thread/list sources)':view==='history'?'Indexed interactive history (default thread/list sources)':view==='active'?'Current shared-daemon loaded IDs with freshly read active status':'Current shared-daemon loaded IDs';
-    return{sessions,nextCursor:next,project,unresolvedLoadedIds:allowedProjects?[]:unresolvedLoadedIds,pageLimitPerSource:limit,view,returnedCount:sessions.length,scanned:{loaded:loaded.data.length,history:stored.data.length},unknownLoadedCount:unknownLoadedIds.size,hasMore:next!==null,scope:`${sources}; one bounded page per selected source, not a global session count or complete enumeration. Filters may return an empty page with a continuation cursor. Stored-only rows do not prove unloaded status. Metadata failures remain unknown. No resume, content preload, filesystem history scan, or control-policy filtering. Separate CODEX_HOME, standalone --no-daemon and other servers are not guaranteed visible.`};
+    return{sessions,nextCursor:next,project,unresolvedLoadedIds:allowedProjects?[]:[...unresolvedLoadedIds],lineageDiagnostics:{childThreads:skippedChildIds.size,unverifiedThreads:unverifiedIds.size,unreadableLoaded:unresolvedLoadedIds.size},pageLimitPerSource:limit,view,returnedCount:sessions.length,scanned:{loaded:loaded.scanned,history:stored.scanned},unknownLoadedCount:unknownLoadedIds.size,hasMore:next!==null,scope:`${sources}; root sessions only; up to four upstream pages per selected source, not a global session count or complete enumeration. Filters may return an empty page with a continuation cursor. Stored-only rows do not prove unloaded status. Children, unverified lineage and unreadable loaded IDs are diagnostics, not ordinary session rows. No resume, content preload, filesystem history scan, or control-policy filtering. Separate CODEX_HOME, standalone --no-daemon and other servers are not guaranteed visible.`};
   }
 
   private async attachOrCreate(p:any,create:boolean,work:Work){
@@ -624,18 +684,20 @@ export class Connector {
         }
         created=true;thread=reply?.thread;alias=p.project;
         if(!this.backend.connected||this.backend.epoch!==epoch||!deliveryId(thread?.id))throw new ConnectorError('INVALID_THREAD_METADATA');
+        this.requireNativeRoot(thread,thread.id);
         this.checkProject(thread,alias);
         if(this.canonicalCwd(thread.cwd)!==this.canonicalCwd(cwd))throw new ConnectorError('THREAD_PROJECT_MISMATCH');
       }
-      else{thread=(await this.backend.rpc('thread/read',{threadId:p.threadId,includeTurns:false})).thread;if(!this.validCwd(thread?.cwd))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');if(p.project){this.checkProject(thread,p.project);alias=p.project;}else{const known=this.projectFor(thread.cwd);if(!known&&!this.config.sessionPolicy?.allowAllSharedSessions)throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');alias=known||'@shared';}}
+      else{const epoch=this.backend.epoch;thread=(await this.backend.rpc('thread/read',{threadId:p.threadId,includeTurns:false})).thread;if(!this.backend.connected||this.backend.epoch!==epoch||thread?.id!==p.threadId)throw new ConnectorError('INVALID_THREAD_METADATA');this.requireNativeRoot(thread);if(!this.validCwd(thread?.cwd))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');if(p.project){this.checkProject(thread,p.project);alias=p.project;}else{const known=this.projectFor(thread.cwd);if(!known&&!this.config.sessionPolicy?.allowAllSharedSessions)throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');alias=known||'@shared';}}
       if(!deliveryId(thread?.id)||(!create&&p.threadId!==thread.id))throw new ConnectorError('INVALID_THREAD_METADATA');
       this.reauthorize(work);
       if(this.runtime&&source.kind==='local'&&!this.localProject(this.runtime.principal(source.userId)!,alias))throw new ConnectorError('LOCAL_SCOPE_DENIED');
       s=this.store.state.sessions.find(s=>s.threadId===thread.id);
       if(s){if(create)throw new ConnectorError('THREAD_ID_ALREADY_BOUND');this.checkSessionThread(thread,s);if(this.runtime&&source.kind==='local'&&(s.project!==alias||!s.cwd||!this.within(this.config.projects[alias]!,s.cwd)))throw new ConnectorError('LOCAL_SCOPE_DENIED');}
       if(!create){
-        const initial=thread;thread=(await this.backend.rpc('thread/resume',{threadId:initial.id,excludeTurns:true})).thread;
-        if(thread?.id!==initial.id||this.canonicalCwd(thread?.cwd)!==this.canonicalCwd(initial.cwd))throw new ConnectorError('THREAD_PROJECT_MISMATCH');
+        const initial=thread,epoch=this.backend.epoch;thread=(await this.backend.rpc('thread/resume',{threadId:initial.id,excludeTurns:true})).thread;
+        if(!this.backend.connected||this.backend.epoch!==epoch||thread?.id!==initial.id||this.canonicalCwd(thread?.cwd)!==this.canonicalCwd(initial.cwd))throw new ConnectorError('THREAD_PROJECT_MISMATCH');
+        this.requireNativeRoot(thread);
         this.reauthorize(work);
         s=this.store.state.sessions.find(s=>s.threadId===thread.id);
         if(s)this.checkSessionThread(thread,s);
@@ -653,6 +715,7 @@ export class Connector {
   private async notification(method:string,p:any,epoch:string){
     if(epoch!==this.backend.epoch||!this.backend.connected)return;
     if(['turn/started','turn/completed','item/started','item/completed'].includes(method)){const activity=recordActivity(this.store.state.activity,method,p,Date.now());if(activity)this.store.transaction(s=>{s.activity=activity;});}
+    if(method!=='serverRequest/resolved'&&!await this.canObserveRoot(p?.threadId,epoch))return;
     if(['turn/started','turn/completed','item/started','item/completed'].includes(method))this.observeDelivery(method,p);
     if(this.localEvents){
       this.localEvents.observe(method,p,epoch);
@@ -805,6 +868,7 @@ export class Connector {
   }
   private async serverRequest(r:any){
     if(r.epoch!==this.backend.epoch||!this.backend.connected||!['string','number'].includes(typeof r.id))return;
+    if(!await this.canObserveRoot(r.params?.threadId,r.epoch))return;
     this.localEvents?.observeRequest(r);
     if(this.runtime){
       if(this.runtime.slackReady())this.scopedServerRequest(r);
@@ -905,7 +969,7 @@ export class Connector {
     return{requestId:pending.id,status:'submitted; awaiting server resolution notification'};
   }
   private disconnected(epoch:string){
-    this.localEvents?.markDisconnected();this.attached.clear();this.items.clear();this.slackInputs.clear();this.deliveryTurns.clear();this.store.transaction(s=>{for(const w of s.work)if(w.messageDelivery)w.messageDelivery.observationGap=true;for(const p of s.pending)if(p.epoch===epoch&&(['pending','responding'].includes(p.status)||p.status==='local-required'&&!!p.slackOwner))p.status='stale';});
+    this.localEvents?.markDisconnected();this.attached.clear();this.verifiedRoots.clear();this.items.clear();this.slackInputs.clear();this.deliveryTurns.clear();this.store.transaction(s=>{for(const w of s.work)if(w.messageDelivery)w.messageDelivery.observationGap=true;for(const p of s.pending)if(p.epoch===epoch&&(['pending','responding'].includes(p.status)||p.status==='local-required'&&!!p.slackOwner))p.status='stale';});
   }
   private sameCurrentPending(original:Pending){
     if(!this.runtime?.slackReady()||this.closing||!this.backend.connected||this.backend.epoch!==original.epoch||!original.slackOwner)return;
@@ -958,6 +1022,7 @@ export class Connector {
     if(!this.scopeMatches(o,state)||o.root||!this.validChannel(o.channel)||containsSensitiveContent(o.text))return;
     const session=o.sessionId?state.sessions.find(s=>s.id===o.sessionId):undefined;
     if(o.sessionId&&(!session||!this.authorizedSession(session)))return;
+    if(o.notificationThreadId&&!this.rootObserved(o.notificationThreadId))return;
     const threadTs=o.threadTs||(!o.origin?session?.threadTs:undefined);
     if(!this.validTimestamp(threadTs))return;
     if(o.subscriptionId&&!this.subscriptions.deliveryAllowed(o.subscriptionId)||o.notificationThreadId&&!o.subscriptionId&&this.subscriptions.hasExplicitDestination(o.notificationThreadId,o.channel,threadTs))return;

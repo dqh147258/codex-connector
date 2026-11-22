@@ -9,14 +9,14 @@ import { parseConfig } from '../src/config.js';
 import { Runtime } from '../src/runtime.js';
 import { apiServer } from '../src/server.js';
 import type { SlackPort } from '../src/types.js';
-import { FakeBackend,event,request,waitFor } from './helpers.js';
+import { FakeBackend,FakeThreads,rootThread,event,request,waitFor } from './helpers.js';
 
 const ORIGINAL='00000000-1111-7111-8111-100000000001', FRESH='00000000-1111-7111-8111-200000000001';
 const ROOT='101.2', OTHER='201.3', OP='c'.repeat(48), AGENT='d'.repeat(48), BIRTH=1763800000;
 const asTurn=(id:string,status:string,items:any[]=[])=>({id,status,itemsView:'full',items});
 const reply=(id:string,text:string,phase='final_answer')=>({id,type:'agentMessage',text,phase});
 function deferred<T=void>(){let resolve!:(v:T)=>void;const promise=new Promise<T>(r=>{resolve=r;});return{resolve,promise};}
-interface Ledgers { threads:Map<string,any>; turns:Map<string,any[]>; createCount:number }
+interface Ledgers { threads:FakeThreads; turns:Map<string,any[]>; createCount:number }
 class NativeBackend extends FakeBackend{
   onStart?:(thread:any)=>Promise<any>;
   beforeRead?:(threadId:string)=>Promise<void>;
@@ -31,7 +31,7 @@ class NativeBackend extends FakeBackend{
     if(method==='thread/start'){
       this.calls.push({method,params:p});
       const n=++this.ledger.createCount,id=n===1?FRESH:randomUUID().replace(/^(.{14})4/,(_m,head)=>head+'7');
-      const thread={id,sessionId:id,cwd:p.cwd,createdAt:BIRTH+n,status:{type:'idle'},canAcceptDirectInput:true,turns:[],forkedFromId:null,parentThreadId:null,ephemeral:false};
+      const thread=rootThread(id,p.cwd,{source:'appServer',createdAt:BIRTH+n,status:{type:'idle'},canAcceptDirectInput:true,turns:[],ephemeral:false});
       this.threads.set(id,thread);this.ledger.turns.set(id,[]);
       return this.onStart?this.onStart(structuredClone(thread)):{thread:structuredClone(thread)};
     }
@@ -91,7 +91,7 @@ async function fixture(n=1){
     const r=new Runtime(cfg,join(directory,'connector'),slack,undefined,(_p,id)=>{
       let data=stores.get(id);
       if(!data){
-        data={threads:new Map([[ORIGINAL,{id:ORIGINAL,createdAt:BIRTH,cwd:project,status:{type:'idle'},canAcceptDirectInput:true}]]),
+        data={threads:new FakeThreads([[ORIGINAL,rootThread(ORIGINAL,project,{createdAt:BIRTH,status:{type:'idle'},canAcceptDirectInput:true})]]),
           turns:new Map([[ORIGINAL,[asTurn('old-history','completed',[reply('old-item','Original private history.')])]]]),createCount:0};
         stores.set(id,data);
       }
@@ -371,4 +371,49 @@ test('legacy snapshot authorization cannot resume and scoped loopback credential
     f.backends.get('default')!.publish(FRESH,'old-policy',[reply('old-activation','An older cutoff policy does not grant this body.')]);
     await sleep(30);never(f,'older cutoff policy');
   }finally{await new Promise<void>(r=>{api.close(()=>r());api.closeAllConnections();});await f.close();}
+});
+
+
+test('dedicated sharing preview reclassifies the observed source; a child may not authorize new dedicated creation',async()=>{
+  const f=await fixture();try{
+    await f.start();const source=await f.subscribe(),b=f.backends.get('default')!;
+    b.threads.get(ORIGINAL).parentThreadId='other-root';
+    await assert.rejects(f.preview(source),/NATIVE_SHARE_THREAD_CHANGED/);
+    assert.equal(b.calls.filter(c=>c.method==='thread/start').length,0);
+    assert.equal(f.runtime.core('default').store.state.nativeShares?.length??0,0);
+  }finally{await f.close();}
+});
+
+test('a positive thread/start acknowledgement carrying child lineage cannot establish Slack sharing',async()=>{
+  const f=await fixture();try{
+    await f.start();const source=await f.subscribe(),b=f.backends.get('default')!;
+    b.onStart=async thread=>{
+      const child={...thread,source:{subAgent:{other:'native-child'}}};
+      b.threads.raw(thread.id,child);return {thread:child};
+    };
+    const result=await f.create(source);
+    assert.equal(result.status,'uncertain');assert.equal(result.newSubscriptionId,null);
+    assert.ok(!f.runtime.core('default').store.state.nativeShares?.some(row=>row.nativeThreadId===FRESH));
+    b.publish(FRESH,'child-turn',[reply('child-text','Dedicated-child body must stay private.')]);
+    await sleep(35);
+    never(f,'Dedicated-child body');
+    assert.equal(b.calls.filter(c=>c.method==='thread/start').length,1);
+    assert.ok(!b.calls.some(c=>['thread/resume','thread/turns/list','thread/items/list'].includes(c.method)&&c.params.threadId===FRESH));
+  }finally{await f.close();}
+});
+
+test('an existing dedicated grant may not resume observation after root lineage becomes unverified',async()=>{
+  const f=await fixture();try{
+    await f.start();const source=await f.subscribe(),created=await f.create(source);
+    assert.equal(created.sharing?.status,'active');const id=created.newSubscriptionId!;
+    f.stores.get('default')!.threads.get(FRESH).source='unknown';
+    await f.restart();
+    const b=f.backends.get('default')!;
+    assert.notEqual(f.inspect(id).status,'active');
+    assert.ok(!b.calls.some(c=>c.method==='thread/resume'&&c.params.threadId===FRESH));
+    b.publish(FRESH,'unverified-turn',[reply('unverified','Unknown lineage body should stay private.')]);
+    await sleep(35);
+    never(f,'Unknown lineage body');
+    assert.ok(!b.calls.some(c=>['thread/turns/list','thread/items/list'].includes(c.method)&&c.params.threadId===FRESH));
+  }finally{await f.close();}
 });

@@ -17,7 +17,7 @@ test('search protocol has explicit defaults, bounded terms, read permission and 
 test('Slack search produces compact hit index and scoped result.next without rediscovering or losing matches',async()=>{
   const f=fixture();try{
     await f.connector.initialize();f.backend.calls=[];
-    f.backend.threads.set('recent',{id:'recent',cwd:f.dir,name:'Recent task',status:{type:'idle'},updatedAt:20,createdAt:10});
+    f.backend.threads.set('recent',{id:'recent',source:'cli',parentThreadId:null,cwd:f.dir,name:'Recent task',status:{type:'idle'},updatedAt:20,createdAt:10});
     const original=f.backend.rpc.bind(f.backend),rows=Array.from({length:3},(_,i)=>message(i+1));
     f.backend.rpc=async(method,p)=>{
       if(method==='thread/items/list'){f.backend.calls.push({method,params:p});const start=p.cursor?Number(p.cursor):0;return{data:rows.slice(start,start+p.limit),nextCursor:start+p.limit<rows.length?String(start+p.limit):null};}
@@ -46,7 +46,7 @@ test('Slack search produces compact hit index and scoped result.next without red
 test('search rechecks the authenticated actor and policy before storing result or sending text',async()=>{
   for(const revoke of ['actor','policy']){
     const f=fixture();try{
-      await f.connector.initialize();f.backend.threads.set('recent',{id:'recent',cwd:f.dir,status:{type:'idle'}});
+      await f.connector.initialize();f.backend.threads.set('recent',{id:'recent',source:'cli',parentThreadId:null,cwd:f.dir,status:{type:'idle'}});
       const original=f.backend.rpc.bind(f.backend);
       f.backend.rpc=async(method,p)=>{if(method==='thread/items/list'){
         if(revoke==='actor')f.config.slack.trustedBots=[];else f.config.filePolicy={allowAbsolutePaths:true};

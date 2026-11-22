@@ -105,7 +105,7 @@ node dist/src/cli.js help --command session.create
 
 ## 3. 绑定已有默认会话
 
-1. `session.list {"limit":20}` 分别分页读取共享 daemon 当前 loaded ID 与已索引交互历史（不扫描会话文件），返回 `manageable` / `reason`；可加 `project` 过滤。每来源最多 `limit` 条，合并后可达两倍；有 `nextCursor` 就继续分页，不能把第一页当全部。`loaded:true` 是读取时已加载观察，stored-only 为未知而非断言未加载；元数据不可读仍保留 ID，并标记 `METADATA_UNAVAILABLE`。桌面「会话列表」可只读刷新/逐页加载、去重，不自动恢复或读取内容。
+1. `session.list {"limit":20}` 分别分页读取共享 daemon 当前 loaded ID 与已索引交互历史（不扫描会话文件），返回 `manageable` / `reason`；可加 `project` 过滤。每来源最多返回 `limit` 个已核实的主会话，合并后可达两倍；为跳过子 Agent，每来源最多检查四个上游页。有 `nextCursor` 就继续分页，不能把第一页当全部。`loaded:true` 是读取时已加载观察，stored-only 为未知而非断言未加载；子 Agent、血缘未核实和读取失败只计入诊断，不作为普通会话出现。桌面「会话列表」可只读刷新/逐页加载、去重，不自动恢复或读取内容。
 2. 选定明确的 `threadId`，发送 `session.attach {"threadId":"...","project":"demo"}`。对于项目外会话，先由操作者在本机启用 `sessionPolicy.allowAllSharedSessions` 并重启，再用 `session.attach {"threadId":"..."}`；无需把外部目录加入文件工具 roots。
 3. 返回 `sessionId`。首次 Slack 绑定使用发起命令的原 Thread（顶层命令用该消息自身作为根），并在其中 mention dot；已有绑定不会移动。本机绑定不需要 Slack 目标；只有操作者明确要求绑定到 Slack 时才给出已配置输出频道内可读取的 `outputThreadTs`。
 4. 用同一 `sessionId` 发送后续命令：
