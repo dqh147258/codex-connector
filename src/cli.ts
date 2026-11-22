@@ -95,7 +95,7 @@ command --name NAME [--params JSON | --params-file FILE|-] [--server ID] [--id R
 receipt --work-id ID [--server ID]
 events --session-id ID [--server ID] [--cursor CURSOR] [--wait-ms 0..30000] [--limit 1..100]
 unwatch --session-id ID --subscription-id ID [--server ID]
-native-share --operation inspect|grant|revoke --server CANONICAL_ID --subscription-id ID (local operator; grant requires interactive consent)
+native-share --operation inspect|grant|revoke --server CANONICAL_ID --subscription-id ID (local operator; grant requires interactive consent to the first verified native turn boundary)
 mcp (stdio; use a scoped CONNECTOR_TOKEN for agents)
 Local clients may use --port PORT --target INSTANCE with CONNECTOR_TOKEN instead of accessing operator files.
 envelope --name NAME --params JSON [--server ID] [--id ID]

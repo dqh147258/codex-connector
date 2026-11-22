@@ -6,7 +6,9 @@ import type { Store } from './store.js';
 import { projectNativeMessage, projectNativeItem, projectNativeInput, renderNativeProjection, type NativeProjection } from './shared-native-content.js';
 
 export const nativeOutboxMarker = '[Native content record: matching Connector version and grant required]';
-export const sharingDisclosure = 'Share future eligible Codex replies and questions with readers of this exact Slack thread. Input entered locally or through another client can affect the shared replies. No earlier or currently running turn is shared. Confirmation alone does not open delivery: wait until the verified native boundary is active. Answer requests in the original Codex app.';
+export const nativeBoundaryPolicy = 'first-verified-native-frontier-v1' as const;
+const currentConsentVersion = 3 as const;
+export const sharingDisclosure = 'Share eligible Codex replies and ordinary questions with readers of this exact Slack thread. After your confirmation, sharing starts strictly after the first verified native turn boundary. Turns already present or running at that boundary are not shared. Turns starting after it may be delivered later even if they begin or finish while Connector still says setting up (pending). No messages are sent until the boundary is verified and delivery opens. Input entered locally or through another client can influence shared replies. Answer questions in the original Codex app.';
 export class NativeShareError extends Error {}
 interface Route {
   serverId: string; backendFingerprint: string; workspaceId: string; channel: string; rootThreadTs: string;
@@ -20,7 +22,8 @@ export interface NativeShare extends Route {
   frontier: string | null;
   grantedAt: string;
   state: 'pending' | 'active' | 'retired';
-  consentVersion?: 2;
+  consentVersion?: 2 | 3;
+  boundaryPolicy?: typeof nativeBoundaryPolicy;
   activatedAt?: string;
   // Only opaque item and original connection hashes, never a tool body.
   questionDeny?: {item:string;connection:string}[];
@@ -51,6 +54,10 @@ const cursor = (x: unknown): x is string | null => x===null||typeof x==='string'
 const fail = (reason: string): never => {throw new NativeShareError(reason);};
 const validRequest = (x: unknown): x is string | number => deliveryId(x)||typeof x==='number'&&Number.isSafeInteger(x);
 const reqKey = (r: {epoch: string; rpcId: string|number}) => JSON.stringify([r.epoch,r.rpcId]);
+function hasCurrentConsent(row:NativeShare) {
+  return row.consentVersion===currentConsentVersion&&row.boundaryPolicy===nativeBoundaryPolicy;
+}
+const phraseFor=(r:Route)=>'SHARE AFTER NATIVE CUT '+r.nativeThreadId+' TO '+r.workspaceId+'/'+r.channel+'/'+r.rootThreadTs;
 const equalRoute = (a: Route,b: Route) => a.serverId===b.serverId&&a.backendFingerprint===b.backendFingerprint&&a.workspaceId===b.workspaceId&&a.channel===b.channel&&a.rootThreadTs===b.rootThreadTs&&a.subscriptionId===b.subscriptionId&&a.nativeThreadId===b.nativeThreadId&&a.policy===b.policy&&a.slackIdentity===b.slackIdentity&&a.scope===b.scope;
 const dedupe = (grant: string, p: NativeProjection) => hash([grant,p.kind,p.turnId,p.itemId]);
 const parts = (p: NativeProjection): string[] => {
@@ -85,21 +92,22 @@ export function validateNativeShareState(s:State){
     !Number.isSafeInteger(r.nativeCreatedAt)||r.nativeCreatedAt<=0||typeof r.grantedAt!=='string'||!Number.isFinite(Date.parse(r.grantedAt))||
     r.anchor!==null&&!deliveryId(r.anchor)||r.frontier!==null&&!deliveryId(r.frontier)||r.anchor!==null&&r.frontier===null||
     !['active','pending','retired'].includes(r.state)||!Array.isArray(r.seenActive)||r.seenActive.length>MAX_ACTIVE_KEYS||!r.seenActive.every(digest)||
-    r.consentVersion!==undefined&&r.consentVersion!==2||
-    r.state==='pending'&&(r.consentVersion!==2||r.anchor!==null||r.frontier!==null||r.activatedAt!==undefined||r.seenActive.length!==0)||
-    r.state==='active'&&r.consentVersion===2&&(typeof r.activatedAt!=='string'||!Number.isFinite(Date.parse(r.activatedAt)))||
+    r.consentVersion!==undefined&&r.consentVersion!==2&&r.consentVersion!==currentConsentVersion||
+    (r.consentVersion===currentConsentVersion?!hasCurrentConsent(r):r.boundaryPolicy!==undefined)||
+    r.state==='pending'&&(r.consentVersion===undefined||r.anchor!==null||r.frontier!==null||r.activatedAt!==undefined||r.seenActive.length!==0)||
+    r.state==='active'&&r.consentVersion!==undefined&&(typeof r.activatedAt!=='string'||!Number.isFinite(Date.parse(r.activatedAt)))||
     r.questionDenySaturated!==undefined&&r.questionDenySaturated!==true||
     r.questionDeny!==undefined&&(!Array.isArray(r.questionDeny)||r.questionDeny.length>MAX_QUESTION_DENIALS||
       r.questionDeny.some(e=>!e||!digest(e.item)||!digest(e.connection))||new Set(r.questionDeny.map(e=>e.item)).size!==r.questionDeny.length))||
     new Set(list.map(r=>r.id)).size!==list.length||new Set(list.map(r=>r.subscriptionId)).size!==list.length)throw new NativeShareError('NATIVE_SHARE_STATE_INVALID');
 }
-// Earlier candidates had no durable pre-anchor gate. Keep their status for
-// audit, but never activate their existing grants or restore queued content.
+// Earlier candidates did not elicit this exact native-cut scope. Keep their
+// status for audit; never activate their grants or restore queued content.
 export function retirePreGateSharing(s:State) {
-  for(const grant of s.nativeShares??[])if(grant.consentVersion!==2&&grant.state!=='retired'){
+  for(const grant of s.nativeShares??[])if(!hasCurrentConsent(grant)&&grant.state!=='retired'){
     grant.state='retired';grant.reason='NATIVE_SHARE_EXPLICIT_REAUTHORIZATION_REQUIRED';
   }
-  for(const o of s.outbox)if(o.nativeShare&&!s.nativeShares?.some(r=>r.id===o.nativeShare!.grantId&&r.consentVersion===2)&&o.status==='queued'){
+  for(const o of s.outbox)if(o.nativeShare&&!s.nativeShares?.some(r=>r.id===o.nativeShare!.grantId&&hasCurrentConsent(r))&&o.status==='queued'){
     o.status='failed';o.error='NATIVE_SHARE_EXPLICIT_REAUTHORIZATION_REQUIRED';o.text='';delete o.nativeShare;
   }
 }
@@ -171,7 +179,7 @@ export class NativeSharing {
     const sub=this.findSub(state,r.subscriptionId);
     if(!sub||!this.hooks.online()||this.blocked.has(r.nativeThreadId))return;
     const route=this.hooks.route(sub);
-    if(r.consentVersion===2&&r.state!=='retired'&&route&&equalRoute(route,r))return sub;
+    if(hasCurrentConsent(r)&&r.state!=='retired'&&route&&equalRoute(route,r))return sub;
   }
   view(id: string) {
     const d=this.store.state,sub=this.findSub(d,id);
@@ -181,7 +189,9 @@ export class NativeSharing {
     return {...(scope?publicRoute(scope):row?publicRoute(row):{subscriptionId:id,nativeThreadId:sub.threadId,channel:sub.owner.channel,rootThreadTs:sub.owner.threadTs}),
       status:!row?'unshared':row.state==='retired'?'retired':row.state==='pending'?'pending':!scope||!equalRoute(scope,row)||!this.backend.connected||!this.hooks.online()||!this.hooks.joined(id)?'paused':row.observationalGap?'gap':this.ready.get(row.id)===this.backend.epoch?'active':'checking',
       reason:row?.reason??row?.observationalGap??null,
-      activation:row?{consentRecordedAt:row.grantedAt,verifiedAnchorRecordedAt:row.activatedAt??null}:null,
+      activation:row?{consentRecordedAt:row.grantedAt,deliveryEnabledAt:row.activatedAt??null,
+        boundaryPolicy:row.boundaryPolicy??null,
+        nativeBoundary:row.state==='active'?{excludedThroughTurnId:row.anchor}:null}:null,
       questionsAfterReconnect:'Only if the official App Server provides a current outstanding request; historical question text is never replayed.',
       disclosure:sharingDisclosure};
   }
@@ -204,7 +214,7 @@ export class NativeSharing {
     if(this.previews.size>=MAX_PREVIEWS)return fail('NATIVE_SHARE_PREVIEW_LIMIT');
     const confirmationId=randomUUID();
     this.previews.set(confirmationId,{expires:Date.now()+PREVIEW_TTL,connection,revision,nativeEpoch:w.epoch,nativeCreatedAt:meta.createdAt,route});
-    return {...publicRoute(route),confirmationId,confirmationPhrase:'SHARE FUTURE '+route.nativeThreadId+' TO '+route.workspaceId+'/'+route.channel+'/'+route.rootThreadTs,disclosure:sharingDisclosure};
+    return {...publicRoute(route),confirmationId,confirmationPhrase:phraseFor(route),boundaryPolicy:nativeBoundaryPolicy,disclosure:sharingDisclosure};
   }
   private async destination(r:Route) {
     try{if(await this.hooks.threadExists(r.channel,r.rootThreadTs))return;}catch{return fail('NATIVE_SHARE_DESTINATION_CHECK_UNAVAILABLE');}
@@ -214,9 +224,9 @@ export class NativeSharing {
     const approval=this.previews.get(challenge);this.previews.delete(challenge);
     const r=approval?.route;
     if(!approval||!r||r.subscriptionId!==id||approval.expires<Date.now()||!this.hooks.online()||approval.connection!==this.hooks.sameSlackConnection()||
-      phrase!=='SHARE FUTURE '+r.nativeThreadId+' TO '+r.workspaceId+'/'+r.channel+'/'+r.rootThreadTs)return fail('NATIVE_SHARE_CONFIRMATION_REQUIRED');
+      phrase!==phraseFor(r))return fail('NATIVE_SHARE_CONFIRMATION_REQUIRED');
     const created:NativeShare={...r,id:randomUUID(),nativeCreatedAt:approval.nativeCreatedAt,anchor:null,frontier:null,
-      grantedAt:new Date().toISOString(),consentVersion:2,state:'pending',seenActive:[],observationalGap:'NATIVE_SHARE_VERIFYING_ANCHOR'};
+      grantedAt:new Date().toISOString(),consentVersion:currentConsentVersion,boundaryPolicy:nativeBoundaryPolicy,state:'pending',seenActive:[],observationalGap:'NATIVE_SHARE_VERIFYING_ANCHOR'};
     // The owner consent is durable before *any* activation RPC. Pending
     // rows cannot queue, restore or deliver bodies, even after a crash.
     this.store.transaction(d=>{
@@ -234,7 +244,7 @@ export class NativeSharing {
     // its own when the owner revoked and reconfirmed during the proof read.
     if(!this.store.state.nativeShares?.some(x=>x.id===created.id)){
       return {...publicRoute(created),status:'retired',reason:'NATIVE_SHARE_REPLACED',disclosure:sharingDisclosure,
-        activation:{consentRecordedAt:created.grantedAt,verifiedAnchorRecordedAt:null}};
+        activation:{consentRecordedAt:created.grantedAt,deliveryEnabledAt:null,boundaryPolicy:created.boundaryPolicy,nativeBoundary:null}};
     }
     return this.view(id);
   }
@@ -255,8 +265,9 @@ export class NativeSharing {
     try{
       await this.destination(actual);
       // Native idle and the first official ordered head are observed only
-      // AFTER the durable consent. The entire recorded prefix is private,
-      // including turns that finish between consent and this snapshot.
+      // AFTER durable consent. This snapshot, not the local pending->active
+      // write or a wall clock, is the exclusive cut the owner consented to.
+      // Anything present (including a running turn) cannot be shared.
       const meta=await this.metadata(sub,w);
       if(meta.createdAt!==row.nativeCreatedAt)fail('NATIVE_SHARE_THREAD_CHANGED');
       if(meta.status?.type!=='idle')fail('NATIVE_SHARE_WAIT_UNTIL_IDLE');
@@ -266,9 +277,11 @@ export class NativeSharing {
         x.resultRef?.threadId===row.nativeThreadId&&Math.abs(meta.createdAt*1000-Date.parse(x.createdAt))<60_000&&Date.parse(x.createdAt)<=Date.parse(row.grantedAt)&&Date.parse(row.grantedAt)-Date.parse(x.createdAt)<15*60_000)){
         fail('NATIVE_SHARE_USE_DEDICATED_THREAD');
       }
+      // Verify identity/scope for the cut we just took, not an additional idle
+      // time boundary. Work beginning after that cut remains eligible even if
+      // the connector is still finishing this check.
       const after=await this.metadata(sub,w);
       if(after.createdAt!==row.nativeCreatedAt)fail('NATIVE_SHARE_THREAD_CHANGED');
-      if(after.status?.type!=='idle')fail('NATIVE_SHARE_WAIT_UNTIL_IDLE');
       if(!this.current(w)||slackConnection!==this.hooks.sameSlackConnection())return;
       const didActivate=this.store.transaction(draft=>{
         const latest=draft.nativeShares?.find(x=>x.id===row.id&&x.state==='pending');
@@ -316,7 +329,7 @@ export class NativeSharing {
     const ids=new Set(itemIds.filter(deliveryId));
     if(!ids.size)return;
     for(const [key,q] of this.pending)if(q.threadId===threadId&&q.projection.turnId===turnId&&ids.has(q.projection.itemId))this.pending.delete(key);
-    const applicable=(r:NativeShare)=>r.consentVersion===2&&r.state!=='retired'&&r.nativeThreadId===threadId&&r.frontier!==turnId&&!r.questionDenySaturated;
+    const applicable=(r:NativeShare)=>hasCurrentConsent(r)&&r.state!=='retired'&&r.nativeThreadId===threadId&&r.frontier!==turnId&&!r.questionDenySaturated;
     if(!this.store.state.nativeShares?.some(r=>applicable(r)&&[...ids].some(id=>this.questionAllowed(r,turnId,id))))return;
     const connection=hash(epoch);
     this.store.transaction(d=>{
@@ -370,7 +383,7 @@ export class NativeSharing {
   request(r:any){
     if(this.closed||this.questionCoverageLost||!this.backend.connected||r?.epoch!==this.backend.epoch||!validRequest(r.id)||!deliveryId(r.params?.threadId)||!this.store.state.nativeShares?.some(row=>row.state==='active'&&row.nativeThreadId===r.params.threadId))return;
     const projection=projectNativeInput(r.method,r.params);
-    if(!projection||!this.store.state.nativeShares?.some(row=>row.consentVersion===2&&row.state==='active'&&row.nativeThreadId===r.params.threadId&&
+    if(!projection||!this.store.state.nativeShares?.some(row=>hasCurrentConsent(row)&&row.state==='active'&&row.nativeThreadId===r.params.threadId&&
       this.questionAllowed(row,projection.turnId,projection.itemId)))return;
     const key={epoch:r.epoch,rpcId:r.id},k=reqKey(key),prior=this.pending.get(k);
     if(this.resolved.has(JSON.stringify([r.params.threadId,k])))return;

@@ -94,7 +94,7 @@ async function fixture(homes=1) {
     confirmationId:string;confirmationPhrase:string;disclosure:string;serverId:string;nativeThreadId:string;workspaceId:string;channel:string;rootThreadTs:string
   };
   const grant=async(id:string,target='default')=>{const p=await preview(id,target);return runtime.nativeShare(target,'grant',id,p.confirmationId,p.confirmationPhrase);};
-  const inspection=(id:string,target='default')=>runtime.nativeShare(target,'inspect',id) as {status:string;reason:string|null};
+  const inspection=(id:string,target='default')=>runtime.nativeShare(target,'inspect',id) as {status:string;reason:string|null;activation?:{boundaryPolicy?:string;deliveryEnabledAt?:string|null;nativeBoundary?:{excludedThroughTurnId?:string|null}}};
   return {root,project,ids,config:cfg,posts,start,backends,subscribe,preview,grant,inspection,get runtime(){return runtime;},
     pause(fn?:typeof pauseRoot){pauseRoot=fn;},markUncertain(marker:string){postError=marker;},deny(marker:string){denial=marker;},
     async restart(bot?:string){await runtime.close();runtime=make();await start(bot);},
@@ -413,7 +413,7 @@ test('tool evidence observed before a same-item question survives reconnect and 
   }finally{await f.close();}
 });
 
-test('an earlier candidate cannot resume content on an old pre-gate grant or cached outbox',async()=>{
+test('an older consent scope cannot resume grant or cached body',async()=>{
   const f=await fixture();try{
     await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
     await f.grant(id);
@@ -422,7 +422,7 @@ test('an earlier candidate cannot resume content on an old pre-gate grant or cac
     await waitFor(()=>held);
     const core=f.runtime.core('default');
     // Trusted on-disk upgrade fixture, not a caller bypass of the auth API.
-    core.store.transaction(d=>{const row=d.nativeShares![0]!;delete row.consentVersion;delete row.activatedAt;});
+    core.store.transaction(d=>{const row=d.nativeShares![0]!;row.consentVersion=2;delete row.boundaryPolicy;});
     f.runtime.disableSlack();release(true);f.pause();
     await f.restart();
     assert.equal(f.inspection(id).status,'retired');assert.equal(f.inspection(id).reason,'NATIVE_SHARE_EXPLICIT_REAUTHORIZATION_REQUIRED');
@@ -454,5 +454,102 @@ test('pending verification cannot cross Slack identity change or survive native 
     assert.equal(f.inspection(id).status,'retired');
     b.publish('rolled-boundary',[reply('rolled-no-output','Rollback will not reopen the content gate.')]);
     await sleep(25);never(f,'will not reopen');
+  }finally{await f.close();}
+});
+
+test('owner sees and confirms the native checkpoint rather than the local pending-to-active write',async()=>{
+  const f=await fixture();try{
+    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
+    const old=await f.preview(id);
+    assert.match(old.disclosure,/strictly after the first verified native turn boundary/);
+    assert.match(old.disclosure,/while Connector still says setting up \(pending\)/);
+    assert.match(old.disclosure,/No messages are sent until the boundary is verified and delivery opens/);
+    assert.equal(old.confirmationPhrase,'SHARE AFTER NATIVE CUT '+THREAD+' TO T1/CIN/'+EMPLOYEES_ROOT);
+    await assert.rejects(async()=>f.runtime.nativeShare('default','grant',id,old.confirmationId,'SHARE FUTURE '+THREAD+' TO T1/CIN/'+EMPLOYEES_ROOT),/CONFIRMATION_REQUIRED/);
+    assert.equal(f.inspection(id).status,'unshared');
+    const offer=await f.preview(id);
+    b.ongoing('notified-before-confirmation',[reply('early-event','An early native event cannot escape.','commentary')]);
+    b.history[0]=turn('notified-before-confirmation','completed',[reply('early-event','An early native event cannot escape.')]);
+    b.threads.get(THREAD).status={type:'idle'};
+    b.notice('turn/completed',{turn:{id:'notified-before-confirmation',status:'completed'}});
+    const original=b.rpc.bind(b);
+    let cutWaiting=false,cutRead=false,identityWaiting=false,recheckTaken=false;
+    let allowCut!:()=>void,allowIdentity!:()=>void;
+    b.rpc=async(method,p)=>{
+      if(method==='thread/turns/list'&&p.limit===1&&!cutRead){
+        await new Promise<void>(r=>{allowCut=r;cutWaiting=true;});
+        const result=await original(method,p);
+        cutRead=true;
+        return result;
+      }
+      if(method==='thread/read'&&cutRead&&!recheckTaken){
+        recheckTaken=true;await new Promise<void>(r=>{allowIdentity=r;identityWaiting=true;});
+      }
+      return original(method,p);
+    };
+    const task=f.runtime.nativeShare('default','grant',id,offer.confirmationId,offer.confirmationPhrase);
+    await waitFor(()=>cutWaiting);
+    assert.deepEqual([f.inspection(id).status,f.inspection(id).activation?.boundaryPolicy,f.inspection(id).activation?.nativeBoundary],['pending','first-verified-native-frontier-v1',null]);
+    const finish=(turnId:string,item:string,text:string)=>{
+      b.ongoing(turnId);
+      b.history[0]=turn(turnId,'completed',[reply(item,text)]);
+      b.threads.get(THREAD).status={type:'idle'};
+      b.notice('turn/completed',{turn:{id:turnId,status:'completed'}});
+    };
+    finish('completed-before-first-cut','excluded-prefix','This round finished before the native checkpoint.');
+    allowCut();await waitFor(()=>identityWaiting);
+    finish('completed-after-first-cut','eligible-pending','This round started after the native checkpoint.');
+    b.ongoing('live-after-first-cut',[reply('eligible-active','Should we use the new arrangement?','commentary')],true);
+    assert.equal(f.inspection(id).status,'pending');
+    assert.equal(f.runtime.core('default').store.state.outbox.filter(o=>o.nativeShare).length,0);
+    never(f,'started after the native checkpoint');never(f,'use the new arrangement');
+    allowIdentity();await task;
+    await observe(f,'started after the native checkpoint');
+    await observe(f,'use the new arrangement');
+    assert.equal(f.inspection(id).activation?.nativeBoundary?.excludedThroughTurnId,'completed-before-first-cut');
+    never(f,'finished before the native checkpoint');never(f,'early native event');
+  }finally{await f.close();}
+});
+
+test('a turn already running in the native snapshot cannot be included by a later idle proof',async()=>{
+  const f=await fixture();try{
+    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
+    const p=await f.preview(id);
+    let held=false,release!:()=>void;
+    b.blockedTurns=async()=>{if(!held)await new Promise<void>(r=>{release=r;held=true;});};
+    const work=f.runtime.nativeShare('default','grant',id,p.confirmationId,p.confirmationPhrase);
+    await waitFor(()=>held);
+    // The preceding metadata check returned idle. The authoritative page now
+    // contains an in-progress turn, so it cannot become the accepted cut.
+    b.ongoing('overlaps-native-snapshot',[reply('private-overlap','The in-progress material remains in Codex.','commentary')],true);
+    release();await work;
+    assert.equal(f.inspection(id).status,'pending');
+    assert.equal(f.inspection(id).reason,'NATIVE_SHARE_WAIT_UNTIL_IDLE');
+    assert.equal(f.inspection(id).activation?.nativeBoundary,null);
+    b.history[0]=turn('overlaps-native-snapshot','completed',[reply('overlap-completed','The earlier in-progress material must remain native.')]);
+    b.threads.get(THREAD).status={type:'idle'};
+    b.notice('turn/completed',{turn:{id:'overlaps-native-snapshot',status:'completed'}});
+    await waitFor(()=>f.inspection(id).status==='active');
+    assert.equal(f.inspection(id).activation?.nativeBoundary?.excludedThroughTurnId,'overlaps-native-snapshot');
+    b.publish('beyond-overlap',[reply('ordinary-answer','An eligible response follows the checkpoint.')]);
+    await observe(f,'eligible response follows');
+    never(f,'in-progress material');
+  }finally{await f.close();}
+});
+
+test('an uncompleted authorization under the earlier consent wording is not upgraded on restart',async()=>{
+  const f=await fixture();try{
+    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
+    b.ongoing('previous-policy-pending',[],true);
+    await f.grant(id);
+    assert.equal(f.inspection(id).status,'pending');
+    f.runtime.core('default').store.transaction(d=>{const row=d.nativeShares![0]!;row.consentVersion=2;delete row.boundaryPolicy;});
+    b.history[0]=turn('previous-policy-pending','completed',[reply('previous-policy-body','An earlier pending consent cannot resume under the new scope.')]);
+    await f.restart();
+    assert.equal(f.inspection(id).status,'retired');
+    assert.equal(f.inspection(id).reason,'NATIVE_SHARE_EXPLICIT_REAUTHORIZATION_REQUIRED');
+    f.backends.get('default')!.publish('new-runtime-old-consent',[reply('cannot-forward','Continue waiting for new consent.')]);
+    await sleep(25);never(f,'earlier pending consent');never(f,'waiting for new consent');
+    assert.ok(!f.runtime.core('default').store.state.outbox.some(o=>o.nativeShare));
   }finally{await f.close();}
 });
