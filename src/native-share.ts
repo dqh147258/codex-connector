@@ -331,7 +331,10 @@ export class NativeSharing {
         if(!current||current.status==='revoked')return;
         if(current.status==='proven'){
           const grant=d.nativeShares?.find(x=>x.creationId===current.id);
-          if(grant?.state==='pending')grant.observationalGap='NATIVE_SHARE_SETUP_IN_PROGRESS';
+          if(grant?.state==='pending'){
+            current.reason='NATIVE_SHARE_OBSERVATION_JOIN_FAILED';
+            grant.observationalGap='NATIVE_SHARE_OBSERVATION_JOIN_FAILED';
+          }
           return;
         }
         current.status=attempted?'uncertain':'failed';
@@ -573,10 +576,12 @@ export class NativeSharing {
       // the exact same-connection request is held only while unresolved.
       // Delivery still rechecks native waiting status, matching tool evidence,
       // and the current grant. Never reconstruct a question from history.
-      if(meta.status?.type==='active'&&meta.status.activeFlags?.includes('waitingOnUserInput')){
+      const waitingOnInput=meta.status?.type==='active'&&meta.status.activeFlags?.includes('waitingOnUserInput');
+      let eligibleQuestion=false;
+      if(waitingOnInput){
         for(const q of this.pending.values())if(q.threadId===sub.threadId&&(!a||q.projection.turnId===a.id)&&
-          q.projection.turnId!==row.frontier&&!terminal.some(t=>t.id===q.projection.turnId)&&this.keyLive(q,sub)){
-          projections.push({p:q.projection,current:q});
+          q.projection.turnId!==row.frontier&&!terminal.some(t=>t.id===q.projection.turnId)&&this.keyLive(q,sub)&&this.questionAllowed(row,q.projection.turnId,q.projection.itemId)){
+          eligibleQuestion=true;projections.push({p:q.projection,current:q});
         }
       }
       await this.dedicatedMetadata(sub,w);
@@ -607,6 +612,7 @@ export class NativeSharing {
         current.frontier=frontier;
         current.seenActive=[...activeSeen].filter(key=>draft.outbox.some(o=>o.nativeShare?.grantId===current.id&&o.nativeShare.key===key&&o.nativeShare.projection.turnId===a?.id));
         if(this.questionCoverageLost||current.questionDenySaturated)current.observationalGap='NATIVE_SHARE_QUESTION_GAP';
+        else if(waitingOnInput&&!eligibleQuestion)current.observationalGap='NATIVE_SHARE_QUESTION_REPLAY_UNCONFIRMED';
         else if(activeContinuity)delete current.observationalGap;
         else current.observationalGap='NATIVE_SHARE_ACTIVE_ITEMS_GAP';
       });

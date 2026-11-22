@@ -117,8 +117,9 @@ export class SessionSubscriptions {
   }
   /**
    * Called only from a positively acknowledged thread/start under durable
-   * local consent. The official server already attached this connection when
-   * creating the thread; a metadata read verifies the identity, not its birth.
+   * local consent. A metadata read verifies the identity, not its birth.
+   * A supported warm observation join on this exact acknowledged thread then
+   * asks the server to replay any request still pending (possibly post-ACK).
    */
   async adoptCreated(thread:any,source:Source,epoch:string,record:(state:State,sub:Subscription)=>void):Promise<Subscription>{
     this.source(source);
@@ -140,8 +141,11 @@ export class SessionSubscriptions {
     if(response?.thread?.id!==sub.threadId||response.thread.sessionId!==thread.sessionId||this.hooks.validate(response.thread,current!.owner).cwd!==current!.cwd) {
       this.disable(sub.id,'SUBSCRIPTION_SCOPE_REVOKED');fail('SUBSCRIPTION_SCOPE_REVOKED');
     }
-    this.store.transaction(s=>{const row=s.subscriptions!.find(r=>r.id===sub.id);if(row?.enabled)row.status='active';});
-    if(this.store.state.subscriptions?.find(s=>s.id===sub.id)?.enabled)this.joined.set(sub.id,epoch);
+    // The original thread/start listener can emit before its positive
+    // acknowledgement. Do not capture arbitrary unknown-thread events.
+    // Official warm resume replays callbacks for only this exact newly
+    // proven thread, after its response; it does not submit/start a turn.
+    await this.join(sub.id,epoch);
     return this.store.state.subscriptions!.find(s=>s.id===sub.id)!;
   }
   private async createOne(threadId: string, owner: Source) {

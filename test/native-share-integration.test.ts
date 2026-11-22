@@ -19,6 +19,7 @@ function deferred<T=void>(){let resolve!:(v:T)=>void;const promise=new Promise<T
 interface Ledgers { threads:FakeThreads; turns:Map<string,any[]>; createCount:number }
 class NativeBackend extends FakeBackend{
   onStart?:(thread:any)=>Promise<any>;
+  afterResume?:(id:string)=>void;
   beforeRead?:(threadId:string)=>Promise<void>;
   withoutLiveTurns=false;
   liveItems=new Map<string,any[]>();
@@ -38,6 +39,11 @@ class NativeBackend extends FakeBackend{
     if(method==='thread/read'){
       await this.beforeRead?.(p.threadId);
       return super.rpc(method,p);
+    }
+    if(method==='thread/resume'){
+      const response=await super.rpc(method,p);
+      this.afterResume?.(p.threadId);
+      return response;
     }
     if(method==='thread/turns/list'){
       this.calls.push({method,params:p});
@@ -197,6 +203,51 @@ test('dedicated setup holds only fresh same-epoch live questions, even if the pe
   }finally{await f.close();}
 });
 
+test('proven fresh warm observation replays only unresolved exact requests after the resume ACK',async()=>{
+  const f=await fixture();try{
+    await f.start();const source=await f.subscribe(),b=f.backends.get('default')!,core=f.runtime.core('default');
+    let releaseReplay=()=>{};
+    b.onStart=async(thread)=>{
+      b.ongoing(thread.id,'early-native',[],true);
+      b.ask(thread.id,'early-native','early-good',81,'Which order should the welcome slides use?');
+      b.ask(thread.id,'early-native','ended-early',82,'This already closed question must not be posted?');
+      b.notice('serverRequest/resolved',thread.id,{requestId:82});
+      b.ask(ORIGINAL,'old-live','old-other',83,'This unrelated original question must remain local?');
+      assert.equal(core.store.state.nativeShares?.length??0,0);
+      return {thread};
+    };
+    b.afterResume=threadId=>{
+      assert.equal(threadId,FRESH);
+      // Official warm resume writes the RPC response first. A later frame
+      // carries only the still-existing callback for this precise thread.
+      releaseReplay=()=>b.ask(FRESH,'early-native','early-good',81,'Which order should the welcome slides use?');
+    };
+    const created=await f.create(source);
+    assert.equal(created.status,'proven');assert.equal(created.newNativeThreadId,FRESH);
+    await waitFor(()=>core.store.state.nativeShares?.some(r=>r.id&&r.observationalGap==='NATIVE_SHARE_QUESTION_REPLAY_UNCONFIRMED')===true);
+    never(f,'welcome slides');
+    releaseReplay();await observed(f,'welcome slides');
+    never(f,'already closed question');never(f,'unrelated original question');
+    assert.equal(b.calls.filter(c=>c.method==='thread/start').length,1);
+    assert.equal(b.calls.filter(c=>c.method==='thread/resume'&&c.params.threadId===FRESH).length,1);
+    assert.ok(!b.calls.some(c=>['turn/start','turn/steer','turn/interrupt','thread/queue/add','thread/queue/start'].includes(c.method)));
+    assert.equal(b.responses.length,0);
+  }finally{await f.close();}
+});
+
+test('a proven creation with failed warm observation does not repeat creation or enable delivery',async()=>{
+  const f=await fixture();try{
+    await f.start();const source=await f.subscribe(),b=f.backends.get('default')!;
+    b.afterResume=id=>{if(id===FRESH)throw Error('Warm observation failed after native creation');};
+    const created=await f.create(source);
+    assert.equal(created.status,'proven');assert.equal(created.reason,'NATIVE_SHARE_OBSERVATION_JOIN_FAILED');
+    assert.equal(created.newNativeThreadId,FRESH);assert.notEqual(created.sharing?.status,'active');
+    b.publish(FRESH,'no-fallback',[reply('no-fallback-message','No fallback delivery after join error.')]);
+    await sleep(30);never(f,'No fallback delivery');
+    assert.equal(f.stores.get('default')!.createCount,1);
+  }finally{await f.close();}
+});
+
 test('a lost or contradictory thread/start response is uncertain, never auto-retries, never adopts an old ID',async()=>{
   const f=await fixture();try{
     await f.start();const source=await f.subscribe(),b=f.backends.get('default')!;
@@ -310,7 +361,7 @@ test('identical native thread, turn, item and RPC IDs are isolated across three 
     const deny=f.runtime.core('default').store.state.nativeShares![0]!.questionDeny;
     assert.equal(deny?.length,1);
     await f.restart();
-    await Promise.all(grants.map((g,i)=>waitFor(()=>f.inspect(g.newSubscriptionId!,f.ids[i]).status==='active')));
+    await Promise.all(grants.map((g,i)=>waitFor(()=>f.inspect(g.newSubscriptionId!,f.ids[i]).status===(i===0?'gap':'active'))));
     f.ids.forEach((id,i)=>{
       const b=f.backends.get(id)!;
       if(i>0)b.ongoing(FRESH,'same-turn',[],true);
