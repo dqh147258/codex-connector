@@ -1,6 +1,6 @@
 import { mkdirSync, closeSync, openSync, unlinkSync, writeFileSync, realpathSync, lstatSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { SharedAppServer } from './codex.js';
+import { isBackendResourceExhaustion, SharedAppServer } from './codex.js';
 import { Connector, ConnectorError, type RuntimeContext } from './connector.js';
 import { Store } from './store.js';
 import { configuredServers, defaultServer, listServers, resolveServerId, targetFingerprint, validateIdentities } from './servers.js';
@@ -29,6 +29,8 @@ function managedDirectory(parent:string,name:string):string {
   if(canonical!==dir)throw Error('UNSAFE_CONNECTOR_HOME');
   return dir;
 }
+const SIMULTANEOUS_PROXY_STARTS=4;
+type ConnectionJob={core:Connector;settle(online:boolean):void};
 type MakeBackend=(profile:Config['backend'],id:string)=>Backend;
 type Page={serverId?:string;sessionId:string;cursor?:string;limit?:number;waitMs?:number};
 /** Physical namespaces avoid ambiguous bare native IDs and preserve all old work,
@@ -38,6 +40,10 @@ export class Runtime {
   readonly backends=new Map<string,Backend>();
   private lock:number;private closed=false;private slackReady=false;private slackEpoch=0;
   private readonly blocked=new Set<string>();
+  private readonly resourceBlocked=new Set<string>();
+  private readonly pendingStarts=new Set<ConnectionJob>();
+  private readonly connectionTasks=new Map<Connector,Promise<void>>();
+  private activeStarts=0;private stoppingConnections=false;
   private readonly dir:string;
   private readonly slackIds:string[];
   constructor(readonly config:Config,dir:string,slack:SlackPort,screens?:ScreenPort,
@@ -56,16 +62,22 @@ export class Runtime {
       writeFileSync(this.lock,String(process.pid));
       for(const [id,profile] of profiles){
         const target=targets.get(id)!;
-        const subdir=id==='default'?this.dir:managedDirectory(managedDirectory(this.dir,'servers'),id);
-        if(id!=='default')assertManagedFiles(subdir);
         let store:Store;
-        try{store=new Store(subdir,{id,fingerprint:targetFingerprint(profile,target),allowLegacy:id==='default'&&profiles.size===1});}
-        catch(e){if(['TARGET_CHANGED','LEGACY_TARGET_AMBIGUOUS'].includes((e as Error).message)){this.blocked.add(id);continue;}throw e;}
+        try {
+          const subdir=id==='default'?this.dir:managedDirectory(managedDirectory(this.dir,'servers'),id);
+          if(id!=='default')assertManagedFiles(subdir);
+          store=new Store(subdir,{id,fingerprint:targetFingerprint(profile,target),allowLegacy:id==='default'&&profiles.size===1});
+        } catch(e) {
+          if(['TARGET_CHANGED','LEGACY_TARGET_AMBIGUOUS'].includes((e as Error).message)){this.blocked.add(id);continue;}
+          if(isBackendResourceExhaustion(e)){this.blocked.add(id);this.resourceBlocked.add(id);continue;}
+          throw e;
+        }
         try{
           const requireHome=profiles.size>1||!!profile.codexHome;
-          const backend=makeBackend?makeBackend(profile,id):new SharedAppServer(profile,undefined,requireHome?target.home!:undefined);
+          const backend=makeBackend?makeBackend(profile,id):new SharedAppServer(profile,undefined,requireHome?target.home!:undefined,target.home??undefined);
           this.backends.set(id,backend);
-          const context:RuntimeContext={id,protectedHomes,unknownHome,defaultRoute:id===this.slackIds.find(a=>!this.blocked.has(a)),
+          const context:RuntimeContext={id,protectedHomes,unknownHome,backendFingerprint:targetFingerprint(profile,target),
+            slackConnection:()=>this.slackEpoch,defaultRoute:id===this.slackIds.find(a=>!this.blocked.has(a)),
             slackReady:()=>this.slackReady&&this.slackIds.includes(id),
             principal:principal=>this.principal(principal),
             servers:source=>source.kind==='local'?this.servers(this.principal(source.userId)!):this.projectServers(this.slackIds),
@@ -84,7 +96,7 @@ export class Runtime {
     const g=this.config.local?.agents?.find(x=>`agent:${x.id}`===id);
     return g?{id,role:'agent',servers:g.servers,projects:g.projects,commands:g.commands}:undefined;
   }
-  private projectServers(ids:string[]){return listServers(this.config,ids,this.backends).map(row=>this.blocked.has(row.serverId)?{...row,connected:false,status:'blocked'}:row);}
+  private projectServers(ids:string[]){return listServers(this.config,ids,this.backends).map(row=>this.blocked.has(row.serverId)?{...row,connected:false,status:'blocked',...(this.resourceBlocked.has(row.serverId)?{lastFailure:'BACKEND_RESOURCE_EXHAUSTED'}:{})}:row);}
   servers(p=OPERATOR){if(p.role==='agent'&&!p.commands?.includes('server.list'))throw new ConnectorError('LOCAL_SCOPE_DENIED');return this.projectServers(p.role==='operator'?[...configuredServers(this.config).keys()]:(p.servers??[]));}
   core(selector:unknown,p=OPERATOR){
     if(selector!==undefined&&typeof selector!=='string')throw new ConnectorError('SERVER_UNAVAILABLE');
@@ -103,20 +115,61 @@ export class Runtime {
   receipt(params:{serverId?:string;workId:string},p:LocalPrincipal){return this.core(params.serverId,p).receipt(params.workId,p);}
   events(params:Page,p:LocalPrincipal,signal?:AbortSignal){return this.core(params.serverId,p).readEvents(params,p,signal);}
   unwatch(params:{serverId?:string;sessionId:string;subscriptionId:string},p:LocalPrincipal){return this.core(params.serverId,p).unwatch(params,p);}
+  nativeShare(serverId:unknown,operation:'inspect'|'preview'|'grant'|'revoke',id:string,challenge?:string,phrase?:string){
+    const core=this.core(serverId);
+    if(core.runtime!.id!==serverId||!core.nativeSharing)throw new ConnectorError('SERVER_UNAVAILABLE');
+    if(operation==='inspect')return core.nativeSharing.view(id);
+    if(operation==='preview')return core.nativeSharing.preview(id);
+    if(operation==='revoke')return core.nativeSharing.revoke(id);
+    return core.nativeSharing.grant(id,challenge!,phrase!);
+  }
   status(serverId?:string){const selected=serverId===undefined?defaultServer(this.config):resolveServerId(this.config,serverId);if(serverId!==undefined&&!this.cores.has(selected!))throw new ConnectorError('SERVER_UNAVAILABLE');const core=selected?this.cores.get(selected):undefined;return{...(core?.status()??{}),serverId:selected??null,servers:this.servers(),slackConnected:this.slackReady};}
   sessionPage(params:Record<string,unknown>={}){const {serverId,...rest}=params;return this.core(serverId).sessionPage(rest);}
   recover(kind:'command'|'outbox',id:string,ts?:string,serverId?:string){this.core(serverId).recover(kind,id,ts);}
-  async connectLocal(){await Promise.all([...this.cores.values()].map(c=>c.reconnect()));}
+  private drainConnections(){
+    while(!this.stoppingConnections&&this.activeStarts<SIMULTANEOUS_PROXY_STARTS&&this.pendingStarts.size){
+      const job=this.pendingStarts.values().next().value!;this.pendingStarts.delete(job);this.activeStarts++;
+      const {core,settle}=job;
+      void Promise.resolve().then(async()=>{
+        if(this.stoppingConnections)return false;
+        await core.backend.connect();
+        return core.backend.connected;
+      }).then(settle,()=>settle(false)).finally(()=>{this.activeStarts--;this.drainConnections();});
+    }
+  }
+  private connectCore(core:Connector){
+    const current=this.connectionTasks.get(core);if(current)return current;
+    if(this.stoppingConnections||core.backend.connected)return Promise.resolve();
+    let settle!:(online:boolean)=>void;
+    const handshake=new Promise<boolean>(r=>{settle=r;});
+    // Restore this Core's own subscriptions/storage after transport verification,
+    // outside the launch pool. A large history cannot hold another Home's slot.
+    const task=handshake.then(online=>{if(online&&!this.stoppingConnections&&core.backend.connected)return core.reconnect();})
+      .finally(()=>{this.connectionTasks.delete(core);});
+    this.connectionTasks.set(core,task);this.pendingStarts.add({core,settle});this.drainConnections();return task;
+  }
+  stopConnecting(){
+    this.stoppingConnections=true;
+    for(const job of this.pendingStarts)job.settle(false);
+    this.pendingStarts.clear();
+  }
+  async connectLocal(){await Promise.all([...this.cores.values()].map(c=>this.connectCore(c)));}
   async enableSlack(userId:string,botId:string){
     if(this.config.slack.enabled===false||!userId)throw Error('SLACK_UNAVAILABLE');
     const epoch=++this.slackEpoch;this.slackReady=false;
     const allowed=[...this.cores].filter(([id])=>this.slackIds.includes(id)).map(([,c])=>c);
     for(const c of allowed){c.selfUserId=userId;c.selfBotId=botId;await c.initializeSlack();}
     if(this.closed||this.slackEpoch!==epoch)throw Error("SLACK_IDENTITY_CHANGED");this.slackReady=true;
-    await Promise.all(allowed.map(async c=>{if(c.backend.connected)await c.subscriptions.rejoin();c.pump();c.flush();}));
+    await Promise.all(allowed.map(async c=>{if(c.backend.connected)await c.subscriptions.rejoin();c.nativeSharing?.tick();c.pump();c.flush();}));
   }
   disableSlack(){this.slackEpoch++;this.slackReady=false;}
   accept(body:unknown){if(!this.slackReady)return false;for(const id of this.slackIds){const c=this.cores.get(id);if(c?.accept(body)){c.pump();c.flush();return true;}}return false;}
-  async tick(){await Promise.all([...this.cores.values()].map(async c=>{if(!c.backend.connected)await c.reconnect();await c.expire();c.pump();c.flush();}));}
-  async close(){if(this.closed)return;this.closed=true;this.disableSlack();try{await Promise.all([...this.cores.values()].map(async c=>{try{await c.close();}finally{c.store.close();}}));}finally{closeSync(this.lock);unlinkSync(join(this.dir,'runtime.lock'));}}
+  async tick(){
+    if(this.closed)return;
+    await Promise.all([...this.cores.values()].map(async c=>{
+      if(!c.backend.connected)void this.connectCore(c).catch(()=>{});
+      await c.expire();c.nativeSharing?.tick();c.pump();c.flush();
+    }));
+  }
+  async close(){if(this.closed)return;this.closed=true;this.stopConnecting();this.disableSlack();try{await Promise.all([...this.cores.values()].map(async c=>{try{await c.close();}finally{c.store.close();}}));}finally{closeSync(this.lock);unlinkSync(join(this.dir,'runtime.lock'));}}
 }

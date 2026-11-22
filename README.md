@@ -181,7 +181,7 @@ npm test
 
 ## 简洁 Slack 输出与关键消息订阅
 
-Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:active` 从当前 loaded 元数据筛选，历史单独用 `view:history`。使用 `result.next` 获取下一页，`result.page` 显式读取短期、同身份同线程的详情，避免自动 JSON 刷屏。`session.subscribe` / `session.unsubscribe` 管理固定状态提醒，取消不会停止 Codex。完整边界见 [输出与订阅](docs/SLACK-OUTPUT.md)。
+Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:active` 从当前 loaded 元数据筛选，历史单独用 `view:history`。使用 `result.next` 获取下一页，`result.page` 显式读取短期、同身份同线程的详情，避免自动 JSON 刷屏。`session.subscribe` / `session.unsubscribe` 默认管理固定状态提醒，取消不会停止 Codex。双入口下，本机操作者可另外确认向这一确切 Slack 线程分享未来合规的 Codex 回复和问题（不分享旧历史，不代答）。完整边界见 [输出与订阅](docs/SLACK-OUTPUT.md)。
 
 提供两份可手动安装/阅读的 Skill：[Codex 本地](skills/codex-connector/SKILL.md) 与 [dot Slack 操作](skills/dot-slack-connector/SKILL.md)。没有自动安装到用户电脑或修改 dot 内部指令。
 

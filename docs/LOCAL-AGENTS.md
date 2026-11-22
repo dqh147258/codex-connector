@@ -1,6 +1,6 @@
 # 本机 Agent 接入：不需要 Slack
 
-同一台电脑上，只启动一个 Connector daemon。本机 CLI、stdio MCP 和 Skill 通过受保护的环回 API 使用它；它们不会另起一台 Codex server。原生对话正文只在原 Codex 界面和获授权的本机内容接口读取，不会由 Slack 模式、订阅或续页转发。所有原生审批/输入仍只由原 Codex 界面处理。连接器只连接操作者预先配置的原生共享 daemon，不扫描所有进程或用户目录。这里给出源码安装方式，示例路径和 ID 都需要替换。
+同一台电脑上，只启动一个 Connector daemon。本机 CLI、stdio MCP 和 Skill 通过受保护的环回 API 使用它；它们不会另起一台 Codex server。本机结果默认不会自动流向 Slack，普通 Slack 订阅和续页也不会转发原生正文。仅当本机操作者明确授权一个已核实的订阅与 Slack 线程时，才会按[内容分享规则](SLACK-OUTPUT.md)转发激活边界之后的合规内容。所有原生审批/输入仍只由原 Codex 界面处理。连接器只连接操作者预先配置的原生共享 daemon，不扫描所有进程或用户目录。这里给出源码安装方式，示例路径和 ID 都需要替换。
 
 ## 1. 先启动本机模式
 
@@ -40,7 +40,9 @@ node dist/src/cli.js status --server default
 }
 ```
 
-多目标时，每个目标都必须对应一个不同且可验证的 Codex Home。配置绝对 `socketPath` 的目标必须同时填写 `codexHome`；不同 socket 路径可能转发到同一个 daemon，不能靠路径区分。未配置 `socketPath` 的默认连接仍使用官方代理自己选路；其预期 Home 是显式 `codexHome`，否则是启动环境继承的 `CODEX_HOME` 或当前账户默认 `~/.codex`。在发送任何会话请求之前，连接器会核对 daemon 握手的真实 Home；缺失或不匹配时该目标保持离线，不切换到其它目标。旧版单目标未固定 Home 时仍可使用官方代理，但 `homeVerified:false`，不要当成身份已核实。列表不暴露 Home、socket 或启动路径。Slack 启用时可用 `slack.servers` 限定其可见的规范 ID；代理授权列表同样使用规范 ID，而非别名。客户端可传别名，保留回执返回的**规范 serverId**用于后续请求。显式选择失败不是切换其它服务的授权。不要用同一个持久 server ID 指向另一台后端；如状态标记为 blocked，应由操作者核对配置，不能直接丢弃状态/锁重试。
+多目标时，每个目标都必须对应一个不同且可验证的 Codex Home。配置绝对 `socketPath` 的目标必须同时填写 `codexHome`；不同 socket 路径可能转发到同一个 daemon，不能靠路径区分。未配置 `socketPath` 的默认连接仍使用官方代理自己选路；其预期 Home 是显式 `codexHome`，否则是启动环境继承的 `CODEX_HOME` 或当前账户默认 `~/.codex`。在发送任何会话请求之前，连接器会核对 daemon 握手的真实 Home；缺失或不匹配时该目标保持离线，不切换到其它目标。旧版单目标未固定 Home 时仍可使用官方代理；只有实际握手核对成功才会显示 `homeVerified:true`，没有证据时不算已核实。列表不暴露 Home、socket 或启动路径。Slack 启用时可用 `slack.servers` 限定其可见的规范 ID；代理授权列表同样使用规范 ID，而非别名。客户端可传别名，保留回执返回的**规范 serverId**用于后续请求。显式选择失败不是切换其它服务的授权。不要用同一个持久 server ID 指向另一台后端；如状态标记为 blocked，应由操作者核对配置，不能直接丢弃状态/锁重试。
+
+配置没有固定的 Home 数量上限。连接按最多 4 个同时启动的代理分批进行，各自保留独立握手超时；一个目标离线或遇到 `BACKEND_RESOURCE_EXHAUSTED` 时，其他已连接目标仍可工作，连接器不会自动改用其他目标。
 
 区分两个名字：命令 envelope 的 `target` 是 Connector 的 `instanceId`，`params.serverId` 才选择后端。CLI 的 `--server` 对应后者。无默认值且有多个候选时须显式选择。即使两个后端的原生 threadId 相同，也不是同一会话。
 

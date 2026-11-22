@@ -3,6 +3,12 @@ import { WebClient, LogLevel } from '@slack/web-api';
 import type { SlackPort } from './types.js';
 export const escapeSlack=(text:string)=>text.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
 export function chunks(text:string,limit=2800):string[]{const out:string[]=[];let part='';for(const cp of text){const escaped=escapeSlack(cp);if(part.length+escaped.length>limit){out.push(part);part='';}part+=escaped;}if(part||!out.length)out.push(part||'(empty)');return out;}
+const ROOT_DENIAL=new Set(['not_in_channel','channel_not_found','message_not_found','thread_not_found','no_permission','missing_scope','restricted_action',
+  'not_allowed_token_type','is_archived','invalid_auth','token_revoked','account_inactive','not_authed','team_access_not_granted']);
+export function isSlackRootPermissionDenial(e:unknown){
+  const error=e as {code?:string;data?:{error?:string}} | undefined;
+  return error?.code==='slack_webapi_platform_error'&&ROOT_DENIAL.has(error.data?.error??'');
+}
 export class SlackClient implements SlackPort {
   readonly web:WebClient;
   constructor(token:string){this.web=new WebClient(token,{logLevel:LogLevel.ERROR,retryConfig:{retries:0},rejectRateLimitedCalls:true,timeout:10000});}
@@ -28,6 +34,14 @@ export class SlackClient implements SlackPort {
     const matches:{userId:string;name:string}[]=[];let cursor:string|undefined;
     do{const r=await this.web.users.list({limit:200,cursor});for(const u of r.members||[])if(!u.deleted&&u.id&&[u.name,u.profile?.display_name,u.profile?.real_name].includes(name))matches.push({userId:u.id,name});cursor=r.response_metadata?.next_cursor||undefined;}while(cursor);
     if(matches.length!==1)throw Error('DOT_NAME_AMBIGUOUS_OR_MISSING: configure a verified userId');return matches[0]!;
+  }
+  async verifySharedRoot(channel:string,threadTs:string){
+    // Exact root via the existing bot's channels:history/groups:history.
+    // conversations.replies requires a user token for public/private channels.
+    try{
+      const r=await this.web.conversations.history({channel,oldest:threadTs,latest:threadTs,inclusive:true,limit:1});
+      return r.messages?.some(m=>m.ts===threadTs&&(!m.thread_ts||m.thread_ts===threadTs))===true;
+    }catch(e){if(isSlackRootPermissionDenial(e))return false;throw e;}
   }
   async threadExists(channel:string,threadTs:string){const r=await this.web.conversations.replies({channel,ts:threadTs,limit:1});return r.messages?.some(m=>m.ts===threadTs&&(!m.thread_ts||m.thread_ts===threadTs))===true;}
   async humanMessage(channel:string,threadTs:string,ts:string){

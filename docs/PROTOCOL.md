@@ -28,7 +28,7 @@ Each proxy connection has a unique epoch. Handlers capture both child identity a
 
 ## Native requests and authority
 
-The original Codex UI is the only place to act on native approvals and user-input requests. Neither Slack envelopes (including an authenticated human's) nor Connector local API calls grant authority to answer. Slack receives at most a fixed same-origin interaction notice: no command, diff, prompt, question, options or response template.
+The original Codex UI is the only place to act on native approvals and user-input requests. Neither Slack envelopes (including an authenticated human's) nor Connector local API calls grant authority to answer. By default Slack receives at most a fixed same-origin interaction notice. An explicitly granted future-content subscription may relay an active ordinary user-input title, question and option labels. No commands, diffs, security approval details, prompts or response templates are shared.
 
 Expiry applies to the Connector reminder, not to the App Server request or turn. It records expiration locally, optionally relaying a fixed note to the same verified Slack origin, and never reads back native state to authorize or issue a decline, answer, or interrupt. Only the original Codex UI handles native approval and input.
 
@@ -36,7 +36,7 @@ Expiry applies to the Connector reminder, not to the App Server request or turn.
 
 Work inbox and Slack outbox are independent. Connector handler completion and response enqueue commit together. This is not model-turn completion; message delivery has its own evidence fields. A Slack failure never retries the backend action. Each session's outbox preserves order even across rate backoff or uncertain deliveries; unrelated sessions can progress. Transient known rate limits may retry; network/unknown outcomes require local operator recovery. Exactly-once Slack delivery is not claimed.
 
-Discovery exposes all shared-visible metadata with manageability reasons. Session control defaults to configured project roots/subdirectories; a local-only allowAllSharedSessions opt-in can authorize other shared sessions without expanding readonly file roots. Slack results omit native free-form content and use safe structured metadata and fixed notices only. Unknown or revoked routes are not given a fallback destination.
+Discovery exposes all shared-visible metadata with manageability reasons. Session control defaults to configured project roots/subdirectories; a local-only allowAllSharedSessions opt-in can authorize other shared sessions without expanding readonly file roots. Ordinary Slack RPC results, search, views and pagination remain safe metadata only. A separate local operator grant permits prospective reply/question delivery, not historical or arbitrary results. Unknown or revoked routes are not given a fallback destination.
 
 ## Tests versus evidence
 
@@ -65,7 +65,7 @@ Local/Skill `session.create` and `session.attach` do not require a Slack destina
 
 ### 简洁响应与观察订阅
 
-Slack 的有界摘要可用 `result.page` 查看短期原线程详情，`result.next` 只继续受支持的安全元数据查询。Slack 默认只查 loaded、每来源最多 10 条。见 [SLACK-OUTPUT](SLACK-OUTPUT.md)。即使仅开启 Slack，也无法证明原生轮次不含另一个客户端的输入，因此不会发送任何原生用户或模型正文；绑定、订阅、分页和缓存恢复都不能改变这一边界。旧正文快照、待发消息和不确定投递不作为重播渠道。已经发送到 Slack 的消息不在连接器自动撤回范围内。
+Slack 的有界摘要可用 `result.page` 查看短期原线程详情，`result.next` 只继续受支持的安全元数据查询。Slack 默认只查 loaded、每来源最多 10 条。见 [SLACK-OUTPUT](SLACK-OUTPUT.md)。默认只发固定状态。只有本机操作者在双入口模式下明确确认已核实 Home / 会话与 Slack workspace / 频道 / 根线程的确切组合，才允许向该线程发送授权后未来轮次的合规回复和问题。因为其他客户端可能影响共享回复，该提示必须随确认展示。绑定、普通订阅、分页或旧缓存不能开启、继续或搬迁分享。失去边界即暂停而不是猜测。不确定的正文投递不会重投；已发送的消息不在自动撤回范围内。
 
 `session.recent {"limit":5}`（1–20）是只读元数据查询，返回有界候选中的生命周期时间排名和独立后端更新参考。它不是 `session.list view=active`：已完成且 idle 的会话也可能最近活跃。不自动建立控制绑定或订阅，记录器不把接收/读取时间当活动时间。见 [SESSION-RECENT.md](SESSION-RECENT.md)。
 
@@ -73,4 +73,6 @@ Slack 的有界摘要可用 `result.page` 查看短期原线程详情，`result.
 
 ## Server-scoped local clients
 
-`target` still addresses the connector instance. Optional `params.serverId` selects a registered backend (ID or alias); it never accepts a socket path or Home. With multiple registered profiles, every target must have a distinct canonical Home and report it during the handshake before becoming usable. A profile with an explicit socket must declare its expected Home; the unqualified official proxy defaults to inherited `CODEX_HOME` or the OS account default. A missing or mismatched Home is offline, not a reason to retry on a different server. The unpinned, single-target legacy route remains supported. For Slack, use `server.list` to discover the configured and authorized subset. See [local API and stdio MCP](LOCAL-AGENTS.md) for authentication, exact command receipts and scoped event cursors.
+`target` still addresses the connector instance. Optional `params.serverId` selects a registered backend (ID or alias); it never accepts a socket path or Home. With multiple registered profiles, every target must have a distinct canonical Home and report it during the handshake before becoming usable. A profile with an explicit socket must declare its expected Home; the unqualified official proxy defaults to inherited `CODEX_HOME` or the OS account default. A missing or mismatched Home is offline, not a reason to retry on a different server. The unpinned, single-target legacy route remains supported for existing operations; native-content sharing still requires affirmative Home verification. Configured profile count is not capped; at most four native connection attempts start in parallel, each with independent timeouts. For Slack, use `server.list` to discover the configured and authorized subset. See [local API and stdio MCP](LOCAL-AGENTS.md) for authentication, exact command receipts and scoped event cursors.
+
+The loopback operator-only action `native.share` supports `inspect`, `preview`, `grant`, and `revoke` with a canonical (not alias) server ID and the exact persisted subscription ID. It is not a Slack envelope or MCP action. The supported owner CLI uses a short-lived, single-use exact-destination confirmation, then proves an idle native ordered anchor. Outbox rows bind the intended grant generation, service fingerprint, native turn/item, Slack workspace/route and part. At dispatch they require a current grant, exact verified root and matching safe projection; queued writes and generation revocations are atomic. Unsupported history or ambiguous transport pauses or rejects rather than choosing another target. No native request answers or decisions are transmitted on this path.

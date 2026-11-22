@@ -1,5 +1,6 @@
 import { closeSync, copyFileSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { validateNativeShareState } from './native-share.js';
 import { validateMessageDelivery } from './session-delivery.js';
 import { validateActivityRecords } from './session-activity.js';
 import type { State } from './types.js';
@@ -18,6 +19,7 @@ export class Store {
       if(legacy&&!pin!.allowLegacy)throw Error('LEGACY_TARGET_AMBIGUOUS');
       if(legacy){const backup=join(dir,'state.before-server-profiles.json');if(!existsSync(backup))copyFileSync(statePath,backup,constants.COPYFILE_EXCL);}
       validateActivityRecords(this.value.activity);
+      validateNativeShareState(this.value);
       for (const work of this.value.work) validateMessageDelivery(work);
       this.transaction(s => {
         if(pin)(s as State & {targetPin?:unknown}).targetPin={id:pin.id,fingerprint:pin.fingerprint};

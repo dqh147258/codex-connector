@@ -72,7 +72,7 @@ export function resolveServerId(config: Config, selector?: string): string {
 export function validateIdentities(profiles: ReadonlyMap<string, BackendProfile>): Map<string, BackendTarget> {
   const targets=new Map<string,BackendTarget>();
   const names = new Set<string>(), homes = new Set<string>(), sockets = new Set<string>();
-  if (!profiles.size || profiles.size > 32) throw Error('Configure between 1 and 32 backend profiles');
+  if (!profiles.size) throw Error('Configure at least one backend profile');
   for (const [id, p] of profiles) {
     for (const name of [id, ...(p.aliases || [])]) {
       if (!validServerId(name) || names.has(name.toLowerCase())) throw Error('Duplicate or invalid server ID/alias');
@@ -90,17 +90,18 @@ export function validateIdentities(profiles: ReadonlyMap<string, BackendProfile>
   return targets;
 }
 
-export interface ServerObservation { checkedAt: string | null; version: string | null; homeVerified?: boolean }
+export interface ServerObservation { checkedAt: string | null; version: string | null; homeVerified?: boolean; resourceExhausted?: boolean }
 export function listServers(config: Config, allowedIds: readonly string[], backends: ReadonlyMap<string, Backend>) {
   // Listing is strictly a projection. In particular do not call backend.capabilities(),
   // connect(), rpc(), probe a socket, or read filesystem metadata while serving it.
-  const preferred = defaultServer(config);
-  return [...configuredServers(config)].filter(([id]) => allowedIds.includes(id)).map(([serverId,p]) => {
+  const preferred = defaultServer(config), allowed = new Set(allowedIds);
+  return [...configuredServers(config)].filter(([id]) => allowed.has(id)).map(([serverId,p]) => {
     const backend = backends.get(serverId) as (Backend & { readonly observation?: ServerObservation }) | undefined;
     const observation = backend?.observation;
     const checkedAt = observation?.checkedAt ?? null, connected = backend?.connected === true;
     return { serverId, aliases: [...(p.aliases || [])], isDefault: serverId === preferred,
       status: connected ? 'online' : checkedAt ? 'offline' : 'unknown', connected,
-      checkedAt, version: observation?.version ?? null, versionSource:'cli', homeVerified:connected && observation?.homeVerified===true };
+      checkedAt, version: observation?.version ?? null, versionSource:'cli', homeVerified:connected && observation?.homeVerified===true,
+      ...(observation?.resourceExhausted ? {lastFailure:'BACKEND_RESOURCE_EXHAUSTED'} : {}) };
   });
 }

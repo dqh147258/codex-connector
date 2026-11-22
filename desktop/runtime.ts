@@ -64,7 +64,7 @@ export class DesktopRuntime {
       this.backend=c?{connected:c.connected,version:c.version,expectedVersion:c.expectedVersion,lastFailure:c.lastFailure,daemonStart:c.daemonStart,unsupportedMethods:c.unsupportedMethods}:undefined;
       if(this.lastError==='STATUS_UNAVAILABLE')this.lastError=undefined;
       this.status={slackConnected:status.slackConnected===true,servers:Array.isArray(status.servers)?
-        status.servers.slice(0,32).filter((row:any)=>row&&typeof row.serverId==='string'&&/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(row.serverId)&&typeof row.connected==='boolean')
+        status.servers.filter((row:any)=>row&&typeof row.serverId==='string'&&/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(row.serverId)&&typeof row.connected==='boolean')
           .map((row:any)=>({serverId:row.serverId,connected:row.connected})):undefined};
     }catch{if(this.child===child){this.lastError='STATUS_UNAVAILABLE';this.backend=undefined;this.status=undefined;}}
     return this.snapshot();

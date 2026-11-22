@@ -11,7 +11,7 @@ async function jsonBody(req:IncomingMessage){
 const digest=(v:string)=>createHash('sha256').update(v).digest();
 const keys=(v:unknown,allowed:string[])=>Boolean(v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).every(k=>allowed.includes(k)));
 const word=(v:unknown):v is string=>typeof v==='string'&&v.length>0&&v.length<=200;
-const safeError=new Set(['SERVER_SELECTION_REQUIRED','SERVER_UNAVAILABLE','RECEIPT_NOT_FOUND','LOCAL_SCOPE_DENIED','ACTOR_REVOKED','LOCAL_BINDING_REQUIRED','LOCAL_ACTION_REQUIRED','NEED_VERIFIABLE_HUMAN_DECISION','REQUEST_ID_CONFLICT','LOCAL_GRANT_CHANGED','TURN_OWNER_UNVERIFIED','SLACK_EXPLICIT_BINDING_UNAVAILABLE','INVALID_CURSOR','EVENT_CURSOR_INVALID','LOCAL_EVENT_CURSOR_INVALID','LOCAL_EVENT_SCOPE_DENIED','LOCAL_EVENT_LIMIT','SESSION_NOT_FOUND','EVENT_WAIT_ABORTED','INVALID_LOCAL_EVENT_CURSOR','INVALID_LOCAL_EVENT_QUERY','LOCAL_EVENT_SUBSCRIPTION_UNAVAILABLE','LOCAL_EVENT_SCOPE_UNAVAILABLE','LOCAL_EVENT_WAIT_LIMIT','LOCAL_EVENT_STREAM_LIMIT','WRONG_TARGET','UNKNOWN_ACTION']);
+const safeError=new Set(['SERVER_SELECTION_REQUIRED','SERVER_UNAVAILABLE','RECEIPT_NOT_FOUND','LOCAL_SCOPE_DENIED','ACTOR_REVOKED','LOCAL_BINDING_REQUIRED','LOCAL_ACTION_REQUIRED','NEED_VERIFIABLE_HUMAN_DECISION','REQUEST_ID_CONFLICT','LOCAL_GRANT_CHANGED','TURN_OWNER_UNVERIFIED','SLACK_EXPLICIT_BINDING_UNAVAILABLE','INVALID_CURSOR','EVENT_CURSOR_INVALID','LOCAL_EVENT_CURSOR_INVALID','LOCAL_EVENT_SCOPE_DENIED','LOCAL_EVENT_LIMIT','SESSION_NOT_FOUND','EVENT_WAIT_ABORTED','INVALID_LOCAL_EVENT_CURSOR','INVALID_LOCAL_EVENT_QUERY','LOCAL_EVENT_SUBSCRIPTION_UNAVAILABLE','LOCAL_EVENT_SCOPE_UNAVAILABLE','LOCAL_EVENT_WAIT_LIMIT','LOCAL_EVENT_STREAM_LIMIT','WRONG_TARGET','UNKNOWN_ACTION','NATIVE_SHARE_SUBSCRIPTION_NOT_FOUND','NATIVE_SHARE_NOT_READY','NATIVE_SHARE_IDENTITY_UNVERIFIED','NATIVE_SHARE_ALREADY_GRANTED','NATIVE_SHARE_PREVIEW_LIMIT','NATIVE_SHARE_CONFIRMATION_REQUIRED','NATIVE_SHARE_SCOPE_CHANGED','NATIVE_SHARE_DESTINATION_CHECK_UNAVAILABLE','NATIVE_SHARE_DESTINATION_UNVERIFIED','NATIVE_SHARE_THREAD_CHANGED','NATIVE_SHARE_WAIT_UNTIL_IDLE','NATIVE_SHARE_USE_DEDICATED_THREAD','NATIVE_SHARE_HISTORY_GAP']);
 export function apiServer(connector:Connector|Runtime,token:string){
  const runtime='cores' in connector?connector:undefined;
  const operator=digest(token);
@@ -35,6 +35,11 @@ export function apiServer(connector:Connector|Runtime,token:string){
     else if(body.action==='unwatch'&&runtime&&keys(body,['action','serverId','sessionId','subscriptionId'])&&word(body.sessionId)&&word(body.subscriptionId))result=runtime.unwatch(body,p);
     else if(body.action==='command'&&keys(body,['action','envelope'])){const r=parseEnvelope(`${START_MARKER}\n${JSON.stringify(body.envelope)}\n${END_MARKER}`,connector.config.instanceId);result=connector.local(r,p);}
     else if(p.role!=='operator')throw Error('LOCAL_SCOPE_DENIED');
+    else if(body.action==='native.share'&&runtime&&keys(body,['action','operation','serverId','subscriptionId','confirmationId','phrase'])&&word(body.serverId)&&word(body.subscriptionId)&&
+      (['inspect','preview','revoke'].includes(body.operation)&&body.confirmationId===undefined&&body.phrase===undefined||
+       body.operation==='grant'&&word(body.confirmationId)&&typeof body.phrase==='string'&&body.phrase.length<=430)){
+      result=await runtime.nativeShare(body.serverId,body.operation,body.subscriptionId,body.confirmationId,body.phrase);
+    }
     else if(body.action==='status'&&keys(body,['action','serverId']))result=runtime?runtime.status(body.serverId):connector.status();
     else if(body.action==='sessions'&&keys(body,['action','params']))result=await connector.sessionPage(body.params??{});
     else if(body.action==='recover'&&keys(body,['action','serverId','kind','id','observedTs'])&&['command','outbox'].includes(body.kind)&&word(body.id)){if(runtime)runtime.recover(body.kind,body.id,body.observedTs,body.serverId);else connector.recover(body.kind,body.id,body.observedTs);result={recovered:body.id};}

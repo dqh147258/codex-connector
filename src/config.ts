@@ -12,8 +12,8 @@ function keys(v: unknown, allowed: string[]): v is Record<string, unknown> {
 function ids(value: unknown, re: RegExp, allowEmpty = false): value is string[] {
   return Array.isArray(value) && (allowEmpty || value.length > 0) && value.every(x => typeof x === 'string' && re.test(x));
 }
-function grant(value: unknown, valid: (key: string) => boolean): value is string[] {
-  return Array.isArray(value) && value.length <= 128 && new Set(value).size === value.length && value.every(v => typeof v === 'string' && valid(v));
+function grant(value: unknown, valid: (key: string) => boolean, max = 128): value is string[] {
+  return Array.isArray(value) && value.length <= max && new Set(value).size === value.length && value.every(v => typeof v === 'string' && valid(v));
 }
 function validateProfile(value: unknown): BackendProfile {
   if (!keys(value, ['executable','socketPath','codexHome','expectedVersion','autoStartDaemon','aliases'])) throw Error('Invalid backend profile');
@@ -53,7 +53,7 @@ function configureSlack(c: Config, profiles: Map<string,BackendProfile>): void {
   const s = c.slack;
   if (s === undefined && c.local?.enabled !== true) throw Error('Configure Slack or explicitly enable local mode');
   if (s !== undefined && (!plain(s) || (s.enabled !== undefined && typeof s.enabled !== 'boolean'))) throw Error('Invalid Slack configuration');
-  if (s?.servers !== undefined && !grant(s.servers, id => profiles.has(id))) throw Error('slack.servers must list unique canonical server IDs');
+  if (s?.servers !== undefined && !grant(s.servers, id => profiles.has(id), profiles.size)) throw Error('slack.servers must list unique canonical server IDs');
   if (s === undefined || s.enabled === false) {
     if (c.local?.enabled === false) throw Error('At least one transport must be enabled');
     c.slack = {enabled:false, teamId:'', inputChannel:'', outputChannel:'', allowedHumans:[],approvalUsers:[],trustedBots:[],dot:{name:''},servers:[]};
@@ -73,7 +73,7 @@ function configureAgents(c: Config, profiles: Map<string,BackendProfile>): void 
   for (const agent of agents) {
     if (!keys(agent, ['id','tokenHash','servers','projects','commands']) || !validServerId(agent.id) || names.has(agent.id)) throw Error('Invalid or duplicate local agent ID');
     if (typeof agent.tokenHash !== 'string' || !/^[a-f0-9]{64}$/.test(agent.tokenHash) || hashes.has(agent.tokenHash)) throw Error('Invalid or duplicate local agent token hash');
-    if (!grant(agent.servers, id => profiles.has(id)) || !grant(agent.projects,id => Object.hasOwn(c.projects,id))) throw Error('Agent grants require configured canonical server and project IDs');
+    if (!grant(agent.servers, id => profiles.has(id), profiles.size) || !grant(agent.projects,id => Object.hasOwn(c.projects,id))) throw Error('Agent grants require configured canonical server and project IDs');
     if (!grant(agent.commands, key => key === 'session.events' || Object.hasOwn(COMMANDS,key) && !['approval-decision','input-decision'].includes(COMMANDS[key as keyof typeof COMMANDS].permission))) throw Error('Agent grants require known non-decision commands');
     names.add(agent.id); hashes.add(agent.tokenHash);
   }

@@ -5,6 +5,7 @@ import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {fork} from 'node:child_process';
+import {createServer} from 'node:http';
 import {once} from 'node:events';
 import {DesktopRuntime,desktopChildEnvironment,probeCodex} from '../desktop/runtime.js';
 import {fixture} from './helpers.js';
@@ -33,4 +34,24 @@ test('local-only runtime launches without inheriting Slack credentials; Slack-on
     await assert.rejects(r.listSessions({}),/LOCAL_DISABLED/);
     child.emit('close',0);
   }finally{await f.cleanup();}
+});
+
+test('Desktop runtime projects all validated known Homes past the former 32-row cap',async()=>{
+  const f=fixture(),child=new FakeChild(),token='S'.repeat(44);
+  const valid=Array.from({length:42},(_,i)=>({serverId:'home-'+i,connected:i%2===0,extra:'PRIVATE_HOME'}));
+  const http=createServer((req,res)=>{
+    assert.equal(req.headers.authorization,'Bearer '+token);assert.equal(req.url,'/v1/command');
+    req.resume();res.end(JSON.stringify({ok:true,result:{servers:[...valid,{serverId:'/invalid-private-path',connected:true},{serverId:'wrong-boolean',connected:'true'}]}}));
+  });
+  http.listen(0,'127.0.0.1');await once(http,'listening');
+  const r=new DesktopRuntime(f.dir,'/fixed/cli','/fixed/runtime',(()=>child)as any);
+  try{
+    const address=http.address();assert.ok(address&&typeof address==='object');
+    f.store.close();writeFileSync(join(f.dir,'api.token'),token);
+    r.start({...f.config,port:address.port,local:{enabled:true}});child.emit('message',{type:'connector:ready'});
+    const status=await r.refresh();
+    assert.equal(status.servers?.length,42);assert.deepEqual(status.servers?.at(-1),{serverId:'home-41',connected:false});
+    assert.doesNotMatch(JSON.stringify(status),/PRIVATE_HOME|invalid-private-path/);
+    child.emit('close',0);
+  }finally{await new Promise<void>(done=>http.close(()=>done()));await f.cleanup();}
 });

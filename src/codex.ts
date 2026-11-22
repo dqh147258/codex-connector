@@ -10,6 +10,10 @@ import { canonicalPath, type ServerObservation } from './servers.js';
 import { classifyRpcError, validRpcDiagnostic, type RpcDiagnostic } from './rpc-diagnostics.js';
 const runFile = promisify(execFile);
 const METHODS = new Set(['thread/list','thread/loaded/list','thread/read','thread/start','thread/resume','thread/turns/list','thread/items/list','turn/start','turn/steer','turn/interrupt','thread/queue/add','thread/queue/start','thread/queue/list']);
+export function isBackendResourceExhaustion(error:unknown):boolean {
+  const code=error&&typeof error==='object'&&'code' in error?error.code:undefined;
+  return typeof code==='string'&&['EMFILE','ENFILE','ENOMEM','ENOBUFS','EAGAIN','ENOSPC','EDQUOT'].includes(code);
+}
 export class BackendError extends Error {
   readonly diagnostic?: RpcDiagnostic;
   constructor(readonly code: string, message = code, diagnostic?: RpcDiagnostic) {
@@ -52,9 +56,9 @@ export class SharedAppServer extends EventEmitter implements Backend {
   private checkedAt: string | null = null;
   private failureStage: string | null = null;
   private verifiedHome = false;
-  get observation(): ServerObservation { return { checkedAt: this.checkedAt, homeVerified:this.connected && this.verifiedHome, version: /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,64})?$/.test(this.version) ? this.version : null }; }
+  get observation(): ServerObservation { return { checkedAt: this.checkedAt, resourceExhausted:this.lastFailure==='BACKEND_RESOURCE_EXHAUSTED', homeVerified:this.connected && this.verifiedHome, version: /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,64})?$/.test(this.version) ? this.version : null }; }
   private readonly expectedHome?:string;
-  constructor(private config: Config['backend'], private timeoutMs = 30000, expectedHome?:string) {
+  constructor(private config: Config['backend'], private timeoutMs = 30000, expectedHome?:string, private readonly observeHome?:string) {
     super();
     this.expectedHome=expectedHome ?? (config.codexHome ? canonicalPath(config.codexHome) : undefined);
   }
@@ -64,7 +68,7 @@ export class SharedAppServer extends EventEmitter implements Backend {
     this.connecting = this.open().finally(() => { this.connecting = undefined; }); return this.connecting;
   }
   private async open() {
-    let stage='version-probe';
+    let stage='version-probe',resourceExhausted=false;
     try {
       this.verifiedHome = false;
       const previous = this.child; this.child = undefined; this.socket?.terminate(); this.socket = undefined; previous?.stdin.end(); previous?.kill();
@@ -81,7 +85,7 @@ export class SharedAppServer extends EventEmitter implements Backend {
         if(this.stopped)throw new BackendError('BACKEND_STOPPED');this.daemonStartAttempted=true;
         const start=codexLaunch(this.config.executable,['app-server','daemon','start']);
         try{await runFile(start.file,start.args,{env,timeout:15000,maxBuffer:8192,shell:false,windowsHide:true});this.daemonStartResult='started-or-already-running';}
-        catch{this.daemonStartResult='failed-or-timeout; no automatic retry';throw new BackendError('DAEMON_START_FAILED');}
+        catch(e){this.daemonStartResult='failed-or-timeout; no automatic retry';throw new BackendError(isBackendResourceExhaustion(e)?'BACKEND_RESOURCE_EXHAUSTED':'DAEMON_START_FAILED');}
         if(this.stopped)throw new BackendError('BACKEND_STOPPED');
       }
       stage='proxy-launch';
@@ -108,7 +112,9 @@ export class SharedAppServer extends EventEmitter implements Backend {
         try { if(isBinary)throw new BackendError('INVALID_PROTOCOL'); this.message(JSON.parse(data.toString()),epoch); }
         catch { this.disconnect('INVALID_PROTOCOL'); socket.terminate(); child.kill(); }
       });
-      child.on('error', () => { if(this.child===child) this.disconnect('PROXY_START_FAILED'); });
+      child.on('error', e => {
+        if(this.child===child){resourceExhausted=isBackendResourceExhaustion(e);this.disconnect(resourceExhausted?'BACKEND_RESOURCE_EXHAUSTED':'PROXY_START_FAILED');}
+      });
       child.on('close', () => { socket.terminate(); if (this.child === child) { this.child = undefined; this.disconnect('PROXY_DISCONNECTED'); } });
       await new Promise<void>((resolve,reject)=>{
         socket.once('open',resolve);
@@ -120,12 +126,15 @@ export class SharedAppServer extends EventEmitter implements Backend {
       const hello = await this.request('initialize', {clientInfo:{name:'codex_connector',title:'Codex Connector',version:'0.2.0'},capabilities:{experimentalApi:true}});
       stage='home-verification';
       verifyHandshakeHome(this.expectedHome, hello); this.verifiedHome=!!this.expectedHome;
+      // Existing unpinned single-home setups may still operate, but sharing
+      // requires an affirmative independent Home match from initialize.
+      if(!this.verifiedHome&&this.observeHome)try{verifyHandshakeHome(this.observeHome,hello);this.verifiedHome=true;}catch{/* No native sharing authority. */}
       stage='initialized';
       await this.write({method:'initialized',params:{}}); this.failureStage = null; this.checkedAt = new Date().toISOString(); this.connected = true; this.lastFailure = ''; this.unsupported.clear();
     } catch (e) {
       this.failureStage = stage;
       this.checkedAt = new Date().toISOString();
-      this.lastFailure = e instanceof BackendError ? e.code : 'SHARED_DAEMON_UNAVAILABLE';
+      this.lastFailure = resourceExhausted||isBackendResourceExhaustion(e)?'BACKEND_RESOURCE_EXHAUSTED':e instanceof BackendError ? e.code : 'SHARED_DAEMON_UNAVAILABLE';
       const failed = this.child; this.child = undefined;
       this.socket?.terminate(); failed?.kill(); throw new BackendError(this.lastFailure);
     }

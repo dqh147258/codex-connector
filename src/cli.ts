@@ -2,6 +2,7 @@
 import { desktopScreenPort } from './screen-ipc.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
+import { createInterface } from 'node:readline/promises';
 import { join, resolve } from 'node:path';
 import { SocketModeClient, LogLevel } from '@slack/socket-mode';
 import { home, loadConfig, readToken } from './config.js';
@@ -24,6 +25,7 @@ const allowedOptions:Record<string,string[]>={
   'service-template':['platform','mode','user','node','script','cwd'],
   servers:[],unwatch:['server','session-id','subscription-id'],status:['server'],receipt:['server','work-id'],events:['server','session-id','cursor','wait-ms','limit'],
   command:['name','params','params-file','id','server'],envelope:['name','params','params-file','id','server'],mcp:[],
+  'native-share':['operation','server','subscription-id'],
   recover:['kind','id','observed-ts','server']
 };
 
@@ -46,7 +48,7 @@ async function start(){
   let tick:Promise<void>|undefined,connecting:Promise<void>|undefined,slackTask:Promise<void>|undefined;
   const stop=()=>stopTask??=(async()=>{
     stopping=true;if(timer)clearInterval(timer);
-    runtime.disableSlack();
+    runtime.stopConnecting();runtime.disableSlack();
     const closeHTTP=server?new Promise<void>(r=>{server!.close(()=>r());server!.closeAllConnections();}):Promise.resolve();
     await Promise.all([closeHTTP,link?.close(),tick,connecting,slackTask?.catch(()=>{})]);
     await runtime.close();
@@ -71,7 +73,7 @@ async function start(){
     timer=setInterval(()=>{
       if(stopping)return;
       if(link&&!slackTask)slackTask=link.connect().catch(degraded).finally(()=>{slackTask=undefined;});
-      if(!connecting&&!tick)tick=runtime.tick().catch(()=>console.error('Connector background operation unavailable; inspect status.')).finally(()=>{tick=undefined;});
+      if(!tick)tick=runtime.tick().catch(()=>console.error('Connector background operation unavailable; inspect status.')).finally(()=>{tick=undefined;});
     },5000);
     if(process.connected)process.send?.({type:'connector:ready'});
     console.log('Connector '+config.instanceId+' running; '+(local?'local endpoint 127.0.0.1:'+config.port:'Slack only, no local listener')+'.');
@@ -93,6 +95,7 @@ command --name NAME [--params JSON | --params-file FILE|-] [--server ID] [--id R
 receipt --work-id ID [--server ID]
 events --session-id ID [--server ID] [--cursor CURSOR] [--wait-ms 0..30000] [--limit 1..100]
 unwatch --session-id ID --subscription-id ID [--server ID]
+native-share --operation inspect|grant|revoke --server CANONICAL_ID --subscription-id ID (local operator; grant requires interactive consent)
 mcp (stdio; use a scoped CONNECTOR_TOKEN for agents)
 Local clients may use --port PORT --target INSTANCE with CONNECTOR_TOKEN instead of accessing operator files.
 envelope --name NAME --params JSON [--server ID] [--id ID]
@@ -126,6 +129,24 @@ ${formatHelp(f.command)}`);return;}
       console.log(START_MARKER+'\n'+JSON.stringify(envelope)+'\n'+END_MARKER);return;
     }
     console.log(JSON.stringify(await localClient(f.port,f.target).command(f.name,params,f.id),null,2));return;
+  }
+  if(cmd==='native-share'){
+    if(Object.hasOwn(process.env,'CONNECTOR_TOKEN')||!['inspect','grant','revoke'].includes(f.operation??'')||!f.server||!f['subscription-id'])throw Error('Use the local operator terminal: native-share --operation inspect|grant|revoke --server CANONICAL_ID --subscription-id ID (no CONNECTOR_TOKEN)');
+    const owner=localClient(),subscriptionId=f['subscription-id'];
+    if(f.operation==='grant'){
+      if(!process.stdin.isTTY||!process.stdout.isTTY)throw Error('Native sharing requires an interactive local operator terminal; no automatic consent');
+      const offer=await owner.nativeShare('preview',f.server,subscriptionId) as {confirmationId:string;confirmationPhrase:string;disclosure:string;serverId:string;nativeThreadId:string;workspaceId:string;channel:string;rootThreadTs:string};
+      console.log(`Verified server: ${offer.serverId}; native thread: ${offer.nativeThreadId}
+Slack destination: ${offer.workspaceId} / ${offer.channel} / ${offer.rootThreadTs}
+${offer.disclosure}
+Type the exact confirmation below to grant, or press Enter to cancel:
+${offer.confirmationPhrase}`);
+      const terminal=createInterface({input:process.stdin,output:process.stdout,terminal:true});
+      let answer:string;try{answer=await terminal.question('> ');}finally{terminal.close();}
+      if(answer!==offer.confirmationPhrase){console.log('Not shared.');return;}
+      console.log(JSON.stringify(await owner.nativeShare('grant',f.server,subscriptionId,{confirmationId:offer.confirmationId,phrase:answer}),null,2));return;
+    }
+    console.log(JSON.stringify(await owner.nativeShare(f.operation as 'inspect'|'revoke',f.server,subscriptionId),null,2));return;
   }
   if(cmd==='mcp'&&!process.env.CONNECTOR_TOKEN?.trim())throw Error('Missing CONNECTOR_TOKEN for MCP; use a scoped agent credential');
   const client=localClient(f.port,f.target);
