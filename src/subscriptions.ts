@@ -1,3 +1,4 @@
+import { isThreadHistoryNotPersisted } from './rpc-diagnostics.js';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Backend, Delivery, Source, State } from './types.js';
 
@@ -41,6 +42,9 @@ export class SubscriptionError extends Error {
 }
 const MAX_SUBSCRIPTIONS = 100;
 const MAX_SEEN = 500;
+export const waitForNativePersistence='SUBSCRIPTION_WAITING_FOR_FIRST_PERSISTED_TURN';
+const MAX_FRESH_RETRIES=8;
+const retryDelay=(attempts:number)=>Math.min(120_000,2_000*2**(attempts-1));
 const validId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value);
 const validTimestamp = (value: unknown): value is string => typeof value === 'string' && /^\d{1,20}\.\d{1,10}$/.test(value);
 const sameOwner = (a: Source, b: Source) => a.kind === b.kind && a.userId === b.userId && a.channel === b.channel && a.threadTs === b.threadTs;
@@ -54,6 +58,10 @@ export class SessionSubscriptions {
   private joined = new Map<string, string>();
   private validatedJoiningEpoch = new Map<string, string>();
   private reconnecting?: Promise<void>;
+  private creationEpochs=new Map<string,string>();
+  private persistedTurnEpochs=new Map<string,string>();
+  private freshRetries=new Map<string,{epoch:string;attempts:number;nextAt:number}>();
+  private freshRetry?:Promise<void>;
   constructor(private readonly store: SubscriptionStore, private readonly backend: Backend, private readonly hooks: SubscriptionHooks) {
     const events = store.state.subscriptionEvents;
     if (events !== undefined && (!events || typeof events !== 'object' || Array.isArray(events) ||
@@ -80,6 +88,41 @@ export class SessionSubscriptions {
     catch { return false; }
   }
   allow(subscription: Subscription) { return this.allowed(subscription); }
+  private positiveFreshCreation(row:Subscription,d:Readonly<State>){
+    const c=d.nativeShareCreations?.find(x=>x.status==='proven'&&x.resultThreadId===row.threadId&&x.resultSubscriptionId===row.id);
+    return !!c&&d.nativeShares?.some(g=>g.state!=='retired'&&g.creationId===c.id&&g.nativeThreadId===row.threadId&&g.subscriptionId===row.id&&g.nativeCreatedAt===c.resultCreatedAt)===true;
+  }
+  private markWaiting(id:string,epoch:string,live:boolean){
+    if(!this.backend.connected||this.backend.epoch!==epoch)return;
+    this.store.transaction(d=>{
+      const sub=d.subscriptions?.find(r=>r.id===id);
+      if(!sub||!this.allowed(sub)||!this.positiveFreshCreation(sub,d))return;
+      sub.status=live?'active':'joining';sub.error=waitForNativePersistence;
+      if(live)this.joined.set(id,epoch);else this.joined.delete(id);
+    });
+  }
+  /** A validated metadata-only turns page, not a noisy live notification. */
+  sawPersistedTurn(id:string,epoch:string){
+    if(this.backend.connected&&epoch===this.backend.epoch)this.persistedTurnEpochs.set(id,epoch);
+  }
+  /** One bounded, exact-ID observation attempt per tick and per backend.
+   * The original creation listener does not need reconnect attempts until
+   * actual persisted-turn evidence arrives. Never boot or submit a turn. */
+  retryFreshObservations():Promise<void>{
+    if(!this.backend.connected||this.freshRetry)return this.freshRetry??Promise.resolve();
+    const d=this.store.state,epoch=this.backend.epoch,now=Date.now();
+    const row=(d.subscriptions??[]).find(sub=>{
+      if(sub.error!==waitForNativePersistence||!this.allowed(sub)||!this.positiveFreshCreation(sub,d))return false;
+      if(this.joined.get(sub.id)===epoch&&this.persistedTurnEpochs.get(sub.id)!==epoch)return false;
+      const prior=this.freshRetries.get(sub.id);
+      return !prior||prior.epoch!==epoch||prior.attempts<MAX_FRESH_RETRIES&&prior.nextAt<=now;
+    });
+    if(!row)return Promise.resolve();
+    const prior=this.freshRetries.get(row.id),attempts=(prior?.epoch===epoch?prior.attempts:0)+1;
+    this.freshRetries.set(row.id,{epoch,attempts,nextAt:now+retryDelay(attempts)});
+    const next=this.restore(row.id,true).catch(()=>{}).finally(()=>{if(this.freshRetry===next)this.freshRetry=undefined;});
+    this.freshRetry=next;return next;
+  }
   private connectionReady(id: string) {
     return this.backend.connected &&
       (this.joined.get(id) === this.backend.epoch || this.validatedJoiningEpoch.get(id) === this.backend.epoch);
@@ -133,6 +176,7 @@ export class SessionSubscriptions {
       if(rows.some(s=>s.threadId===sub.threadId)||state.sessions.some(s=>s.threadId===sub.threadId))fail('SUBSCRIPTION_THREAD_INVALID');
       rows.push(sub);record(state,sub);
     });
+    this.creationEpochs.set(sub.id,epoch);
     // The fresh identity is durable before yielding. Safe live request
     // candidates may arrive during this metadata read; no delivery can yet.
     const response=await this.backend.rpc('thread/read',{threadId:sub.threadId,includeTurns:false});
@@ -219,7 +263,10 @@ export class SessionSubscriptions {
     const row = this.store.state.subscriptions?.find(s => s.id === id);
     if (!row?.enabled) return;
     if (!this.allowed(row)) { this.disable(id, 'SUBSCRIPTION_SCOPE_REVOKED'); fail('SUBSCRIPTION_SCOPE_REVOKED'); }
-    if (epoch !== this.backend.epoch || !this.backend.connected) { this.disable(id, 'SUBSCRIPTION_BACKEND_CHANGED'); fail('SUBSCRIPTION_BACKEND_CHANGED'); }
+    if (epoch !== this.backend.epoch || !this.backend.connected) {
+      if(this.positiveFreshCreation(row,this.store.state)){this.waitAfterDisconnect(id);return;}
+      this.disable(id, 'SUBSCRIPTION_BACKEND_CHANGED');fail('SUBSCRIPTION_BACKEND_CHANGED');
+    }
     try {
       // Callers have just confirmed loaded state and fresh metadata in this epoch.
       // Replay may enqueue during resume. Delivery waits for the returned metadata validation.
@@ -238,9 +285,42 @@ export class SessionSubscriptions {
       else this.joined.delete(id);
 
     } catch (error) {
+      const d=this.store.state,latest=d.subscriptions?.find(s=>s.id===id);
+      if(latest&&this.allowed(latest)&&this.positiveFreshCreation(latest,d)&&isThreadHistoryNotPersisted(error)&&
+         this.backend.connected&&this.backend.epoch===epoch){
+        let live=false;
+        // The pinned server attaches the creating client before the successful
+        // thread/start response. Only this same connection can use that proof;
+        // a new connection needs warm replay after persistence.
+        if(this.creationEpochs.get(id)===epoch){
+          try{
+            await this.confirmLoaded(latest.threadId);
+            const scope=await this.metadata(latest.threadId,latest.owner);
+            if(scope.cwd!==latest.cwd)fail('SUBSCRIPTION_SCOPE_REVOKED');
+            live=this.backend.connected&&this.backend.epoch===epoch;
+          }catch(e){
+            const code=subscriptionPolicyError(e,'SUBSCRIPTION_JOIN_FAILED');
+            if(['SUBSCRIPTION_SCOPE_REVOKED','SUBAGENT_THREAD_NOT_SUPPORTED','NATIVE_THREAD_ROOT_UNVERIFIED'].includes(code)){
+              this.disable(id,code);throw new SubscriptionError(code);
+            }
+          }
+        }
+        this.markWaiting(id,epoch,live);
+        return;
+      }
       const code = subscriptionPolicyError(error,'SUBSCRIPTION_JOIN_FAILED');
+      if(latest&&this.allowed(latest)&&this.positiveFreshCreation(latest,d)&&(!this.backend.connected||this.backend.epoch!==epoch)){
+        this.waitAfterDisconnect(id);return;
+      }
       this.disable(id, code); throw new SubscriptionError(code);
     }
+  }
+
+  private waitAfterDisconnect(id:string){
+    this.store.transaction(d=>{
+      const row=d.subscriptions?.find(r=>r.id===id);
+      if(row&&this.allowed(row)&&this.positiveFreshCreation(row,d)){row.status='joining';row.error=waitForNativePersistence;this.joined.delete(id);}
+    });
   }
 
   private disableIn(state: SubscriptionState, id: string, error?: string) {
@@ -248,6 +328,7 @@ export class SessionSubscriptions {
     if (!row) return;
     row.enabled = false; row.status = error ? 'error' : 'disabled';
     this.joined.delete(id); this.validatedJoiningEpoch.delete(id);
+    this.creationEpochs.delete(id);this.persistedTurnEpochs.delete(id);this.freshRetries.delete(id);
     for (const [key, ids] of Object.entries(state.subscriptionEvents || {})) state.subscriptionEvents![key] = ids.filter(candidate => candidate !== id);
     if (error) row.error = error; else delete row.error;
     for (const delivery of state.outbox as SubscriptionDelivery[]) if (delivery.subscriptionId === id && delivery.status === 'queued') {
@@ -277,20 +358,20 @@ export class SessionSubscriptions {
     this.reconnecting = this.rejoinAll().finally(() => { this.reconnecting = undefined; });
     return this.reconnecting;
   }
-  private restore(id: string): Promise<void> {
+  private restore(id: string,forceFreshReplay=false): Promise<void> {
     const pending = this.restoring.get(id);
     if (pending) return pending;
-    const operation = this.restoreOne(id).finally(() => this.restoring.delete(id));
+    const operation = this.restoreOne(id,forceFreshReplay).finally(() => this.restoring.delete(id));
     this.restoring.set(id, operation);
     return operation;
   }
-  private async restoreOne(id: string) {
+  private async restoreOne(id: string,forceFreshReplay:boolean) {
     const row = this.store.state.subscriptions?.find(s => s.id === id);
     if (!row?.enabled) return;
+    const epoch=this.backend.epoch;
     try {
       if (!this.allowed(row)) fail('SUBSCRIPTION_SCOPE_REVOKED');
-      if (this.backend.connected && this.joined.get(id) === this.backend.epoch) return;
-      const epoch = this.backend.epoch;
+      if (!forceFreshReplay&&this.backend.connected&&this.joined.get(id)===epoch) return;
       await this.confirmLoaded(row.threadId);
       const scope = await this.metadata(row.threadId, row.owner);
       if (scope.cwd !== row.cwd) fail('SUBSCRIPTION_SCOPE_REVOKED');
@@ -300,6 +381,13 @@ export class SessionSubscriptions {
       await this.join(id, epoch);
     } catch (error) {
       const code = subscriptionPolicyError(error,'SUBSCRIPTION_JOIN_FAILED');
+      const d=this.store.state,latest=d.subscriptions?.find(s=>s.id===id);
+      if(latest&&this.allowed(latest)&&this.positiveFreshCreation(latest,d)&&
+        (['SUBSCRIPTION_NOT_CONFIRMED_LOADED','SUBSCRIPTION_METADATA_UNAVAILABLE'].includes(code)||!this.backend.connected||this.backend.epoch!==epoch)){
+        if(this.backend.connected&&this.backend.epoch===epoch)this.markWaiting(id,epoch,this.joined.get(id)===epoch);
+        else this.waitAfterDisconnect(id);
+        return;
+      }
       this.disable(id, code); throw new SubscriptionError(code);
     }
   }

@@ -181,7 +181,9 @@ export class Runtime {
     if(this.closed)return;
     await Promise.all([...this.cores.values()].map(async c=>{
       if(!c.backend.connected)void this.connectCore(c).catch(()=>{});
-      await c.expire();c.nativeSharing?.tick();c.pump();c.flush();
+      await c.expire();
+      if(this.slackReady&&this.slackIds.includes(c.runtime!.id))void c.subscriptions.retryFreshObservations().catch(()=>{});
+      c.nativeSharing?.tick();c.pump();c.flush();
     }));
   }
   async close(){if(this.closed)return;this.closed=true;this.stopConnecting();this.disableSlack();try{await Promise.all([...this.cores.values()].map(async c=>{try{await c.close();}finally{c.store.close();}}));}finally{closeSync(this.lock);unlinkSync(join(this.dir,'runtime.lock'));}}

@@ -36,3 +36,18 @@ test('diagnostic validation fails closed on arbitrary fields, labels and invalid
     assert.equal(new BackendError('RPC_REJECTED', undefined, value as any).diagnostic, undefined);
   }
 });
+
+test('blank-thread deferral recognizes only the same exact native UUID, code and relevant read RPC',()=>{
+  const id='00000000-1111-7111-8111-200000000001',other='00000000-1111-7111-8111-200000000002';
+  for(const method of ['thread/resume','thread/turns/list'])for(const noun of ['thread','conversation']){
+    const message='no rollout found for '+noun+' id '+id;
+    const exact=classifyRpcError(method,-32600,message,undefined,id);
+    assert.equal(exact.classification,'THREAD_HISTORY_NOT_PERSISTED');
+    assert.doesNotMatch(JSON.stringify(exact),new RegExp(id));
+    assert.equal(classifyRpcError(method,-32600,message,undefined,other).classification,'INVALID_REQUEST');
+    assert.equal(classifyRpcError(method,-32600,message+'\n',undefined,id+'\n').classification,'INVALID_REQUEST');
+    assert.equal(classifyRpcError(method,-32600,'prefix '+message,undefined,id).classification,'INVALID_REQUEST');
+    assert.equal(classifyRpcError(method,-32603,message,undefined,id).classification,'INTERNAL_ERROR');
+    assert.equal(classifyRpcError('thread/read',-32600,message,undefined,id).classification,'INVALID_REQUEST');
+  }
+});

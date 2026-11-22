@@ -9,6 +9,8 @@ import { parseConfig } from '../src/config.js';
 import { Runtime } from '../src/runtime.js';
 import { apiServer } from '../src/server.js';
 import type { SlackPort } from '../src/types.js';
+import { BackendError } from '../src/codex.js';
+import { classifyRpcError } from '../src/rpc-diagnostics.js';
 import { FakeBackend,FakeThreads,rootThread,event,request,waitFor } from './helpers.js';
 
 const ORIGINAL='00000000-1111-7111-8111-100000000001', FRESH='00000000-1111-7111-8111-200000000001';
@@ -16,12 +18,14 @@ const ROOT='101.2', OTHER='201.3', OP='c'.repeat(48), AGENT='d'.repeat(48), BIRT
 const asTurn=(id:string,status:string,items:any[]=[])=>({id,status,itemsView:'full',items});
 const reply=(id:string,text:string,phase='final_answer')=>({id,type:'agentMessage',text,phase});
 function deferred<T=void>(){let resolve!:(v:T)=>void;const promise=new Promise<T>(r=>{resolve=r;});return{resolve,promise};}
-interface Ledgers { threads:FakeThreads; turns:Map<string,any[]>; createCount:number }
+interface Ledgers { threads:FakeThreads; turns:Map<string,any[]>; createCount:number; unpersisted:Set<string> }
 class NativeBackend extends FakeBackend{
   onStart?:(thread:any)=>Promise<any>;
   afterResume?:(id:string)=>void;
   beforeRead?:(threadId:string)=>Promise<void>;
   withoutLiveTurns=false;
+  blankOnCreate=false;
+  saveHistory(id:string){this.ledger.unpersisted.delete(id);}
   liveItems=new Map<string,any[]>();
   constructor(private ledger:Ledgers,private project:string){
     super();this.threads=ledger.threads;this.epoch=randomUUID();
@@ -29,11 +33,17 @@ class NativeBackend extends FakeBackend{
   get observation(){return{version:'0.171.0-alpha.13',homeVerified:this.connected,checkedAt:'2026-11-22T00:00:00Z'};}
   private rows(id:string){return this.ledger.turns.get(id)??[];}
   override async rpc(method:string,p:any):Promise<any>{
+    if(['thread/resume','thread/turns/list'].includes(method)&&this.ledger.unpersisted.has(p.threadId)){
+      this.calls.push({method,params:p});
+      throw new BackendError('RPC_REJECTED',undefined,classifyRpcError(method,-32600,
+        'no rollout found for thread id '+p.threadId,undefined,p.threadId));
+    }
     if(method==='thread/start'){
       this.calls.push({method,params:p});
       const n=++this.ledger.createCount,id=n===1?FRESH:randomUUID().replace(/^(.{14})4/,(_m,head)=>head+'7');
       const thread=rootThread(id,p.cwd,{source:'appServer',createdAt:BIRTH+n,status:{type:'idle'},canAcceptDirectInput:true,turns:[],ephemeral:false});
       this.threads.set(id,thread);this.ledger.turns.set(id,[]);
+      if(this.blankOnCreate)this.ledger.unpersisted.add(id);
       return this.onStart?this.onStart(structuredClone(thread)):{thread:structuredClone(thread)};
     }
     if(method==='thread/read'){
@@ -98,7 +108,7 @@ async function fixture(n=1){
       let data=stores.get(id);
       if(!data){
         data={threads:new FakeThreads([[ORIGINAL,rootThread(ORIGINAL,project,{createdAt:BIRTH,status:{type:'idle'},canAcceptDirectInput:true})]]),
-          turns:new Map([[ORIGINAL,[asTurn('old-history','completed',[reply('old-item','Original private history.')])]]]),createCount:0};
+          turns:new Map([[ORIGINAL,[asTurn('old-history','completed',[reply('old-item','Original private history.')])]]]),createCount:0,unpersisted:new Set()};
         stores.set(id,data);
       }
       const b=new NativeBackend(data,project);backends.set(id,b);return b;
@@ -245,6 +255,62 @@ test('a proven creation with failed warm observation does not repeat creation or
     b.publish(FRESH,'no-fallback',[reply('no-fallback-message','No fallback delivery after join error.')]);
     await sleep(30);never(f,'No fallback delivery');
     assert.equal(f.stores.get('default')!.createCount,1);
+  }finally{await f.close();}
+});
+
+test('exact missing blank history preserves the creating listener and delivers the first normal question and reply',async()=>{
+  const f=await fixture();try{
+    await f.start();const source=await f.subscribe(),b=f.backends.get('default')!,core=f.runtime.core('default');
+    b.blankOnCreate=true;
+    const created=await f.create(source),newId=created.newSubscriptionId!;
+    assert.equal(created.status,'proven');assert.equal(created.newNativeThreadId,FRESH);
+    assert.equal(core.store.state.subscriptions?.find(s=>s.id===newId)?.enabled,true);
+    assert.equal(core.subscriptions.deliveryAllowed(newId),true);
+    assert.equal((f.inspect(newId) as any).observation,'live-awaiting-persistence');
+    const beforeResume=b.calls.filter(c=>c.method==='thread/resume').length;
+    for(let n=0;n<20;n++)await core.subscriptions.retryFreshObservations();
+    assert.equal(b.calls.filter(c=>c.method==='thread/resume').length,beforeResume,'blank polls never retry a working creation listener');
+    b.ongoing(FRESH,'first-normal',[],true);b.saveHistory(FRESH);
+    b.ask(FRESH,'first-normal','first-question',84,'Which arrangement suits the first draft?');
+    await observed(f,'arrangement suits the first draft');
+    await core.subscriptions.retryFreshObservations();
+    assert.equal((f.inspect(newId) as any).observation,'connected');
+    b.publish(FRESH,'first-normal',[reply('first-normal-reply','The first ordinary reply was saved.')]);
+    await observed(f,'first ordinary reply was saved');
+    assert.equal(b.calls.filter(c=>c.method==='thread/start').length,1);
+    assert.equal(b.responses.length,0);
+    assert.ok(!b.calls.some(c=>['turn/start','turn/interrupt','turn/steer','thread/queue/add','thread/queue/start'].includes(c.method)));
+  }finally{await f.close();}
+});
+
+test('disconnect during an unsaved first turn keeps the exact grant paused, then safely rejoins a persisted callback',async()=>{
+  const f=await fixture();try{
+    await f.start();const source=await f.subscribe(),before=f.backends.get('default')!;
+    before.blankOnCreate=true;
+    const created=await f.create(source),newId=created.newSubscriptionId!;
+    before.ongoing(FRESH,'unsaved-first-turn',[],true);
+    before.ask(FRESH,'unsaved-first-turn','still-waiting',86,'Which format should this resumed project use?');
+    await waitFor(()=>f.inspect(newId).reason==='SUBSCRIPTION_WAITING_FOR_FIRST_PERSISTED_TURN');
+    await f.restart();
+    const b=f.backends.get('default')!,core=f.runtime.core('default');
+    assert.equal(core.store.state.subscriptions?.find(s=>s.id===newId)?.enabled,true);
+    assert.equal(core.subscriptions.deliveryAllowed(newId),false,'new connection does not inherit creation listener');
+    assert.equal((f.inspect(newId) as any).observation,'waiting-for-persisted-connection');
+    const beforeRetry=b.calls.filter(c=>c.method==='thread/resume'&&c.params.threadId===FRESH).length;
+    await core.subscriptions.retryFreshObservations();
+    for(let n=0;n<20;n++)await core.subscriptions.retryFreshObservations();
+    assert.equal(b.calls.filter(c=>c.method==='thread/resume'&&c.params.threadId===FRESH).length,beforeRetry+1);
+    never(f,'resumed project use');
+    b.saveHistory(FRESH);
+    b.afterResume=id=>{if(id===FRESH)setTimeout(()=>b.ask(FRESH,'unsaved-first-turn','still-waiting',86,'Which format should this resumed project use?'),10);};
+    // A real reconnect remains a bounded immediate observation attempt, not
+    // permission inherited from the previously detached connection.
+    await core.subscriptions.rejoin();
+    await observed(f,'resumed project use');
+    assert.equal(core.subscriptions.deliveryAllowed(newId),true);
+    assert.equal(f.stores.get('default')!.createCount,1);
+    assert.equal(b.responses.length,0);
+    assert.ok(!b.calls.some(c=>['turn/start','turn/interrupt','turn/steer','thread/queue/add','thread/queue/start'].includes(c.method)));
   }finally{await f.close();}
 });
 

@@ -2,7 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { actionableQuestion,answerSpec,canOfferQuestion,closeQuestionEvidence,confirmQuestionPost,nativeAnswerPayload,newQuestionReference,
   observeQuestionEvidence,questionDigest,stageQuestionPost,type AnswerSpec } from './native-question-evidence.js';
 import { deliveryId, terminalExecution } from './session-delivery.js';
-import type { Subscription } from './subscriptions.js';
+import { waitForNativePersistence,type Subscription } from './subscriptions.js';
+import { isThreadHistoryNotPersisted } from './rpc-diagnostics.js';
 import type { Backend, Delivery, Source, State } from './types.js';
 import type { Store } from './store.js';
 import { projectNativeMessage, projectNativeItem, projectNativeInput, renderNativeProjection, type NativeProjection } from './shared-native-content.js';
@@ -62,6 +63,7 @@ type Callback = {
   validateThread(sub: Subscription, thread: unknown): boolean;
   online(): boolean;
   joined(subId: string): boolean;
+  provedPersistedTurn(subId:string,epoch:string):void;
   sameSlackConnection(): number;
   threadExists(channel: string, ts: string): Promise<boolean>;
   projectPath(alias:string):string|undefined;
@@ -210,7 +212,11 @@ export class NativeSharing {
       w.bytes+=Buffer.byteLength(JSON.stringify(response),'utf8');
       if(w.bytes>MAX_BYTES)fail('NATIVE_SHARE_HISTORY_GAP');
       return response;
-    }catch(e){if(e instanceof NativeShareError)throw e;return fail('NATIVE_SHARE_HISTORY_GAP');}
+    }catch(e){
+      if(e instanceof NativeShareError)throw e;
+      if(method==='thread/turns/list'&&isThreadHistoryNotPersisted(e))return fail('NATIVE_SHARE_HISTORY_NOT_PERSISTED');
+      return fail('NATIVE_SHARE_HISTORY_GAP');
+    }
     finally{if(timer)clearTimeout(timer);}
   }
   private async metadata(sub:Subscription,w:Window){
@@ -266,7 +272,10 @@ export class NativeSharing {
       questionAnswerMode:row?.answerUsers?.length?'named-humans-choice-only':'original-codex-only',
       questionDiagnostics:row?structuredClone(this.questionCounters.get(row.id)??{}):{},
       status:!row?'unshared':row.state==='retired'?'retired':row.state==='pending'?'pending':!scope||!equalRoute(scope,row)||!this.backend.connected||!this.hooks.online()||!this.hooks.joined(id)?'paused':row.observationalGap?'gap':this.ready.get(row.id)===this.backend.epoch?'active':'checking',
-      reason:row?.reason??row?.observationalGap??null,
+      reason:row?.reason??sub.error??row?.observationalGap??null,
+      observation:sub.error===waitForNativePersistence?
+        this.hooks.joined(id)?'live-awaiting-persistence':'waiting-for-persisted-connection':
+        this.hooks.joined(id)?'connected':'not-confirmed',
       activation:row?{consentRecordedAt:row.grantedAt,deliveryEnabledAt:row.activatedAt??null,
         boundaryPolicy:row.boundaryPolicy??null,
         nativeBoundary:verifiedCreation(row,d)?{kind:'positive-new-thread-response',threadId:row.nativeThreadId}:null}:null,
@@ -592,6 +601,7 @@ export class NativeSharing {
         pageCursors.add(upstream.next);after=upstream.next;
       }
       if(!known)fail('NATIVE_SHARE_HISTORY_GAP');
+      if(frame.length&&this.current(w))this.hooks.provedPersistedTurn(sub.id,w.epoch);
       const active=frame.filter(t=>!terminalExecution(t.status));
       // One native active turn, and it must be the newest position. Do not
       // advance past an unresolved older turn or reinterpret out-of-order data.

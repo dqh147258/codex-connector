@@ -3,6 +3,7 @@
 export const RPC_CLASSIFICATIONS = [
   'PARSE_ERROR', 'INVALID_REQUEST', 'METHOD_NOT_FOUND', 'INVALID_PARAMS', 'INTERNAL_ERROR',
   'QUEUE_ENTRY_NOT_FOUND', 'THREAD_BUSY', 'THREAD_RESUME_REQUIRED', 'QUEUE_UNAVAILABLE',
+  'THREAD_HISTORY_NOT_PERSISTED',
   'UNCLASSIFIED',
 ] as const;
 export type RpcClassification = typeof RPC_CLASSIFICATIONS[number];
@@ -15,7 +16,7 @@ export function validRpcDiagnostic(value: unknown): value is RpcDiagnostic {
     Number.isSafeInteger(d.rpcCode) && RPC_CLASSIFICATIONS.includes(d.classification);
 }
 
-export function classifyRpcError(method: string, rpcCode: number, message: string, queuedSubmissionId?: string): RpcDiagnostic {
+export function classifyRpcError(method: string, rpcCode: number, message: string, queuedSubmissionId?: string, threadId?:string): RpcDiagnostic {
   let classification: RpcClassification = ({
     [-32700]: 'PARSE_ERROR', [-32600]: 'INVALID_REQUEST', [-32601]: 'METHOD_NOT_FOUND',
     [-32602]: 'INVALID_PARAMS', [-32603]: 'INTERNAL_ERROR',
@@ -29,9 +30,18 @@ export function classifyRpcError(method: string, rpcCode: number, message: strin
   }
   if (['thread/queue/add','thread/queue/start','thread/queue/list'].includes(method) && rpcCode === -32600 &&
       message === 'user message queue is unavailable') classification = 'QUEUE_UNAVAILABLE';
+  if ((method==='thread/resume'||method==='thread/turns/list')&&rpcCode===-32600&&threadId&&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\s\S])/i.test(threadId)&&
+    (message===('no rollout found for thread id '+threadId)||message===('no rollout found for conversation id '+threadId)))
+    classification='THREAD_HISTORY_NOT_PERSISTED';
   return { rpcCode, classification };
 }
 
 export function formatRpcDiagnostic(value: unknown): string {
   return validRpcDiagnostic(value) ? `JSON-RPC ${value.rpcCode}; reason=${value.classification}` : 'RPC details unavailable';
+}
+
+export function isThreadHistoryNotPersisted(error: unknown):boolean {
+  const e=error as {diagnostic?:unknown}|undefined;
+  return validRpcDiagnostic(e?.diagnostic)&&e.diagnostic.rpcCode===-32600&&e.diagnostic.classification==='THREAD_HISTORY_NOT_PERSISTED';
 }

@@ -97,6 +97,7 @@ export class Connector {
       online:()=>runtime.slackReady(),
       sameSlackConnection:()=>runtime.slackConnection?.()??0,
       joined:id=>this.subscriptions.deliveryAllowed(id),
+      provedPersistedTurn:(id,epoch)=>this.subscriptions.sawPersistedTurn(id,epoch),
       threadExists:(channel,ts)=>this.slack.verifySharedRoot?this.slack.verifySharedRoot(channel,ts):this.slack.threadExists(channel,ts),
       queue:(d,sub,projected,text)=>this.outputNative(d,sub,projected,text),
       flush:()=>this.flush(),
