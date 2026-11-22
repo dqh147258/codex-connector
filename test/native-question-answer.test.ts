@@ -17,6 +17,7 @@ import { FakeBackend,FakeThreads,event,request,waitFor } from './helpers.js';
 const ORIGINAL='00000000-1111-7111-8111-100000000001';
 const DEDICATED='00000000-1111-7111-8111-200000000001';
 const TURN='native-turn-common', ITEM='native-question-common', RPC=848, BIRTH=1763800100;
+const FORM_ONE='f'.repeat(32), FORM_TWO='g'.repeat(32);
 const APP='AQUESTIONS', ACCOUNT='T1', CHANNEL='CIN', PERMITTED='U1', NONDELEGATED='U2';
 interface Card {channel:string;root:string;ts:string;text:string;reference?:string;count?:number}
 type NativeOffer={id:string|number;method:string;params:{
@@ -117,11 +118,10 @@ async function fixture(homes=1,sdkWire=false){
   };
   const sdk=sdkWire?new SocketModeClient({appToken:'test-no-credential',autoReconnectEnabled:false}):undefined;
   const web=sdk?new SlackClient('test-no-credential'):undefined,apiPosts:any[]=[],forms:any[]=[],statusUpdates:any[]=[];
-  let link:SlackLink|undefined,seq=0;
+  let link:SlackLink|undefined,seq=0,viewSeq=0;
   if(sdk&&web){
     (sdk as any).start=async()=>({});(sdk as any).disconnect=async()=>{};(sdk as any).send=async()=>{};
     (web.web as any).axios.defaults.adapter=()=>{throw Error('External network disabled in SDK fixture');};
-    web.verifySharedRoot=(c,ts)=>checkRoot(c,ts);
     web.resolveDot=slack.resolveDot;
     const api=async(method:string,opts:any):Promise<any>=>{
       if(method==='auth.test')return {ok:true,team_id:ACCOUNT,user_id:'USELF',bot_id:'BSELF'};
@@ -130,14 +130,18 @@ async function fixture(homes=1,sdkWire=false){
       if(method==='chat.postMessage'){
         const ts='450.'+(apiPosts.length+1);apiPosts.push({...opts,ts});return {ok:true,channel:opts.channel,ts};
       }
-      if(method==='views.open')return {ok:true,view:{...opts.view,id:'VNATIVE45',team_id:ACCOUNT,app_id:APP}};
+      if(method==='conversations.history'){
+        assert.equal(opts.oldest,opts.latest);assert.equal(opts.inclusive,true);
+        return {ok:true,messages:await checkRoot(opts.channel,opts.oldest)?[{ts:opts.oldest}]:[]};
+      }
+      if(method==='views.open')return {ok:true,view:{...opts.view,id:'VNATIVE'+(++viewSeq),team_id:ACCOUNT,app_id:APP}};
       if(method==='views.update'){
         if(opts.view.submit)forms.push({...opts.view,id:opts.view_id,team_id:ACCOUNT,app_id:APP});else statusUpdates.push(opts.view);
         return {ok:true};
       }
       throw Error('Unrecognized SDK request in fixture: '+method);
     };
-    for(const method of ['auth.test','bots.info','users.info','chat.postMessage','views.open','views.update']){
+    for(const method of ['auth.test','bots.info','users.info','chat.postMessage','conversations.history','views.open','views.update']){
       const [component,route]=method.split('.') as [string,string];
       (web.web as any)[component][route]=(opts:any)=>api(method,opts);
     }
@@ -231,14 +235,17 @@ test('authorized choices bind the acknowledged Slack card to exactly one typed n
       {header:'Choose tone',question:'What tone fits this preview?',labels:['Quiet','Bright']},
     ]});
     assert.ok(!card.text.includes('layout_key')&&!card.text.includes('tone_key')&&!card.text.includes('Uses a compact layout.'));
-    for(const invalid of [[0],[1,2],[-1,0],[0,1.5]])assert.equal(await f.gateway.submitQuestion(a,invalid),'denied');
+    for(const invalid of [[0],[1,2],[-1,0],[0,1.5]])assert.equal(await f.gateway.submitQuestion(a,invalid,FORM_ONE),'denied');
     assert.deepEqual(nativeResponses(f),[]);
-    assert.equal(await f.gateway.submitQuestion(a,[1,0]),'submitted');
+    assert.equal(await f.gateway.submitQuestion(a,[1,0],FORM_ONE),'submitted');
     assert.deepEqual(nativeResponses(f),[{id:'native-rpc-string',result:{answers:{
       layout_key:{answers:['Spacious']},tone_key:{answers:['Quiet']},
     }}}]);
     assert.deepEqual(b.expectedEpochs,[b.epoch]);
-    assert.equal(await f.gateway.submitQuestion(a,[0,1]),'submitted','Already sent receipt may be repeated, never the native write');
+    assert.equal(await f.gateway.submitQuestion(a,[1,0],FORM_ONE),'submitted','Identical form and selections get the exact previous receipt');
+    assert.equal(await f.gateway.submitQuestion(a,[0,1],FORM_ONE),'prior-answer','A replay using the same nonce must not claim a different selection was sent');
+    assert.equal(await f.gateway.submitQuestion(a,[1,0],FORM_TWO),'prior-answer','A different form must not claim a receipt for an identical choice');
+    assert.equal(await f.gateway.submitQuestion(a,[0,1],FORM_TWO),'prior-answer','A different form must not claim the first form’s receipt');
     assert.equal(nativeResponses(f).length,1);
     assert.equal(f.rt.core('default').store.state.nativeQuestionAnswers?.at(-1)?.status,'submitted');
   }finally{release.resolve();await f.close();}
@@ -251,12 +258,12 @@ test('owner-selected humans and exact app/team/root/channel/message/reference ar
       {channel:'COUT'},{rootThreadTs:'202.4'},{messageTs:'420.099'},{reference:'reference-that-was-never-posted'}]){
       const variant={...valid,...patch};
       assert.equal(await f.gateway.openQuestion(variant),undefined,JSON.stringify(patch));
-      assert.notEqual(await f.gateway.submitQuestion(variant,[0]),'submitted');
+      assert.notEqual(await f.gateway.submitQuestion(variant,[0],FORM_ONE),'submitted');
     }
     assert.ok(await f.gateway.openQuestion(valid));
     await f.rt.nativeShare('default','revoke',grant);
     assert.equal(await f.gateway.openQuestion(valid),undefined);
-    assert.notEqual(await f.gateway.submitQuestion(valid,[0]),'submitted');
+    assert.notEqual(await f.gateway.submitQuestion(valid,[0],FORM_ONE),'submitted');
     assert.deepEqual(nativeResponses(f),[]);
   }finally{await f.close();}
 });
@@ -268,7 +275,7 @@ test('identical native identities across three verified Homes are dispatched onl
     const offers=await Promise.all(f.ids.map((id,i)=>eligible(f,ordinary(),id,roots[i]!)));
     assert.equal(new Set(offers.map(o=>o.reference)).size,3);
     assert.equal(await f.gateway.openQuestion({...offers[2]!,reference:offers[0]!.reference}),undefined);
-    assert.equal(await f.gateway.submitQuestion(offers[2]!,[0]),'submitted');
+    assert.equal(await f.gateway.submitQuestion(offers[2]!,[0],FORM_ONE),'submitted');
     assert.deepEqual(nativeResponses(f,'default'),[]);assert.deepEqual(nativeResponses(f,'extra1'),[]);
     assert.deepEqual(nativeResponses(f,'extra2'),[{id:RPC,result:{answers:{layout_key:{answers:['Compact']}}}}]);
   }finally{await f.close();}
@@ -281,15 +288,17 @@ test('native UI resolution during Slack submission preflight wins even if the wa
     assert.ok(await f.gateway.openQuestion(a));
     let checking=false;
     f.root(async()=>{checking=true;await release.promise;return true;});
-    const submit=f.gateway.submitQuestion(a,[0]);
+    const submit=f.gateway.submitQuestion(a,[0],FORM_ONE);
     await waitFor(()=>checking);
     b.resolveRequest(RPC);
     await waitFor(()=>f.rt.core('default').store.state.nativeQuestionAnswers?.at(-1)?.status==='closed');
     assert.deepEqual(f.model.get('default')!.threads.get(DEDICATED).status.activeFlags,['waitingOnUserInput']);
     release.resolve();
-    assert.notEqual(await submit,'submitted');
+    assert.equal(await submit,'closed');
     assert.equal(await f.gateway.openQuestion(a),undefined);
-    assert.notEqual(await f.gateway.submitQuestion(a,[0]),'submitted');
+    assert.equal(await f.gateway.submitQuestion(a,[0],FORM_ONE),'closed');
+    f.rt.core('default').store.transaction(d=>{delete d.nativeQuestionAnswers!.at(-1)!.nativeClosed;});
+    assert.equal(await f.gateway.submitQuestion(a,[0],FORM_ONE),'unavailable','Old ambiguous closure rows must not claim a positive native close');
     assert.deepEqual(nativeResponses(f),[]);
     assert.ok(!b.calls.some(c=>['turn/interrupt','turn/start','turn/steer'].includes(c.method)));
   }finally{release.resolve();await f.close();}
@@ -300,12 +309,14 @@ test('an uncertain native response consumes its reference despite concurrent sub
     await f.dedicated();
     const a=await eligible(f),firstBackend=f.backends.get('default')!;
     firstBackend.respondHook=async()=>{await release.promise;throw Error('Synthetic transport lost after write');};
-    const attempted=f.gateway.submitQuestion(a,[0]);
+    const attempted=f.gateway.submitQuestion(a,[0],FORM_ONE);
     await waitFor(()=>firstBackend.responses.length===1);
-    const repeat=f.gateway.submitQuestion(a,[1]);
+    const repeat=f.gateway.submitQuestion(a,[1],FORM_ONE);
+    const second=f.gateway.submitQuestion(a,[1],FORM_TWO);
     release.resolve();
     assert.equal(await attempted,'unconfirmed');
-    assert.notEqual(await repeat,'submitted');
+    assert.equal(await repeat,'unconfirmed');
+    assert.equal(await second,'unconfirmed');
     assert.equal(firstBackend.responses.length,1);assert.deepEqual(firstBackend.expectedEpochs,[firstBackend.epoch]);
     assert.equal(f.rt.core('default').store.state.nativeQuestionAnswers?.at(-1)?.status,'uncertain');
     await f.restart(true);
@@ -314,7 +325,7 @@ test('an uncertain native response consumes its reference despite concurrent sub
     await waitFor(()=>current.calls.some(c=>c.method==='thread/resume'&&c.params.threadId===DEDICATED));
     current.emitRequest(ordinary());await sleep(35);
     assert.equal(await f.gateway.openQuestion(a),undefined);
-    assert.notEqual(await f.gateway.submitQuestion(a,[0]),'submitted');
+    assert.notEqual(await f.gateway.submitQuestion(a,[0],FORM_ONE),'submitted');
     assert.equal(current.responses.length,0);assert.equal(firstBackend.responses.length,1);
     assert.equal(f.posts.filter(p=>p.reference).length,1);
   }finally{release.resolve();await f.close();}
@@ -333,7 +344,7 @@ test('old share consent and free-text native requests may notify, but cannot gen
     for(const c of [a,b]){
       const bad:Origin={teamId:ACCOUNT,appId:APP,userId:PERMITTED,channel:c.channel,rootThreadTs:c.root,messageTs:c.ts,reference:'forged-not-posted-question-reference'};
       assert.equal(await f.gateway.openQuestion(bad),undefined);
-      assert.notEqual(await f.gateway.submitQuestion(bad,[0]),'submitted');
+      assert.notEqual(await f.gateway.submitQuestion(bad,[0],FORM_ONE),'submitted');
     }
     assert.deepEqual(nativeResponses(f,'default'),[]);assert.deepEqual(nativeResponses(f,'extra1'),[]);
   }finally{await f.close();}
@@ -347,7 +358,7 @@ test('a changed native descriptor invalidates the old choice mapping; replay can
     const updated=ordinary('Which revised layout fits the preview?');
     updated.params.questions[0]!.options.reverse();
     b.emitRequest(updated);
-    assert.notEqual(await f.gateway.submitQuestion(a,[0]),'submitted');
+    assert.notEqual(await f.gateway.submitQuestion(a,[0],FORM_ONE),'submitted');
     assert.equal(await f.gateway.openQuestion(a),undefined);
     b.emitRequest(ordinary());await sleep(30);
     assert.equal(await f.gateway.openQuestion(a),undefined);
@@ -367,7 +378,7 @@ test('only a genuine still-pending replay after reconnect can post a new card fo
     const b=f.backends.get('default')!;
     assert.notEqual(b.epoch,previousBackend.epoch);
     assert.equal(await f.gateway.openQuestion(old),undefined);
-    assert.notEqual(await f.gateway.submitQuestion(old,[0]),'submitted');
+    assert.notEqual(await f.gateway.submitQuestion(old,[0],FORM_ONE),'submitted');
     assert.equal(f.posts.filter(p=>p.reference).length,1,'waiting flag does not recreate a callback');
     assert.equal(b.responses.length,0);
     b.emit('notification','turn/started',{threadId:DEDICATED,turn:{id:TURN,status:'inProgress'}},b.epoch);
@@ -382,7 +393,7 @@ test('only a genuine still-pending replay after reconnect can post a new card fo
     const fresh=origin(card);
     assert.notEqual(fresh.messageTs,old.messageTs);
     assert.ok(await f.gateway.openQuestion(fresh));
-    assert.equal(await f.gateway.submitQuestion(fresh,[1]),'submitted');
+    assert.equal(await f.gateway.submitQuestion(fresh,[1],FORM_ONE),'submitted');
     assert.deepEqual(nativeResponses(f),[{id:RPC,result:{answers:{layout_key:{answers:['Spacious']}}}}]);
     assert.deepEqual(previousBackend.responses,[]);
   }finally{await f.close();}
@@ -394,7 +405,7 @@ test('temporary root verification failure, allowed-human revocation, and clock m
     const a=await eligible(f);
     assert.ok(await f.gateway.openQuestion(a));
     f.root(async()=>false);
-    assert.notEqual(await f.gateway.submitQuestion(a,[1]),'submitted');
+    assert.notEqual(await f.gateway.submitQuestion(a,[1],FORM_ONE),'submitted');
     assert.deepEqual(nativeResponses(f),[]);
   }finally{await f.close();}
   const f2=await fixture();try{
@@ -402,7 +413,7 @@ test('temporary root verification failure, allowed-human revocation, and clock m
     const a=await eligible(f2);
     f2.cfg.slack.allowedHumans.splice(f2.cfg.slack.allowedHumans.indexOf(PERMITTED),1);
     assert.equal(await f2.gateway.openQuestion(a),undefined);
-    assert.notEqual(await f2.gateway.submitQuestion(a,[1]),'submitted');
+    assert.notEqual(await f2.gateway.submitQuestion(a,[1],FORM_ONE),'submitted');
     assert.deepEqual(nativeResponses(f2),[]);
   }finally{await f2.close();}
   const f3=await fixture();try{
@@ -416,25 +427,38 @@ test('temporary root verification failure, allowed-human revocation, and clock m
 });
 
 
+const cardClick=(msg:any,triggerId:string)=>({type:'block_actions',team:{id:ACCOUNT},api_app_id:APP,user:{id:PERMITTED,team_id:ACCOUNT},
+  channel:{id:CHANNEL},container:{type:'message',channel_id:CHANNEL,message_ts:msg.ts,is_ephemeral:false},
+  message:{type:'message',user:'USELF',bot_id:'BSELF',thread_ts:'101.2',ts:msg.ts},trigger_id:triggerId,
+  actions:[{...msg.blocks[1].elements[0],block_id:msg.blocks[1].block_id}]});
+const cardSubmit=(view:any,choice:string)=>({type:'view_submission',team:{id:ACCOUNT},api_app_id:APP,user:{id:PERMITTED},view:{
+  ...view,state:{values:{q0:{pick:{type:'static_select',selected_option:{value:choice}}}}}
+}});
+async function sdkCard(f:Fixture,question:string){
+  f.backends.get('default')!.ask(ordinary(question));
+  await waitFor(()=>f.apiPosts.some(p=>p.blocks?.[1]?.elements?.[0]?.value));
+  const msg=f.apiPosts.find(p=>p.blocks?.[1]?.elements?.[0]?.value)!;
+  await waitFor(()=>f.rt.core('default').store.state.nativeQuestionAnswers?.some(q=>q.status==='posted'&&q.messageTs===msg.ts)===true);
+  return msg;
+}
+
 test('live Slack SDK parser and posted modal complete an exact typed native response end to end',async()=>{
   const f=await fixture(1,true);try{
     await f.dedicated();
-    f.backends.get('default')!.ask(ordinary('Which layout should this SDK example use?'));
-    await waitFor(()=>f.apiPosts.some(p=>p.blocks?.[1]?.elements?.[0]?.value));
-    const msg=f.apiPosts.find(p=>p.blocks?.[1]?.elements?.[0]?.value)!;
+    const msg=await sdkCard(f,'Which layout should this SDK example use?');
     assert.equal(msg.thread_ts,'101.2');assert.equal(msg.reply_broadcast,false);
     assert.match(msg.blocks[0].text.text,/SDK example/);
-    await waitFor(()=>f.rt.core('default').store.state.nativeQuestionAnswers?.some(q=>q.status==='posted'&&q.messageTs===msg.ts)===true);
-    await f.wire({type:'block_actions',team:{id:ACCOUNT},api_app_id:APP,user:{id:PERMITTED,team_id:ACCOUNT},
-      channel:{id:CHANNEL},container:{type:'message',channel_id:CHANNEL,message_ts:msg.ts,is_ephemeral:false},
-      message:{type:'message',user:'USELF',bot_id:'BSELF',thread_ts:'101.2',ts:msg.ts},trigger_id:'test-opaque-trigger',
-      actions:[{...msg.blocks[1].elements[0],block_id:msg.blocks[1].block_id}]});
-    await waitFor(()=>f.forms.length===1);
-    const submit={type:'view_submission',team:{id:ACCOUNT},api_app_id:APP,user:{id:PERMITTED},view:{
-      ...f.forms[0],state:{values:{q0:{pick:{type:'static_select',selected_option:{value:'1'}}}}}
-    }};
-    await f.wire(submit);await f.wire(submit);
+    await f.wire(cardClick(msg,'test-opaque-trigger-first'));await waitFor(()=>f.forms.length===1);
+    await f.wire(cardClick(msg,'test-opaque-trigger-second'));await waitFor(()=>f.forms.length===2);
+    assert.notEqual(f.forms[0].private_metadata,f.forms[1].private_metadata);
+    assert.notEqual(f.forms[0].id,f.forms[1].id);
+    const submit=(i:number,choice:string)=>cardSubmit(f.forms[i],choice);
+    await f.wire(submit(0,'1'));await f.wire(submit(0,'1'));await f.wire(submit(0,'0'));
     await waitFor(()=>f.statusUpdates.some(r=>JSON.stringify(r).includes('其他客户端')));
+    await f.wire(submit(1,'0'));
+    await waitFor(()=>f.statusUpdates.some(r=>JSON.stringify(r).includes('已有一份答复')));
+    assert.equal(f.statusUpdates.filter(r=>JSON.stringify(r).includes('已将答复发给')).length,1);
+    assert.equal(f.statusUpdates.filter(r=>JSON.stringify(r).includes('本表单的选择没有发送')).length,1);
     assert.deepEqual(nativeResponses(f),[{id:RPC,result:{answers:{layout_key:{answers:['Spacious']}}}}]);
   }finally{await f.close();}
 });
@@ -447,11 +471,54 @@ test('a Slack transport replacement alone makes the old form unusable even on th
     const native=f.backends.get('default')!,epoch=native.epoch;
     assert.ok(await f.gateway.openQuestion(old));
     f.rt.disableSlack();
-    assert.equal(await f.gateway.submitQuestion(old,[0]),'denied');
+    assert.equal(await f.gateway.submitQuestion(old,[0],FORM_ONE),'denied');
     await f.rt.enableSlack('USELF','BSELF');
     assert.equal(native.epoch,epoch);
     assert.equal(await f.gateway.openQuestion(old),undefined);
-    assert.equal(await f.gateway.submitQuestion(old,[0]),'closed');
+    assert.equal(await f.gateway.submitQuestion(old,[0],FORM_ONE),'unavailable');
     assert.deepEqual(nativeResponses(f),[]);
+  }finally{await f.close();}
+});
+
+
+test('real Slack SDK adapter reports a transient root outage without closing the live question; a verified retry can respond',async()=>{
+  const f=await fixture(1,true);try{
+    await f.dedicated();
+    const msg=await sdkCard(f,'Which layout after checking the Slack thread?'),b=f.backends.get('default')!;
+    await f.wire(cardClick(msg,'trigger-temporary-root'));await waitFor(()=>f.forms.length===1);
+    let failingRootChecks=0;
+    f.root(async(c,ts)=>{assert.equal(c,CHANNEL);assert.equal(ts,'101.2');failingRootChecks++;throw Error('Synthetic Slack API error');});
+    await f.wire(cardSubmit(f.forms[0],'0'));
+    await waitFor(()=>f.statusUpdates.some(r=>JSON.stringify(r).includes('暂时无法核对')));
+    assert.equal(failingRootChecks,1);assert.deepEqual(nativeResponses(f),[]);
+    assert.equal(f.statusUpdates.some(r=>JSON.stringify(r).includes('已关闭')),false);
+    assert.equal(f.rt.core('default').store.state.nativeQuestionAnswers?.at(-1)?.status,'posted');
+    assert.equal(f.model.get('default')!.requests.has(String(RPC)),true);
+    f.root(async()=>true);
+    // The next normal refresh observes the same positively live callback.
+    b.emit('notification','item/completed',{threadId:DEDICATED,turnId:TURN,item:{type:'agentMessage',id:'irrelevant-msg',text:'Ready'}},b.epoch);
+    await waitFor(()=>f.rt.core('default').store.state.nativeShares?.at(-1)?.observationalGap===undefined);
+    await f.wire(cardClick(msg,'trigger-restored-root'));await waitFor(()=>f.forms.length===2);
+    await f.wire(cardSubmit(f.forms[1],'1'));
+    await waitFor(()=>f.statusUpdates.some(r=>JSON.stringify(r).includes('已将答复发给')));
+    assert.deepEqual(nativeResponses(f),[{id:RPC,result:{answers:{layout_key:{answers:['Spacious']}}}}]);
+  }finally{await f.close();}
+});
+
+test('legacy submitted evidence stays non-writable but cannot attest an exact form',async()=>{
+  const f=await fixture();try{
+    await f.dedicated();
+    const a=await eligible(f);
+    assert.equal(await f.gateway.submitQuestion(a,[0],FORM_ONE),'submitted');
+    const rules=f.rt.core('default').store;
+    rules.transaction(d=>{
+      const row=d.nativeQuestionAnswers!.at(-1)!;
+      assert.equal(row.status,'submitted');
+      assert.match(row.claimDigest!,/^[a-f0-9]{64}$/);
+      assert.ok(!JSON.stringify(row).includes(FORM_ONE));
+      delete row.claimDigest; // upgrades do not know which old form was sent
+    });
+    assert.equal(await f.gateway.submitQuestion(a,[0],FORM_ONE),'prior-answer');
+    assert.deepEqual(nativeResponses(f),[{id:RPC,result:{answers:{layout_key:{answers:['Compact']}}}}]);
   }finally{await f.close();}
 });

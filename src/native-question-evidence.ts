@@ -52,11 +52,16 @@ export interface QuestionEvidence {
   key:string; digest:string; firstEpoch:string; firstObservedAt:number; expiresAt:number;
   status:'observed'|'posting'|'posted'|'submitting'|'submitted'|'uncertain'|'closed'|'changed';
   epoch?:string; deliveryId?:string; reference?:string; messageTs?:string; request?:string;
-  claimedBy?:string; closedAt?:number;
+  // Old submitted rows may lack claimDigest. They prevent another native
+  // response, but cannot identify an individual modal as the one that wrote.
+  claimedBy?:string; claimDigest?:string; closedAt?:number;
+  // Older versions set closedAt for some descriptor changes too. Only an
+  // authoritative close frame seen after this upgrade may prove closure.
+  nativeClosed?:true;
 }
 export interface QuestionState { nativeQuestionAnswers?:QuestionEvidence[] }
 const statuses=new Set(['observed','posting','posted','submitting','submitted','uncertain','closed','changed']);
-const fieldNames=new Set(['key','digest','firstEpoch','firstObservedAt','expiresAt','status','epoch','deliveryId','reference','messageTs','request','claimedBy','closedAt']);
+const fieldNames=new Set(['key','digest','firstEpoch','firstObservedAt','expiresAt','status','epoch','deliveryId','reference','messageTs','request','claimedBy','claimDigest','closedAt','nativeClosed']);
 
 export function validateQuestionEvidence(d:Readonly<QuestionState>){
   const rows=d.nativeQuestionAnswers;
@@ -66,7 +71,9 @@ export function validateQuestionEvidence(d:Readonly<QuestionState>){
       !validTime(q.firstObservedAt)||!validTime(q.expiresAt)||q.expiresAt<q.firstObservedAt||q.expiresAt-q.firstObservedAt>STOP_AFTER||
       typeof q.status!=='string'||!statuses.has(q.status)||q.epoch!==undefined&&!isHash(q.epoch)||q.reference!==undefined&&!isHash(q.reference)||
       q.deliveryId!==undefined&&!deliveryId(q.deliveryId)||q.messageTs!==undefined&&!timestamp(q.messageTs)||
-      q.request!==undefined&&!isHash(q.request)||q.claimedBy!==undefined&&!isHash(q.claimedBy)||q.closedAt!==undefined&&!validTime(q.closedAt)||
+      q.request!==undefined&&!isHash(q.request)||q.claimedBy!==undefined&&!isHash(q.claimedBy)||
+      q.claimDigest!==undefined&&(!isHash(q.claimDigest)||!q.claimedBy||!['submitting','submitted','uncertain'].includes(q.status))||
+      q.closedAt!==undefined&&!validTime(q.closedAt)||q.nativeClosed!==undefined&&(q.nativeClosed!==true||!q.closedAt)||
       ['posting','posted','submitting','submitted','uncertain'].includes(q.status)&&(!q.epoch||!q.request||!q.deliveryId||!q.reference)||
       ['posted','submitting','submitted','uncertain'].includes(q.status)&&!q.messageTs||
       ['submitting','submitted','uncertain'].includes(q.status)&&!q.claimedBy)){
@@ -115,6 +122,6 @@ export function actionableQuestion(row:QuestionEvidence|undefined,proof:{refHash
     row.messageTs===proof.messageTs&&row.digest===proof.digest&&row.expiresAt-now>SAFETY_MARGIN;
 }
 export function closeQuestionEvidence(row:QuestionEvidence,now:number){
-  row.closedAt=now;
+  row.closedAt=now;row.nativeClosed=true;
   if(!['submitting','submitted','uncertain','changed'].includes(row.status))row.status='closed';
 }

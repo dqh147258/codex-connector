@@ -6,6 +6,7 @@ import { waitForNativePersistence,type Subscription } from './subscriptions.js';
 import { isThreadHistoryNotPersisted } from './rpc-diagnostics.js';
 import type { Backend, Delivery, Source, State } from './types.js';
 import type { Store } from './store.js';
+import type { SlackQuestionOutcome } from './slack-questions.js';
 import { projectNativeMessage, projectNativeItem, projectNativeInput, renderNativeProjection, type NativeProjection } from './shared-native-content.js';
 
 export const nativeOutboxMarker = '[Native content record: matching Connector version and grant required]';
@@ -102,7 +103,7 @@ const epochStamp=(epoch:string)=>questionDigest(['observation-epoch',epoch]);
 const requestStamp=(k:{epoch:string;rpcId:string|number})=>questionDigest(['server-request',k.epoch,k.rpcId]);
 const inputDedup=(key:string,stamp:string)=>questionDigest([key,stamp]);
 export interface NativeAnswerOrigin {teamId:string;appId:string;userId:string;channel:string;rootThreadTs:string;messageTs:string;reference:string}
-export type NativeAnswerOutcome='submitted'|'closed'|'unconfirmed'|'denied';
+export type NativeAnswerOutcome=SlackQuestionOutcome;
 const sameDestination=(a:Route,b:Route)=>a.serverId===b.serverId&&a.backendFingerprint===b.backendFingerprint&&a.workspaceId===b.workspaceId&&
   a.channel===b.channel&&a.rootThreadTs===b.rootThreadTs&&a.policy===b.policy&&a.slackIdentity===b.slackIdentity&&a.scope===b.scope;
 const equalRoute = (a: Route,b: Route) => a.serverId===b.serverId&&a.backendFingerprint===b.backendFingerprint&&a.workspaceId===b.workspaceId&&a.channel===b.channel&&a.rootThreadTs===b.rootThreadTs&&a.subscriptionId===b.subscriptionId&&a.nativeThreadId===b.nativeThreadId&&a.policy===b.policy&&a.slackIdentity===b.slackIdentity&&a.scope===b.scope;
@@ -538,7 +539,7 @@ export class NativeSharing {
     const stamp=epochStamp(r.epoch),qkey=nativeAnswerKey(grant,projection);
     if(prior){
       if(prior.threadId!==r.params.threadId||hash(prior.projection)!==hash(projection)||prior.answer?.spec.digest!==spec?.digest){
-        this.finishObservedQuestion(prior);this.pending.delete(k);
+        this.pending.delete(k);
         if(prior.answer)this.store.transaction(d=>{const row=d.nativeQuestionAnswers?.find(x=>x.key===prior.answer!.key);if(row?.status==='observed'||row?.status==='posted'||row?.status==='posting')row.status='changed';});
         this.countQuestion(grant.id,'changedRequest');
       }
@@ -795,19 +796,33 @@ export class NativeSharing {
     if(!exact||exact.evidence.key!==initial.evidence.key||exact.q.projection.kind!=='input')return;
     return {questions:exact.q.projection.questions};
   }
-  private rememberedOutcome(origin:NativeAnswerOrigin,d:Readonly<State>):NativeAnswerOutcome|undefined{
-    const old=this.answerLookup(origin,d);
-    if(!old||old.evidence.claimedBy!==old.actor)return;
-    if(old.evidence.status==='submitted')return 'submitted';
-    if(['submitting','uncertain'].includes(old.evidence.status))return 'unconfirmed';
+  private answerClaim(item:NonNullable<ReturnType<NativeSharing['answerLookup']>>,formNonce:string,choices:readonly number[]){
+    return questionDigest(['answer-form-v1',item.evidence.key,item.refHash,item.actor,item.evidence.digest,formNonce,choices]);
   }
-  async submitQuestion(origin:NativeAnswerOrigin,choices:readonly number[]):Promise<NativeAnswerOutcome>{
-    const latest=this.store.state;
-    const known=this.rememberedOutcome(origin,latest);if(known)return known;
-    const prior=this.writableQuestion(origin,latest);
-    if(!prior)return this.answerLookup(origin,latest)?'closed':'denied';
+  private answerOutcome(origin:NativeAnswerOrigin,formNonce:string,choices:readonly number[],d:Readonly<State>):NativeAnswerOutcome{
+    const old=this.answerLookup(origin,d);
+    if(!old)return 'denied';
+    const {evidence}=old;
+    if(evidence.status==='submitted'){
+      return evidence.claimedBy===old.actor&&evidence.claimDigest===this.answerClaim(old,formNonce,choices)?'submitted':'prior-answer';
+    }
+    // Native closure alone cannot prove whose callback won. Never turn an
+    // uncertain attempt into success or make it writable after another form.
+    if(evidence.status==='submitting'||evidence.status==='uncertain')return 'unconfirmed';
+    // Only persisted evidence backed by native resolved/turn-terminal events
+    // can report closure. Scope/readiness/expiry/schema mismatches do not.
+    if(evidence.status==='closed'&&evidence.nativeClosed===true)return 'closed';
+    return 'unavailable';
+  }
+  async submitQuestion(origin:NativeAnswerOrigin,choices:readonly number[],formNonce:string):Promise<NativeAnswerOutcome>{
+    if(typeof formNonce!=='string'||formNonce.length!==32||!/^[A-Za-z0-9_-]+$/.test(formNonce)||
+      !Array.isArray(choices)||choices.length<1||choices.length>4||
+      Array.from(choices).some(c=>!Number.isSafeInteger(c)||c<0||c>5))return 'denied';
+    choices=[...choices];
+    const latest=this.store.state,prior=this.writableQuestion(origin,latest);
+    if(!prior)return this.answerOutcome(origin,formNonce,choices,latest);
     if(!nativeAnswerPayload(prior.q.answer!.spec,choices))return 'denied';
-    if(await this.prepare(prior.card)!=='ready')return 'closed';
+    if(await this.prepare(prior.card)!=='ready')return this.answerOutcome(origin,formNonce,choices,this.store.state);
     // No await from the final exact checks through consuming the receipt and
     // invoking the epoch-bound native write. The server's callback registry
     // is the only authority on who wins a simultaneous native submission.
@@ -815,17 +830,18 @@ export class NativeSharing {
       const same=this.writableQuestion(origin,d);
       if(!same||same.evidence.key!==prior.evidence.key||same.refHash!==prior.refHash||reqKey(same.q.key)!==reqKey(prior.q.key))return;
       const payload=nativeAnswerPayload(same.q.answer!.spec,choices);if(!payload)return;
-      same.evidence.status='submitting';same.evidence.claimedBy=same.actor;
-      return {key:same.evidence.key,ref:same.refHash,payload,native:same.q.key};
+      const claimDigest=this.answerClaim(same,formNonce,choices);
+      same.evidence.status='submitting';same.evidence.claimedBy=same.actor;same.evidence.claimDigest=claimDigest;
+      return {key:same.evidence.key,ref:same.refHash,claimDigest,payload,native:same.q.key};
     });
-    if(!claimed)return this.rememberedOutcome(origin,this.store.state)??'closed';
+    if(!claimed)return this.answerOutcome(origin,formNonce,choices,this.store.state);
     let submitted=false;
     try{
       await this.backend.respond(claimed.native.rpcId,claimed.payload,claimed.native.epoch);
       submitted=this.backend.connected&&this.backend.epoch===claimed.native.epoch;
     }catch{/* Dispatch may have happened; never retry it. */}
     this.store.transaction(d=>{
-      const row=d.nativeQuestionAnswers?.find(q=>q.key===claimed.key&&q.reference===claimed.ref);
+      const row=d.nativeQuestionAnswers?.find(q=>q.key===claimed.key&&q.reference===claimed.ref&&q.claimDigest===claimed.claimDigest);
       if(row?.status==='submitting')row.status=submitted?'submitted':'uncertain';
     });
     return submitted?'submitted':'unconfirmed';

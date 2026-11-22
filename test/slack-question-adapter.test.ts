@@ -10,7 +10,7 @@ const ref='Qx12345_6789-azABCDEFGHIJKLMNOPQRSTUVWXYZ';
 const expected={teamId:team,appId:app,userId:user,channel,rootThreadTs:root,messageTs:ts,reference:ref};
 const fields=[{header:'颜色',question:'选择主色',labels:['绿色','蓝色']},{header:'口味',question:'选择口味',labels:['甜','淡']}];
 const tick=()=>new Promise<void>(r=>setImmediate(r));
-async function setup(options:{botFault?:boolean;noGateway?:boolean;outcome?:'closed'|'denied'|'unconfirmed'|'error'}={}){
+async function setup(options:{botFault?:boolean;noGateway?:boolean;outcome?:'closed'|'denied'|'unconfirmed'|'unavailable'|'prior-answer'|'error'}={}){
   const slack=new SlackClient('fake-noncredential');
   // Exercise the real SDK WebClient call shape and real SocketModeClient wire
   // decoder; only the Slack Web API / socket boundary is replaced in-process.
@@ -40,7 +40,7 @@ async function setup(options:{botFault?:boolean;noGateway?:boolean;outcome?:'clo
   }
   const gateway:SlackQuestionGateway={
     async openQuestion(o){opens.push(o);if(deny||closed||Object.keys(expected).some(k=>o[k as keyof SlackQuestionOrigin]!==expected[k as keyof SlackQuestionOrigin]))return;return {questions:fields};},
-    async submitQuestion(o,choices){answers.push({o,choices});if(options.outcome==='error')throw Error('withheld');return options.outcome??'submitted';},
+    async submitQuestion(o,choices,formNonce){answers.push({o,choices,formNonce});if(options.outcome==='error')throw Error('withheld');return options.outcome??'submitted';},
   };
   const link=new SlackLink(team,{accept:(x:any)=>{received.push(x);return true;},disableSlack(){},async enableSlack(){}} as any,
     ()=>slack.web.auth.test(),()=>sdk,options.noGateway?undefined:{client:slack,gateway});
@@ -72,7 +72,7 @@ test('exact native question card → actual Socket Mode decoder → verified use
   for(const b of f.modals[0].blocks.filter((x:any)=>x.type==='input'))assert.equal(b.element.type,'static_select');
   assert.ok(!JSON.stringify(f.modals[0]).includes(ref),'opaque question ref need not enter modal metadata');
   const b=f.submission();await f.wire('interactive',b);await f.wire('interactive',b);
-  assert.equal(f.opens.length,1);assert.deepEqual(f.answers,[{o:expected,choices:[1,0]}]);assert.deepEqual(f.lookups,[user,user]);
+  assert.equal(f.opens.length,1);assert.deepEqual(f.answers,[{o:expected,choices:[1,0],formNonce:b.view.private_metadata}]);assert.deepEqual(f.lookups,[user,user]);
   assert.equal(f.acks[1].response.response_action,'update');assert.match(JSON.stringify(f.acks[1]),/尚未确认/);
   assert.equal(f.updates.length,1);assert.match(JSON.stringify(f.updates),/其他客户端/);assert.equal(f.received.length,0);
   await f.link.close();
@@ -122,7 +122,7 @@ test('view binds actual opener, nonce, view ID and exact owned app; unknown form
   await f.wire('interactive',b);assert.deepEqual(f.answers[0].choices,[1,0]);await f.link.close();
 });
 test('no outcome claim on closure/uncertainty or unsuccessful delivery; no second native attempt',async()=>{
-  for(const [outcome,pattern] of [['closed',/不能证明/],['unconfirmed',/未自动重试/],['error',/未自动重试/],['denied',/未发送答复/]] as const){
+  for(const [outcome,pattern] of [['closed',/Codex 已关闭/],['unconfirmed',/未自动重试/],['unavailable',/暂时无法核对/],['prior-answer',/已有一份答复发出/],['error',/未自动重试/],['denied',/未发送答复/]] as const){
     const f=await setup({outcome});await f.post();await f.wire('interactive',f.action());const b=f.submission();
     await f.wire('interactive',b);await f.wire('interactive',b);
     assert.equal(f.answers.length,1);assert.match(JSON.stringify(f.updates[0]),pattern);await f.link.close();

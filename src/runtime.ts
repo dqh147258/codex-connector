@@ -135,7 +135,7 @@ export class Runtime {
     return matches.length===1?matches[0]:undefined;
   }
   async openQuestion(origin:SlackQuestionOrigin){return this.questionOwner(origin)?.openQuestion(origin);}
-  async submitQuestion(origin:SlackQuestionOrigin,choices:readonly number[]){return this.questionOwner(origin)?.submitQuestion(origin,choices)??'denied' as const;}
+  async submitQuestion(origin:SlackQuestionOrigin,choices:readonly number[],formNonce:string){return this.questionOwner(origin)?.submitQuestion(origin,choices,formNonce)??'denied' as const;}
   status(serverId?:string){const selected=serverId===undefined?defaultServer(this.config):resolveServerId(this.config,serverId);if(serverId!==undefined&&!this.cores.has(selected!))throw new ConnectorError('SERVER_UNAVAILABLE');const core=selected?this.cores.get(selected):undefined;return{...(core?.status()??{}),serverId:selected??null,servers:this.servers(),slackConnected:this.slackReady};}
   sessionPage(params:Record<string,unknown>={}){const {serverId,...rest}=params;return this.core(serverId).sessionPage(rest);}
   recover(kind:'command'|'outbox',id:string,ts?:string,serverId?:string){this.core(serverId).recover(kind,id,ts);}

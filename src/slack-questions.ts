@@ -10,9 +10,10 @@ export interface SlackQuestionOrigin {
   reference:string; teamId:string; appId:string; userId:string; channel:string; rootThreadTs:string; messageTs:string;
 }
 export interface SlackQuestionField {header:string;question:string;labels:readonly string[]}
+export type SlackQuestionOutcome='submitted'|'prior-answer'|'closed'|'unconfirmed'|'unavailable'|'denied';
 export interface SlackQuestionGateway {
   openQuestion(origin:SlackQuestionOrigin):Promise<{questions:readonly SlackQuestionField[]}|undefined>;
-  submitQuestion(origin:SlackQuestionOrigin,choices:readonly number[]):Promise<'submitted'|'closed'|'unconfirmed'|'denied'>;
+  submitQuestion(origin:SlackQuestionOrigin,choices:readonly number[],formNonce:string):Promise<SlackQuestionOutcome>;
 }
 export const validAction=(x:SlackQuestionAction)=>!!x && typeof x.reference==='string' && /^[A-Za-z0-9_-]{16,96}$/.test(x.reference)
   && Number.isInteger(x.questionCount) && x.questionCount>=1 && x.questionCount<=4;
@@ -48,10 +49,13 @@ function modal(qs:readonly SlackQuestionField[],nonce:string):ModalView {
     close:plain('取消'),notify_on_close:true,blocks};
 }
 const messages={
-  checking:'正在核对你是否可以回答此问题。暂不需要输入；如未出现选项，请在原生 Codex 中回答。',  pending:'正在核对。尚未确认 Codex 收到答复；如未显示结果，请查看原生 Codex，不要重复提交。',
+  checking:'正在核对你是否可以回答此问题。暂不需要输入；如未出现选项，请在原生 Codex 中回答。',
+  pending:'正在核对。尚未确认 Codex 收到答复；如未显示结果，请查看原生 Codex，不要重复提交。',
   submitted:'已将答复发给 Codex。其他客户端也可能同时作答，请在原生会话查看最终结果。',
-  closed:'问题已关闭；这不能证明 Codex 采用了你的 Slack 答复。',
-  unconfirmed:'无法确认答复是否生效。未自动重试，请在原生 Codex 查看。',
+  'prior-answer':'此问题已有一份答复发出，本表单的选择没有发送。请在原生 Codex 查看最终结果。',
+  closed:'Codex 已关闭此问题，本表单的选择没有发送。',
+  unconfirmed:'无法确认此问题的答复结果。系统未自动重试，请在原生 Codex 查看。',
+  unavailable:'暂时无法核对问题或 Slack 线程，本表单的选择没有发送。请在原生 Codex 查看。',
   denied:'未发送答复。授权或问题状态可能已改变，请在原生 Codex 查看。',
 } as const;
 const status=(key:keyof typeof messages):ModalView=>({type:'modal',title:plain('Codex 答复状态'),close:plain('关闭'),
@@ -150,11 +154,15 @@ export class SlackQuestionTransport {
     try{
       await ack({response_action:'update',view:status('pending')});
       if(!this.current())return;
-      let receipt:'submitted'|'closed'|'unconfirmed'|'denied'='denied';
-      try{
-        if(await this.human(m.origin.userId)&&this.current()&&Date.now()<m.expires)
-          receipt=await this.gateway.submitQuestion(m.origin,answers);
-      }catch{receipt='unconfirmed';}
+      let receipt:SlackQuestionOutcome='denied',human=false;
+      try{human=await this.human(m.origin.userId);}catch{receipt='unavailable';}
+      if(human&&this.current()&&Date.now()<m.expires){
+        // Nonce was minted by this transport and matched the actual owned
+        // view and authenticated opener. It identifies exactly this form,
+        // not every form opened by that actor for the same question.
+        try{receipt=await this.gateway.submitQuestion(m.origin,answers,nonce);}
+        catch{receipt='unconfirmed';}
+      }
       if(this.current())await this.web.views.update({view_id:m.viewId,view:status(receipt)});
     }finally{this.inflight--;}
   }
