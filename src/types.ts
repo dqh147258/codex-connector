@@ -1,6 +1,6 @@
 import type { MessageDelivery } from './session-delivery.js';
 import type { ActivityRecord } from './session-activity.js';
-import type { NativeDelivery, NativeShare } from './native-share.js';
+import type { NativeDelivery, NativeShare, NativeShareCreation } from './native-share.js';
 import type { Subscription } from './subscriptions.js';
 import type { CommandEnvelope } from './protocol.js';
 export interface Config {
@@ -31,7 +31,7 @@ export interface Pending {
   method: string; kind: 'command'|'file'|'input'|'unsupported'; status: 'pending'|'responding'|'resolved'|'stale'|'expired'|'local-required';
   details: Record<string, any>; expiresAt: number; decisions: string[];
 }
-export interface State { version: 2; nativeShares?:NativeShare[]; slackVisibility?:{policy:string;generation:string}; activity?:ActivityRecord[]; subscriptions?:Subscription[]; subscriptionEvents?:Record<string,string[]>; results?:ResultSnapshot[]; sessions: Session[]; work: Work[]; outbox: Delivery[]; pending: Pending[]; seenEvents: Record<string, string>; seenNotifications: Record<string, true>; dot?: { userId: string; name: string; selector?: string } }
+export interface State { version: 2; nativeShares?:NativeShare[]; nativeShareCreations?:NativeShareCreation[]; slackVisibility?:{policy:string;generation:string}; activity?:ActivityRecord[]; subscriptions?:Subscription[]; subscriptionEvents?:Record<string,string[]>; results?:ResultSnapshot[]; sessions: Session[]; work: Work[]; outbox: Delivery[]; pending: Pending[]; seenEvents: Record<string, string>; seenNotifications: Record<string, true>; dot?: { userId: string; name: string; selector?: string } }
 export interface Backend {
   epoch: string; connected: boolean;
   readonly observation?: { checkedAt:string|null; version:string|null; homeVerified?:boolean };

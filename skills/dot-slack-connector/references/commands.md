@@ -70,7 +70,7 @@ CODEX_CONNECTOR_COMMAND_END
 
 ## Observe a loaded thread, inspect subscriptions, cancel observation
 
-Use the exact shared Codex thread ID for subscribe; use the returned subscription ID for unsubscribe. Cancellation does not stop Codex. Keep the same authenticated sender and origin thread. Observation defaults to fixed notices. Only the local operator can separately confirm anticipated reply/question sharing for one exact root. Approval details, old history and tool output are never included; answer questions in the original Codex app.
+Use the exact shared Codex thread ID for subscribe; use the returned subscription ID for unsubscribe. Cancellation does not stop Codex. Keep the same authenticated sender and origin thread. Observation defaults to fixed notices. An existing Codex session is status-only. Only the local operator can separately approve creating a new dedicated Codex session for reply/question sharing to one exact Slack root. Use the separate returned subscription ID to cancel the new observation. Approval details, old history and tool output are never included; answer questions in the original Codex app.
 
 ```text
 CODEX_CONNECTOR_COMMAND_BEGIN

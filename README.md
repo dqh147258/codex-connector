@@ -1,6 +1,6 @@
 # Codex Connector 0.2：本机 Agent 和 Slack 共用已授权的 Codex server
 
-连接器使用官方 `codex app-server proxy` 接入当前账户已配置的共享 daemon。**不使用 Slack 也能工作**：本机 Agent 通过 CLI、stdio MCP 或 Skill 选择 server、创建或绑定会话并读取回复。Slack 可以单独启用，也可以与本机模式并存；Slack 只发送安全元数据、命令回执和可归属到原 Slack 线程的固定状态提醒，不转发原生会话正文或审批细节。快速配置与多 server 示例见[本机 Agent 接入](docs/LOCAL-AGENTS.md)。
+连接器使用官方 `codex app-server proxy` 接入当前账户已配置的共享 daemon。**不使用 Slack 也能工作**：本机 Agent 通过 CLI、stdio MCP 或 Skill 选择 server、创建或绑定会话并读取回复。Slack 可以单独启用，也可以与本机模式并存；Slack 默认只发送安全元数据、命令回执和固定状态提醒。已有 Codex 会话不会分享正文；双入口下，本机操作者可另行批准新建专用会话，把该会话的合规回复和普通提问发到指定 Slack 线程，不会转发审批细节。快速配置与多 server 示例见[本机 Agent 接入](docs/LOCAL-AGENTS.md)。
 
 > **用户上传的本机验证记录报告：已在 macOS 实机验证共享 daemon 的 WebSocket 握手和只读会话发现，Slack 凭据与 dot 身份核验通过。** 真实活动会话的发送、接管和固定提醒仍待专项验收，不代表所有会话均可管理。完整证据与验收范围见 [runtime report](docs/RUNTIME-VERIFICATION.md)。
 
@@ -12,9 +12,9 @@
 - 仅接受配置的工作区、输入频道、dot 的 **botId + userId + appId**，以及配置的人类 ID；不信任正文里的 `actor` / `approvedBy`。
 - 全消息精确起止标记 + JSON；命令、参数、目标实例、重复 ID 均校验。没有任意 shell / RPC 透传。
 - 输入频道与输出频道可分离；dot 可按名称唯一解析，保存稳定 user ID。更改名称选择会重新解析，不会继续偷偷 mention 旧对象。
-- 共享会话发现、绑定、创建、发送、显式 steer/queue/interrupt；按能力报告无法管理的例外。授权本机客户端可另查可见历史，Slack 不读原生正文。
+- 共享会话发现、绑定、创建、发送、显式 steer/queue/interrupt；按能力报告无法管理的例外。授权本机客户端可另查可见历史；Slack 命令不能调阅原生正文。
 - 只读文件 `list/stat/read/search`：兼容项目别名；可在本地明确启用绝对路径读取，无需项目别名。保留 OS 权限、敏感路径/内容和输出量限制，默认关闭全系统只读。
-- 原生审批和输入必须在原 Codex 界面完成。Slack 只可能收到原线程的固定提醒，不显示原始内容或决策模板。
+- 原生审批和回答必须在原 Codex 界面完成。Slack 不显示审批详情或操作按钮；普通结构化提问只有在已授权的全新专用会话中才可转发。
 - 持久命令 inbox 与独立 outbox；发送失败不会重跑 Codex；同一会话输出保序。
 - Linux / macOS / Windows 的登录/登录前启动**模板生成**，不自动安装、不提权、不保存系统登录密码。
 
@@ -181,7 +181,7 @@ npm test
 
 ## 简洁 Slack 输出与关键消息订阅
 
-Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:active` 从当前 loaded 元数据筛选，历史单独用 `view:history`。使用 `result.next` 获取下一页，`result.page` 显式读取短期、同身份同线程的详情，避免自动 JSON 刷屏。`session.subscribe` / `session.unsubscribe` 默认管理固定状态提醒，取消不会停止 Codex。双入口下，本机操作者可另外确认向这一确切 Slack 线程分享未来合规的 Codex 回复和问题（不分享旧历史，不代答）。完整边界见 [输出与订阅](docs/SLACK-OUTPUT.md)。
+Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:active` 从当前 loaded 元数据筛选，历史单独用 `view:history`。使用 `result.next` 获取下一页，`result.page` 显式读取短期、同身份同线程的详情，避免自动 JSON 刷屏。`session.subscribe` / `session.unsubscribe` 默认管理固定状态提醒，取消不会停止 Codex。双入口下，本机操作者只能另行确认新建专用 Codex 会话，再把这个新会话的合规回复和普通问题发往这一确切 Slack 线程；不会分享现有会话或旧历史，也不会代答。完整边界见 [输出与订阅](docs/SLACK-OUTPUT.md)。
 
 提供两份可手动安装/阅读的 Skill：[Codex 本地](skills/codex-connector/SKILL.md) 与 [dot Slack 操作](skills/dot-slack-connector/SKILL.md)。没有自动安装到用户电脑或修改 dot 内部指令。
 

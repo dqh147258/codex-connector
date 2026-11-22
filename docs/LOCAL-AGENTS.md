@@ -1,6 +1,6 @@
 # 本机 Agent 接入：不需要 Slack
 
-同一台电脑上，只启动一个 Connector daemon。本机 CLI、stdio MCP 和 Skill 通过受保护的环回 API 使用它；它们不会另起一台 Codex server。本机结果默认不会自动流向 Slack，普通 Slack 订阅和续页也不会转发原生正文。仅当本机操作者明确授权一个已核实的订阅与 Slack 线程时，才会按[内容分享规则](SLACK-OUTPUT.md)转发激活边界之后的合规内容。所有原生审批/输入仍只由原 Codex 界面处理。连接器只连接操作者预先配置的原生共享 daemon，不扫描所有进程或用户目录。这里给出源码安装方式，示例路径和 ID 都需要替换。
+同一台电脑上，只启动一个 Connector daemon。本机 CLI、stdio MCP 和 Skill 通过受保护的环回 API 使用它；它们不会另起一台 Codex server。本机结果默认不会自动流向 Slack，普通 Slack 订阅和续页也不会转发原生正文。现有会话在 Slack 里始终只有状态。本机操作者可另行明确批准为已核实的 Slack 线程创建一个独立新会话，按[内容分享规则](SLACK-OUTPUT.md)转发该新会话的合规回复和普通提问；scoped MCP 无此权限。所有原生审批/输入仍只由原 Codex 界面处理。连接器只连接操作者预先配置的原生共享 daemon，不扫描所有进程或用户目录。这里给出源码安装方式，示例路径和 ID 都需要替换。
 
 ## 1. 先启动本机模式
 

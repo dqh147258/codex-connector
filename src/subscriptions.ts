@@ -110,6 +110,35 @@ export class SessionSubscriptions {
     this.creating.set(key, operation);
     return operation;
   }
+  /**
+   * Called only from a positively acknowledged thread/start under durable
+   * local consent. The official server already attached this connection when
+   * creating the thread; a metadata read verifies the identity, not its birth.
+   */
+  async adoptCreated(thread:any,source:Source,epoch:string,record:(state:State,sub:Subscription)=>void):Promise<Subscription>{
+    this.source(source);
+    if(!validId(thread?.id)||!this.backend.connected||this.backend.epoch!==epoch)fail('SUBSCRIPTION_BACKEND_CHANGED');
+    const metadata=this.hooks.validate(thread,source),policy=this.hooks.policy();
+    const sub:Subscription={id:randomUUID(),threadId:thread.id,...metadata,owner:structuredClone(source),enabled:true,createdAt:new Date().toISOString(),policy,status:'joining',seen:[]};
+    if(!this.allowed(sub))fail('SUBSCRIPTION_SCOPE_REVOKED');
+    this.store.transaction(state=>{
+      const rows=state.subscriptions??=[];
+      if(rows.length>=MAX_SUBSCRIPTIONS)fail('SUBSCRIPTION_LIMIT_REACHED');
+      if(rows.some(s=>s.threadId===sub.threadId)||state.sessions.some(s=>s.threadId===sub.threadId))fail('SUBSCRIPTION_THREAD_INVALID');
+      rows.push(sub);record(state,sub);
+    });
+    // The fresh identity is durable before yielding. Safe live request
+    // candidates may arrive during this metadata read; no delivery can yet.
+    const response=await this.backend.rpc('thread/read',{threadId:sub.threadId,includeTurns:false});
+    const current=this.store.state.subscriptions?.find(s=>s.id===sub.id);
+    if(!current?.enabled||!this.allowed(current)||!this.backend.connected||this.backend.epoch!==epoch)fail('SUBSCRIPTION_BACKEND_CHANGED');
+    if(response?.thread?.id!==sub.threadId||response.thread.sessionId!==thread.sessionId||this.hooks.validate(response.thread,current!.owner).cwd!==current!.cwd) {
+      this.disable(sub.id,'SUBSCRIPTION_SCOPE_REVOKED');fail('SUBSCRIPTION_SCOPE_REVOKED');
+    }
+    this.store.transaction(s=>{const row=s.subscriptions!.find(r=>r.id===sub.id);if(row?.enabled)row.status='active';});
+    if(this.store.state.subscriptions?.find(s=>s.id===sub.id)?.enabled)this.joined.set(sub.id,epoch);
+    return this.store.state.subscriptions!.find(s=>s.id===sub.id)!;
+  }
   private async createOne(threadId: string, owner: Source) {
     const previous = this.store.state.subscriptions?.find(s => s.enabled && s.threadId === threadId && sameOwner(s.owner, owner));
     if (previous) {

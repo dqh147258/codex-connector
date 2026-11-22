@@ -1,555 +1,374 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync,mkdirSync,rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { createHash,randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseConfig } from '../src/config.js';
 import { Runtime } from '../src/runtime.js';
 import { apiServer } from '../src/server.js';
 import type { SlackPort } from '../src/types.js';
-import { FakeBackend, event, request, waitFor } from './helpers.js';
+import { FakeBackend,event,request,waitFor } from './helpers.js';
 
-const THREAD='native-same-thread', EMPLOYEES_ROOT='101.2', SPECTATOR_ROOT='202.3';
-const OP='c'.repeat(48), AGENT='d'.repeat(48);
-const BIRTH=1763800000;
-function reply(id:string,text:string,phase:string|null='final_answer'){return{id,type:'agentMessage',phase,text};}
-function turn(id:string,status:string,items:any[]=[]){return{id,status,itemsView:'full',items};}
-class NativeBackend extends FakeBackend {
-  history:any[]=[]; overridePage?:any;
-  itemsToday:any[]=[];
-  homeMatch=true; blockedTurns?:()=>Promise<void>;
-  constructor(project:string, history?:any[]){
-    super();this.history=history??[turn('pre-grant','completed',[reply('old-native-item','Old private material must stay native.')])];
-    this.threads.set(THREAD,{id:THREAD,cwd:project,createdAt:BIRTH,status:{type:'idle'},canAcceptDirectInput:true});
+const ORIGINAL='00000000-1111-7111-8111-100000000001', FRESH='00000000-1111-7111-8111-200000000001';
+const ROOT='101.2', OTHER='201.3', OP='c'.repeat(48), AGENT='d'.repeat(48), BIRTH=1763800000;
+const asTurn=(id:string,status:string,items:any[]=[])=>({id,status,itemsView:'full',items});
+const reply=(id:string,text:string,phase='final_answer')=>({id,type:'agentMessage',text,phase});
+function deferred<T=void>(){let resolve!:(v:T)=>void;const promise=new Promise<T>(r=>{resolve=r;});return{resolve,promise};}
+interface Ledgers { threads:Map<string,any>; turns:Map<string,any[]>; createCount:number }
+class NativeBackend extends FakeBackend{
+  onStart?:(thread:any)=>Promise<any>;
+  beforeRead?:(threadId:string)=>Promise<void>;
+  withoutLiveTurns=false;
+  liveItems=new Map<string,any[]>();
+  constructor(private ledger:Ledgers,private project:string){
+    super();this.threads=ledger.threads;this.epoch=randomUUID();
   }
-  get observation(){return{checkedAt:'2026-11-22T00:00:00.000Z',version:'0.171.0',homeVerified:this.connected&&this.homeMatch};}
-  override async rpc(method:string,params:any){
-    if(method==='thread/turns/list'&&params.threadId===THREAD){
-      this.calls.push({method,params});
-      await this.blockedTurns?.();
-      if(this.overridePage)return this.overridePage;
-      const start=Number(params.cursor??0),data=this.history.slice(start,start+params.limit).map(t=>({...t,itemsView:params.itemsView,items:params.itemsView==='notLoaded'?[]:t.items}));
-      return{data,nextCursor:start+data.length<this.history.length?String(start+data.length):null,backwardsCursor:data.length?'mock-inverse':null};
+  get observation(){return{version:'0.171.0-alpha.13',homeVerified:this.connected,checkedAt:'2026-11-22T00:00:00Z'};}
+  private rows(id:string){return this.ledger.turns.get(id)??[];}
+  override async rpc(method:string,p:any):Promise<any>{
+    if(method==='thread/start'){
+      this.calls.push({method,params:p});
+      const n=++this.ledger.createCount,id=n===1?FRESH:randomUUID().replace(/^(.{14})4/,(_m,head)=>head+'7');
+      const thread={id,sessionId:id,cwd:p.cwd,createdAt:BIRTH+n,status:{type:'idle'},canAcceptDirectInput:true,turns:[],forkedFromId:null,parentThreadId:null,ephemeral:false};
+      this.threads.set(id,thread);this.ledger.turns.set(id,[]);
+      return this.onStart?this.onStart(structuredClone(thread)):{thread:structuredClone(thread)};
     }
-    if(method==='thread/items/list'&&params.threadId===THREAD){
-      this.calls.push({method,params});
-      const found=this.history.find(t=>t.id===params.turnId);
-      const data=found?.status==='inProgress'?this.itemsToday.filter(i=>i.turnId===params.turnId):(found?.items??[]).map((item:any)=>({turnId:params.turnId,item,startedAtMs:null,completedAtMs:null}));
+    if(method==='thread/read'){
+      await this.beforeRead?.(p.threadId);
+      return super.rpc(method,p);
+    }
+    if(method==='thread/turns/list'){
+      this.calls.push({method,params:p});
+      const rows=this.rows(p.threadId).filter(t=>!this.withoutLiveTurns||t.status!=='inProgress');
+      const start=Number(p.cursor??0),data=rows.slice(start,start+p.limit).map(t=>({...t,itemsView:p.itemsView,items:p.itemsView==='notLoaded'?[]:t.items}));
+      return{data,nextCursor:start+data.length<rows.length?String(start+data.length):null};
+    }
+    if(method==='thread/items/list'){
+      this.calls.push({method,params:p});
+      const row=this.rows(p.threadId).find(t=>t.id===p.turnId);
+      const data=row?.status==='inProgress'?this.liveItems.get(p.threadId)??[]:(row?.items??[]).map((item:any)=>({turnId:p.turnId,item,startedAtMs:null,completedAtMs:null}));
       return{data,nextCursor:null};
     }
-    const response=await super.rpc(method,params);
-    if(method==='thread/start')response.thread.createdAt=Math.floor(Date.now()/1000);
-    return response;
+    return super.rpc(method,p);
   }
-  notice(method:string,params:any){this.emit('notification',method,{threadId:THREAD,...params},this.epoch);}
-  publish(id:string,items:any[]){this.history.unshift(turn(id,'completed',items));this.threads.get(THREAD).status={type:'idle'};this.notice('turn/completed',{turn:{id,status:'completed'}});}
-  ongoing(id:string,items:any[]=[],waiting=false){
-    this.history.unshift(turn(id,'inProgress',items));this.itemsToday=items.map(item=>({turnId:id,item,startedAtMs:BIRTH*1000,completedAtMs:BIRTH*1000+1}));
-    this.threads.get(THREAD).status={type:'active',activeFlags:waiting?['waitingOnUserInput']:[]};
-    this.notice('turn/started',{turn:{id,status:'inProgress'}});
-    for(const item of items)this.notice('item/completed',{turnId:id,item});
+  notice(method:string,threadId:string,p:any={}){this.emit('notification',method,{threadId,...p},this.epoch);}
+  publish(threadId:string,turnId:string,items:any[]){
+    const rows=this.rows(threadId),old=rows.findIndex(t=>t.id===turnId);
+    if(old>=0)rows[old]=asTurn(turnId,'completed',items);else rows.unshift(asTurn(turnId,'completed',items));
+    this.threads.get(threadId).status={type:'idle'};
+    this.notice('turn/completed',threadId,{turn:{id:turnId,status:'completed'}});
   }
-  ask(turnId:string,id:string,rpcId:number,isSecret=false,overrides:any={}){
-    this.emit('request',{id:rpcId,epoch:this.epoch,method:'item/tool/requestUserInput',params:{threadId:THREAD,turnId,itemId:id,
-      questions:[{id:'omit-question-id',header:'Layout choice',question:'Which layout should we use?',isOther:false,isSecret,
-        options:[{label:'Compact',description:'An alternate visual arrangement.'},{label:'Spacious',description:'Another visual arrangement.'}]}],...overrides}});
+  ongoing(threadId:string,turnId:string,items:any[]=[],waiting=false){
+    this.rows(threadId).unshift(asTurn(turnId,'inProgress',items));
+    this.liveItems.set(threadId,items.map(item=>({turnId,item,startedAtMs:BIRTH*1000,completedAtMs:BIRTH*1000+1})));
+    this.threads.get(threadId).status={type:'active',activeFlags:waiting?['waitingOnUserInput']:[]};
+    this.notice('turn/started',threadId,{turn:{id:turnId,status:'inProgress'}});
+    for(const item of items)this.notice('item/completed',threadId,{turnId,item});
+  }
+  ask(threadId:string,turnId:string,itemId:string,id:number,question:string,opts:{secret?:boolean;qid?:string}={}){
+    this.emit('request',{id,epoch:this.epoch,method:'item/tool/requestUserInput',params:{threadId,turnId,itemId,
+      questions:[{id:opts.qid??' layout_id'.trim(),header:'Layout choice',question,isOther:false,isSecret:opts.secret??false,options:[{label:'Compact',description:'One option.'},{label:'Spacious',description:'Another option.'}]}]}});
   }
 }
-
-async function fixture(homes=1) {
-  const root=mkdtempSync(join(tmpdir(),'cc-native-share-')),project=join(root,'book');mkdirSync(project);
-  const ids=Array.from({length:homes},(_,i)=>i===0?'default':'extra'+i);
-  const paths=new Map(ids.map(id=>[id,join(root,'home-'+id)]));for(const path of paths.values())mkdirSync(path);
-  const cfg=parseConfig({
-    version:2,instanceId:'test',port:18672,approvalTimeoutSec:30,projects:{demo:project},
-    backends:Object.fromEntries(ids.map(id=>[id,{executable:process.execPath,codexHome:paths.get(id),...(id==='default'?{aliases:['primary']}:{} )}])),
-    slack:{enabled:true,servers:ids,teamId:'T1',inputChannel:'CIN',outputChannel:'COUT',allowedHumans:['U1'],approvalUsers:['U1'],trustedBots:[{botId:'BDOT',userId:'UDOT',appId:'ADOT'}],dot:{name:'dot',userId:'UDOT'}},
-    local:{enabled:true,agents:[{id:'agent',tokenHash:createHash('sha256').update(AGENT).digest('hex'),servers:ids,projects:['demo'],commands:['server.list','session.list']}]}
+async function fixture(n=1){
+  const directory=mkdtempSync(join(tmpdir(),'dedicated-native-')),project=join(directory,'book');mkdirSync(project);
+  const ids=Array.from({length:n},(_,i)=>i===0?'default':'extra'+i);
+  const paths=ids.map(id=>join(directory,'home-'+id));paths.forEach(p=>mkdirSync(p));
+  const cfg=parseConfig({version:2,instanceId:'test',port:19781,approvalTimeoutSec:30,projects:{book:project},
+    backends:Object.fromEntries(ids.map((id,i)=>[id,{executable:process.execPath,codexHome:paths[i],...(i===0?{aliases:['primary']}: {})}])),
+    slack:{teamId:'T1',inputChannel:'CIN',outputChannel:'COUT',allowedHumans:['U1'],approvalUsers:['U1'],trustedBots:[{botId:'BDOT',userId:'UDOT',appId:'ADOT'}],servers:ids,dot:{name:'dot',userId:'UDOT'}},
+    local:{enabled:true,agents:[{id:'test-agent',tokenHash:createHash('sha256').update(AGENT).digest('hex'),servers:ids,projects:['book'],commands:['server.list']}]}
   });
-  const backends=new Map<string,NativeBackend>(),posts:{channel:string;text:string;threadTs?:string;id:string}[]=[];
-  let pauseRoot:((rootTs:string)=>Promise<boolean>)|undefined, postError:string|undefined, denial:string|undefined;
-  const slack:SlackPort={
-    async post(channel,text,o){posts.push({channel,text,threadTs:o.threadTs,id:o.deliveryId});if(denial&&text.includes(denial))throw Object.assign(Error('mock permission change'),{code:'slack_webapi_platform_error',data:{error:'not_in_channel'}});if(postError&&text.includes(postError))throw Error('unknown send response');return '410.42';},
-    async resolveDot(){return {userId:'UDOT',name:'dot'};}, async threadExists(){throw Error('Sharing should use the exact-root reader');},
-    async verifySharedRoot(_channel,ts){return pauseRoot?Promise.race([pauseRoot(ts),sleep(1200,false,{ref:false})]):true;},async humanMessage(){return undefined;}
-  };
-  const histories = new Map<string,any[]>();
-  const make=()=>{
-    const r=new Runtime(cfg,join(root,'connector'),slack,undefined,(_p,id)=>{
-      const b=new NativeBackend(project,histories.get(id));b.epoch=randomUUID();histories.set(id,b.history);backends.set(id,b);return b;
+  const stores=new Map<string,Ledgers>(),backends=new Map<string,NativeBackend>();
+  const posts:{channel:string;text:string;root?:string;id:string}[]=[];
+  let rootCheck:((root:string)=>Promise<boolean>)|undefined,postFault:((text:string)=>void)|undefined;
+  const slack:SlackPort={async post(channel,text,o){posts.push({channel,text,root:o.threadTs,id:o.deliveryId});postFault?.(text);return '444.2';},
+    async resolveDot(){return{userId:'UDOT',name:'dot'};},async threadExists(){throw Error('Use exact root verification');},
+    async verifySharedRoot(_,ts){return rootCheck?Promise.race([rootCheck(ts),sleep(1500,false,{ref:false})]):true;},async humanMessage(){return undefined;}};
+  const init=()=>{
+    const r=new Runtime(cfg,join(directory,'connector'),slack,undefined,(_p,id)=>{
+      let data=stores.get(id);
+      if(!data){
+        data={threads:new Map([[ORIGINAL,{id:ORIGINAL,createdAt:BIRTH,cwd:project,status:{type:'idle'},canAcceptDirectInput:true}]]),
+          turns:new Map([[ORIGINAL,[asTurn('old-history','completed',[reply('old-item','Original private history.')])]]]),createCount:0};
+        stores.set(id,data);
+      }
+      const b=new NativeBackend(data,project);backends.set(id,b);return b;
     });
-    for(const c of r.cores.values())Object.assign(c,{postIntervalMs:0});return r;
+    for(const core of r.cores.values())Object.assign(core,{postIntervalMs:0});
+    return r;
   };
-  let runtime=make();
+  let runtime=init();
   const start=async(bot='BSELF')=>{await runtime.connectLocal();await runtime.enableSlack('USELF',bot);};
-  const subscribe=async(root:string,serverId='default',threadId=THREAD)=>{
-    const q=request('session.subscribe',{threadId,serverId}),core=runtime.core(serverId);
-    assert.equal(runtime.accept(event(q,{thread_ts:root})),true);
+  const subscribe=async(root=ROOT,id='default',thread=ORIGINAL)=>{
+    const q=request('session.subscribe',{serverId:id,threadId:thread}),core=runtime.core(id);
+    assert.ok(runtime.accept(event(q,{thread_ts:root})));
     await waitFor(()=>core.store.state.work.some(w=>w.request.id===q.id&&w.status==='completed'));
-    return core.store.state.subscriptions!.find(s=>s.owner.threadTs===root)!.id;
+    return core.store.state.subscriptions!.find(s=>s.owner.threadTs===root&&s.threadId===thread)!.id;
   };
-  const preview=async(id:string,target='default')=>await runtime.nativeShare(target,'preview',id) as {
-    confirmationId:string;confirmationPhrase:string;disclosure:string;serverId:string;nativeThreadId:string;workspaceId:string;channel:string;rootThreadTs:string
+  const preview=async(id:string,server='default')=>await runtime.nativeShare(server,'preview-create',id) as {
+    confirmationId:string;confirmationPhrase:string;disclosure:string;project:string;workspaceId:string;channel:string;rootThreadTs:string;boundaryPolicy:string
   };
-  const grant=async(id:string,target='default')=>{const p=await preview(id,target);return runtime.nativeShare(target,'grant',id,p.confirmationId,p.confirmationPhrase);};
-  const inspection=(id:string,target='default')=>runtime.nativeShare(target,'inspect',id) as {status:string;reason:string|null;activation?:{boundaryPolicy?:string;deliveryEnabledAt?:string|null;nativeBoundary?:{excludedThroughTurnId?:string|null}}};
-  return {root,project,ids,config:cfg,posts,start,backends,subscribe,preview,grant,inspection,get runtime(){return runtime;},
-    pause(fn?:typeof pauseRoot){pauseRoot=fn;},markUncertain(marker:string){postError=marker;},deny(marker:string){denial=marker;},
-    async restart(bot?:string){await runtime.close();runtime=make();await start(bot);},
-    async close(){await runtime.close();rmSync(root,{recursive:true,force:true});}
+  type Result={status:string;reason:string|null;newSubscriptionId:string|null;newNativeThreadId:string|null;sharing?:{status:string}};
+  const create=async(id:string,server='default')=>{const p=await preview(id,server);return await runtime.nativeShare(server,'create',id,p.confirmationId,p.confirmationPhrase) as Result;};
+  const inspect=(id:string,server='default')=>runtime.nativeShare(server,'inspect',id) as {status:string;reason:string|null;dedicatedCreation:Result|null};
+  return {directory,project,ids,stores,backends,posts,subscribe,preview,create,inspect,start,get runtime(){return runtime;},
+    rootCheck(fn?:typeof rootCheck){rootCheck=fn;},fault(fn?:typeof postFault){postFault=fn;},
+    async restart(bot?:string){await runtime.close();runtime=init();await start(bot);},
+    async close(){await runtime.close();rmSync(directory,{force:true,recursive:true});}
   };
 }
-const observe=(f:Awaited<ReturnType<typeof fixture>>,text:string,root=EMPLOYEES_ROOT)=>waitFor(()=>f.posts.some(p=>p.text.includes(text)&&p.threadTs===root));
-const never=(f:Awaited<ReturnType<typeof fixture>>,text:string)=>assert.equal(f.posts.some(p=>p.text.includes(text)),false,text);
-const nativePosts=(f:Awaited<ReturnType<typeof fixture>>,root=EMPLOYEES_ROOT)=>f.posts.filter(p=>p.threadTs===root&&p.text.startsWith('Codex '));
+type F=Awaited<ReturnType<typeof fixture>>;
+const observed=(f:F,needle:string,root=ROOT)=>waitFor(()=>f.posts.some(p=>p.text.includes(needle)&&p.root===root));
+const never=(f:F,needle:string)=>assert.ok(!f.posts.some(p=>p.text.includes(needle)),needle);
 
-test('explicit owner grant forwards future reply, ordinary question and structured question only to the authorized Slack root',async()=>{
+test('existing native history, late events and unverifiable boundaries never enable body sharing; new session needs typed scope',async()=>{
   const f=await fixture();try{
-    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),spectator=await f.subscribe(SPECTATOR_ROOT);
-    const b=f.backends.get('default')!,core=f.runtime.core('default');
-    assert.equal(f.inspection(id).status,'unshared');
-    assert.equal(f.inspection(spectator).status,'unshared');
-    // An eligible-looking native reply and old live turn receive no default grant.
-    b.publish('before-grant',[reply('no-consent','A reply before the owner accepted.')]);
-    b.ongoing('in-flight-before-grant');
-    await f.grant(id);
-    assert.equal(f.inspection(id).status,'pending');
-    assert.equal(f.inspection(id).reason,'NATIVE_SHARE_WAIT_UNTIL_IDLE');
-    await f.runtime.nativeShare('default','revoke',id);
-    b.history[0]=turn('in-flight-before-grant','completed',[reply('finished-private','A private turn that was already running.')]);
-    b.threads.get(THREAD).status={type:'idle'};
-    const offer=await f.preview(id);
-    assert.deepEqual([offer.serverId,offer.nativeThreadId,offer.workspaceId,offer.channel,offer.rootThreadTs],['default',THREAD,'T1','CIN',EMPLOYEES_ROOT]);
-    assert.match(offer.disclosure,/entered locally or through another client/);
-    await assert.rejects(async()=>f.runtime.nativeShare('default','grant',spectator,offer.confirmationId,offer.confirmationPhrase),/CONFIRMATION_REQUIRED/);
-    await assert.rejects(async()=>f.runtime.nativeShare('default','grant',id,offer.confirmationId,offer.confirmationPhrase),/CONFIRMATION_REQUIRED/);
-    assert.throws(()=>f.runtime.nativeShare('primary','inspect',id),/SERVER_UNAVAILABLE/);
-    await f.grant(id);
-    // A fabricated/live-only completed message cannot bypass ordered history.
-    b.notice('item/completed',{turnId:'in-flight-before-grant',item:reply('late-pre-grant','Late pre-activation content.')});
-    b.notice('item/completed',{turnId:'not-in-history',item:reply('forged','Unverified live body.')});
-    b.ongoing('future-active',[{id:'native-prompt',type:'userMessage',content:[{type:'text',text:'The original local prompt stays private.'}]},reply('plain-question','How should we arrange the overview?','commentary')],true);
-    b.ask('future-active','structured',72);
-    // The official Windows release uses this reserved question id for an
-    // app-side approval even if a template supplies benign-looking wording.
-    b.ask('future-active','mcp-same-rpc',171,false,{questions:[{id:'mcp_tool_call_approval_mcp-same-rpc',header:'Review layout',question:'A benign-looking app approval stays native?',isOther:false,isSecret:false,
-      options:[{label:'Minimal',description:'Use a clean layout.'}]}]});
-    b.itemsToday.push({turnId:'future-active',item:{id:'related-tool',type:'mcpToolCall'},startedAtMs:BIRTH*1000,completedAtMs:null});
-    b.ask('future-active','related-tool',172,false,{questions:[{id:'unrecognized',header:'Alternate layout',question:'A matching tool item is not a normal question?',isOther:false,isSecret:false,options:null}]});
-    b.ask('future-active','secret-ask',73,true,{questions:[{id:'secret',header:'Secret test descriptor',question:'Unshareable question',isOther:false,isSecret:true,options:null}]});
-    b.emit('request',{id:74,epoch:b.epoch,method:'item/commandExecution/requestApproval',params:{threadId:THREAD,turnId:'future-active',command:'Sensitive command operation text'}});
-    b.notice('item/agentMessage/delta',{turnId:'future-active',delta:'Stream fragments stay local.'});
-    await observe(f,'How should we arrange the overview?');
-    await observe(f,'Which layout should we use?');
-    const q=f.posts.find(x=>x.text.includes('Which layout should we use?'))!;
-    assert.match(q.text,/Layout choice\nWhich layout should we use\?\n• Compact\n• Spacious/);
-    assert.match(q.text,/Answer in the original Codex window/);
-    assert.doesNotMatch(q.text,/alternate visual|omit-question-id|structured/);
-    b.notice('serverRequest/resolved',{requestId:72});
-    const last=[reply('plain-question','How should we arrange the overview?','commentary'),reply('future-reply','The overview and comparison are ready.'),reply('unknown-phase','A body with no verified display phase.',null),
-      {id:'tool',type:'commandExecution',aggregatedOutput:'Contents of the command output.'},
-      {id:'thought',type:'reasoning',content:['No hidden reasoning in Slack.']},reply('looks-secret','Your password: demo-fixture-value')];
-    b.history[0]=turn('future-active','completed',last);b.threads.get(THREAD).status={type:'idle'};
-    b.notice('turn/completed',{turn:{id:'future-active',status:'completed'}});b.notice('turn/completed',{turn:{id:'future-active',status:'completed'}});
-    await observe(f,'The overview and comparison are ready.');
-    assert.equal(nativePosts(f).filter(p=>p.text.includes('How should')).length,1);
-    assert.equal(nativePosts(f,SPECTATOR_ROOT).length,0);
-    ['Old private material','before the owner','already running','Late pre-activation','Unverified live body','Sensitive command operation','Stream fragments','original local prompt','Unshareable question','benign-looking app approval','matching tool item','no verified display phase','Contents of the command output','hidden reasoning in Slack','demo-fixture-value'].forEach(t=>never(f,t));
-    assert.equal(b.responses.length,0);assert.equal(b.calls.filter(x=>x.method==='turn/interrupt').length,0);
-    assert.ok(b.calls.filter(r=>r.method==='thread/turns/list').every(r=>r.params.itemsView==='notLoaded'));
-    assert.ok(!b.calls.some(r=>r.method==='thread/items/list'&&['pre-grant','before-grant','in-flight-before-grant'].includes(r.params.turnId)));
-    assert.ok(core.store.state.outbox.filter(o=>o.nativeShare).every(o=>o.channel==='CIN'&&o.threadTs===EMPLOYEES_ROOT&&o.text.startsWith('[Native content record:')));
-    assert.equal(core.store.state.results?.some(row=>row.text.includes('The overview and comparison')),false);
+    await f.start();const source=await f.subscribe(),b=f.backends.get('default')!,core=f.runtime.core('default');
+    assert.throws(()=>f.runtime.nativeShare('default','preview',source),/EXISTING_SESSION_UNSUPPORTED/);
+    assert.throws(()=>f.runtime.nativeShare('default','grant',source,'prior-code','old-consent'),/EXISTING_SESSION_UNSUPPORTED/);
+    b.ongoing(ORIGINAL,'old-live',[reply('old-active','An original native replay must stay local.','commentary')],true);
+    b.ask(ORIGINAL,'old-live','same-question',7,'Does a private question stay local?');
+    const offer=await f.preview(source);
+    assert.match(offer.disclosure,/Create a new, empty Codex session/);assert.match(offer.disclosure,/No existing Codex session or history is shared/);
+    assert.match(offer.disclosure,/work started while setup is running/);
+    assert.deepEqual([offer.project,offer.workspaceId,offer.channel,offer.rootThreadTs],['book','T1','CIN',ROOT]);
+    assert.equal(offer.confirmationPhrase,'CREATE AND SHARE NEW CODEX SESSION TO T1/CIN/'+ROOT);
+    await assert.rejects(async()=>f.runtime.nativeShare('default','create',source,offer.confirmationId,'SHARE AFTER NATIVE CUT'),/CONFIRMATION_REQUIRED/);
+    assert.equal(b.calls.filter(c=>['thread/turns/list','thread/start'].includes(c.method)).length,0);
+    const other=await f.subscribe(OTHER),newOffer=await f.preview(source);
+    await assert.rejects(async()=>f.runtime.nativeShare('default','create',other,newOffer.confirmationId,newOffer.confirmationPhrase),/CONFIRMATION_REQUIRED/);
+    assert.throws(()=>f.runtime.nativeShare('primary','inspect',source),/SERVER_UNAVAILABLE/);
+    b.onStart=async(thread)=>{
+      assert.equal(core.store.state.nativeShareCreations!.at(-1)!.status,'creating');
+      assert.equal(core.store.state.nativeShares?.length??0,0);
+      b.publish(ORIGINAL,'old-live',[reply('old-active','An original native replay must stay local.')]);
+      return{thread};
+    };
+    const created=await f.create(source);
+    assert.equal(created.status,'proven');assert.equal(created.newNativeThreadId,FRESH);assert.equal(created.sharing?.status,'active');
+    assert.equal(f.inspect(source).status,'unshared');assert.equal(f.inspect(created.newSubscriptionId!).status,'active');
+    assert.deepEqual(b.calls.find(c=>c.method==='thread/start')!.params,{cwd:f.project,ephemeral:false});
+    assert.ok(!b.calls.some(c=>c.method==='thread/turns/list'&&c.params.threadId===ORIGINAL));
+    b.publish(FRESH,'fresh-answer',[reply('good','This new session has a welcome response.')]);
+    await observed(f,'new session has a welcome response');
+    assert.ok(!f.posts.some(p=>p.root===OTHER&&p.text.includes('welcome response')));
+    ['Original private history','original native replay','private question stays local'].forEach(x=>never(f,x));
   }finally{await f.close();}
 });
 
-test('revocation, in-flight confirmation, stale structured request and exact Slack root checks at adapter boundary',async()=>{
+test('dedicated setup holds only fresh same-epoch live questions, even if the persisted active turn is late',async()=>{
   const f=await fixture();try{
-    await f.start();const sub=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
-    let release!:(v:boolean)=>void,checks=0;
-    f.pause(()=>new Promise(r=>{release=r;checks++;}));
-    const p=await f.preview(sub);
-    const race=Promise.resolve(f.runtime.nativeShare('default','grant',sub,p.confirmationId,p.confirmationPhrase));
-    await waitFor(()=>checks===1);f.runtime.nativeShare('default','revoke',sub);release(true);
-    await race;
-    assert.equal(f.inspection(sub).status,'retired');
-    f.pause();await f.grant(sub);
-    let started=false;f.pause(()=>new Promise(r=>{release=r;started=true;}));
-    b.ongoing('live',[reply('action-ready','Ready for presentation feedback.','commentary')],true);
-    await waitFor(()=>started);
-    const cut=await f.runtime.nativeShare('default','revoke',sub);
-    assert.ok('inFlightMayStillArrive' in cut);assert.equal(cut.inFlightMayStillArrive,false);
-    release(true);await sleep(40);never(f,'Ready for presentation feedback');
-    b.history[0]=turn('live','completed');b.threads.get(THREAD).status={type:'idle'};
-    f.pause();await f.grant(sub);
-    started=false;f.pause(()=>new Promise(r=>{release=r;started=true;}));
-    b.ongoing('request-current',[],true);b.ask('request-current','unresolved-then-closed',90);
-    await waitFor(()=>started);
-    b.notice('serverRequest/resolved',{requestId:90});
-    release(true);await sleep(40);never(f,'Which layout should we use?');
-    b.history[0]=turn('request-current','completed');
-    started=false;f.pause(()=>new Promise(r=>{release=r;started=true;}));
-    b.ongoing('late-association',[],true);
-    b.ask('late-association','later-qualified-as-tool',91,false,{questions:[{id:'context-review',header:'Layout review',question:'Provide the redraft format?',isOther:false,isSecret:false,options:null}]});
-    await waitFor(()=>started);
-    // This native item appears in the App Server read after the initial queue,
-    // without forwarding a lifecycle event to the connector.
-    b.itemsToday.push({turnId:'late-association',item:{id:'later-qualified-as-tool',type:'mcpToolCall'},startedAtMs:BIRTH*1000,completedAtMs:null});
-    release(true);await sleep(40);never(f,'Provide the redraft format?');
-    b.history[0]=turn('late-association','completed');
-    f.pause(async()=>false);b.publish('root-removed',[reply('wrong-destination','Text after its destination was removed.')]);
-    await waitFor(()=>f.inspection(sub).status==='retired');never(f,'Text after its destination was removed.');
-    assert.equal(b.responses.length,0);assert.equal(b.calls.filter(x=>x.method==='turn/interrupt').length,0);
+    await f.start();const source=await f.subscribe(),b=f.backends.get('default')!,core=f.runtime.core('default');
+    const entered=deferred(),resume=deferred();let held=false;
+    b.beforeRead=async(threadId)=>{if(threadId===FRESH){b.threads.get(FRESH).createdAt++;if(!held){held=true;entered.resolve();await resume.promise;}}};
+    const creation=f.create(source);await entered.promise;
+    const row=core.store.state.nativeShares![0]!;
+    assert.equal(row.state,'pending');assert.equal(row.nativeThreadId,FRESH);
+    assert.equal(f.inspect(source).dedicatedCreation?.newSubscriptionId,row.subscriptionId);
+    b.withoutLiveTurns=true;
+    b.ongoing(FRESH,'fresh-running',[reply('plain-while-setup','How should we arrange the new outline?','commentary')],true);
+    b.ask(FRESH,'fresh-running','setup-question',72,'Which layout is suitable for the new outline?');
+    b.ask(FRESH,'fresh-running','setup-resolved',73,'The resolved setup choice must not appear?');
+    b.notice('serverRequest/resolved',FRESH,{requestId:73});
+    b.ask(FRESH,'fresh-running','secret',74,'The secret test question?',{secret:true});
+    b.ask(FRESH,'fresh-running','approval',75,'A benign-looking app approval must stay native?',{qid:'mcp_tool_call_approval_approval'});
+    b.notice('item/started',FRESH,{turnId:'fresh-running',item:{id:'earlier-tool',type:'mcpToolCall'}});
+    b.ask(FRESH,'fresh-running','earlier-tool',76,'A matching native action must stay native?');
+    b.notice('item/agentMessage/delta',FRESH,{turnId:'fresh-running',delta:'Raw stream is not shared.'});
+    assert.equal(core.store.state.outbox.filter(o=>o.nativeShare).length,0);
+    assert.ok(!JSON.stringify(core.store.state).includes('Which layout is suitable'));
+    resume.resolve();await creation;
+    await observed(f,'Which layout is suitable');
+    const question=f.posts.find(p=>p.text.includes('Which layout is suitable'))!;
+    assert.match(question.text,/Layout choice\nWhich layout is suitable[^\n]+\n• Compact\n• Spacious/);
+    assert.match(question.text,/Answer in the original Codex window/);assert.doesNotMatch(question.text,/One option|layout_id/);
+    b.withoutLiveTurns=false;b.notice('item/completed',FRESH,{turnId:'fresh-running',item:reply('plain-while-setup','How should we arrange the new outline?','commentary')});
+    await observed(f,'arrange the new outline');
+    b.publish(FRESH,'fresh-running',[reply('plain-while-setup','How should we arrange the new outline?','commentary'),
+      reply('final','The new outline is ready.'),{id:'user',type:'userMessage',content:[{type:'text',text:'Local user input is not shared.'}]},
+      {id:'tool',type:'commandExecution',aggregatedOutput:'Raw tool result is not shared.'},reply('secret-tail','Your password: demo-secret-tail')]);
+    await observed(f,'new outline is ready');
+    assert.equal(f.posts.filter(p=>p.text.includes('arrange the new outline')).length,1);
+    ['resolved setup choice','secret test question','benign-looking app approval','matching native action','Raw stream','Local user input','Raw tool result','demo-secret-tail'].forEach(x=>never(f,x));
+    assert.equal(b.responses.length,0);assert.ok(!b.calls.some(c=>c.method==='turn/interrupt'));
   }finally{await f.close();}
 });
 
-test('durable bounded offline recovery, no uncertain resend and same-ID separation across three Homes',async()=>{
-  const f=await fixture(3);try{
-    await f.start();const roots=['101.2','211.2','311.2'];
-    const ids=await Promise.all(f.ids.map((id,index)=>f.subscribe(roots[index]!,id)));
-    await Promise.all(ids.map((sub,i)=>f.grant(sub,f.ids[i])));
-    const b0=f.backends.get('default')!,b1=f.backends.get('extra1')!,b2=f.backends.get('extra2')!;
-    b0.notice('item/completed',{turnId:'collision',item:reply('same-item','A native wake signal before the connection drops.')});
-    b0.connected=false;b0.emit('disconnect',b0.epoch);
-    await sleep(15);assert.equal(f.inspection(ids[0]!).status,'paused');
-    b0.history.unshift(turn('collision','completed',[reply('same-item','Isolated first Home recovered.')]));
-    b1.publish('collision',[reply('same-item','Isolated second Home live.')]);b2.publish('collision',[reply('same-item','Isolated third Home live.')]);
-    await observe(f,'Isolated second Home live.',roots[1]);await observe(f,'Isolated third Home live.',roots[2]);
-    never(f,'Isolated first Home recovered.');
+test('a lost or contradictory thread/start response is uncertain, never auto-retries, never adopts an old ID',async()=>{
+  const f=await fixture();try{
+    await f.start();const source=await f.subscribe(),b=f.backends.get('default')!;
+    b.onStart=async()=>{throw Error('Response lost after native creation');};
+    const outcome=await f.create(source);
+    assert.equal(outcome.status,'uncertain');assert.equal(outcome.newNativeThreadId,null);
+    assert.equal(f.stores.get('default')!.createCount,1);
     await f.restart();
-    await observe(f,'Isolated first Home recovered.',roots[0]);
-    assert.equal(f.posts.filter(p=>p.text.includes('Isolated')).length,3);
-    assert.ok(!f.posts.some(p=>p.text.includes('Isolated first Home')&&p.threadTs!==roots[0]));
-    assert.ok(!f.posts.some(p=>p.text.includes('Isolated second Home')&&p.threadTs!==roots[1]));
-    assert.ok(!f.posts.some(p=>p.text.includes('Isolated third Home')&&p.threadTs!==roots[2]));
-    f.markUncertain('network-outcome-test');f.backends.get('extra1')!.publish('uncertain-turn',[reply('uncertain','A network-outcome-test message.')]);
-    const core=f.runtime.core('extra1');await waitFor(()=>core.store.state.outbox.some(o=>o.nativeShare?.projection.kind==='message'&&o.nativeShare.projection.text.includes('network-outcome-test')&&o.status==='uncertain'));
-    const old=core.store.state.outbox.find(o=>o.nativeShare?.projection.kind==='message'&&o.nativeShare.projection.text.includes('network-outcome-test'))!;
-    assert.throws(()=>f.runtime.recover('outbox',old.id,undefined,'extra1'),/SCOPE_UNVERIFIED/);
-    await f.restart('DIFFERENTBOT');
-    f.backends.get('default')!.publish('reconnected-different-destination',[reply('different-auth','A different Slack connection cannot receive this body.')]);
-    await waitFor(()=>f.inspection(ids[0]!).status==='retired');
-    never(f,'A different Slack connection');
-    assert.equal(f.posts.filter(p=>p.text.includes('network-outcome-test')).length,1);
+    assert.equal(f.inspect(source).dedicatedCreation?.status,'uncertain');
+    await assert.rejects(()=>f.create(source),/ALREADY_PENDING/);
+    assert.equal(f.stores.get('default')!.createCount,1);
+    f.runtime.nativeShare('default','revoke',source);
+    const fresh=f.backends.get('default')!;
+    fresh.onStart=async()=>({thread:{...fresh.threads.get(ORIGINAL),sessionId:ORIGINAL,turns:[],forkedFromId:null,parentThreadId:null,attachedToThreadId:null,ephemeral:false}});
+    const bad=await f.create(source);
+    assert.equal(bad.status,'uncertain');assert.equal(bad.newNativeThreadId,null);
+    fresh.publish(ORIGINAL,'old-id-response',[reply('failed-birth','Do not adopt a known old thread returned from creation.')]);
+    await sleep(30);never(f,'known old thread');
+    assert.equal(f.runtime.core('default').store.state.nativeShares?.length??0,0);
+    assert.equal(f.stores.get('default')!.createCount,2);
+    f.runtime.nativeShare('default','revoke',source);
+    fresh.onStart=async(thread)=>({thread:{...thread,attachedToThreadId:ORIGINAL}});
+    const attached=await f.create(source);
+    assert.equal(attached.status,'uncertain');assert.equal(attached.newNativeThreadId,null);
+    assert.equal(f.runtime.core('default').store.state.nativeShares?.length??0,0);
   }finally{await f.close();}
 });
 
-test('unproven activation, lost frontier and operator HTTP isolation stay closed',async()=>{
-  const f=await fixture();const api=apiServer(f.runtime,OP);
-  await new Promise<void>(resolve=>api.listen(0,'127.0.0.1',resolve));const port=(api.address() as {port:number}).port;
-  const http=(body:any,token=OP)=>fetch('http://127.0.0.1:'+port+'/v1/command',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify(body)});
-  try{
-    await f.start();const sub=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
-    for(const operation of ['inspect','preview','grant','revoke'])assert.equal((await http({action:'native.share',operation,serverId:'default',subscriptionId:sub},AGENT)).status,403);
-    assert.equal((await http({action:'native.share',operation:'preview',serverId:'primary',subscriptionId:sub})).status,400);
-    assert.equal((await http({action:'native.share',operation:'grant',serverId:'default',subscriptionId:sub,confirmationId:'bogus',phrase:'forced'})).status,400);
-    b.homeMatch=false;
-    const noHome=await http({action:'native.share',operation:'preview',serverId:'default',subscriptionId:sub});
-    assert.deepEqual(await noHome.json(),{error:'NATIVE_SHARE_IDENTITY_UNVERIFIED'});
-    b.homeMatch=true;
-    b.overridePage={data:[{id:'wrong-shape',status:'completed',items:[]}],nextCursor:null};
-    await f.grant(sub);
-    assert.equal(f.inspection(sub).status,'pending');assert.equal(f.inspection(sub).reason,'NATIVE_SHARE_HISTORY_GAP');
-    await f.runtime.nativeShare('default','revoke',sub);
-    b.overridePage=undefined;
-    await f.grant(sub);
-    b.history.splice(0,b.history.length,turn('not-an-anchor','completed',[reply('private-gap','Unverifiable gap message.')]));
-    b.notice('turn/completed',{turn:{id:'not-an-anchor',status:'completed'}});
-    await waitFor(()=>f.inspection(sub).status==='retired');never(f,'Unverifiable gap message.');
-    // Rollback/unload signals hard invalidate the prior grant. No fallback or auto-recreate.
-    b.notice('thread/rolledBack',{});
-    await waitFor(()=>f.inspection(sub).status==='retired');
-    assert.equal(b.calls.filter(c=>['thread/start','turn/start','turn/steer','turn/interrupt'].includes(c.method)).length,0);
-  }finally{await new Promise<void>(done=>{api.close(()=>done());api.closeAllConnections();});await f.close();}
-});
-
-test('existing empty history needs a known boundary; a newly created owner dedicated session can be explicitly granted',async()=>{
+test('restart while a native create is in flight never reuses the unacknowledged fresh thread',async()=>{
   const f=await fixture();try{
     await f.start();
-    const b=f.backends.get('default')!,sub=await f.subscribe(EMPLOYEES_ROOT);
-    b.history.length=0;
-    await f.grant(sub);
-    assert.equal(f.inspection(sub).status,'pending');
-    assert.equal(f.inspection(sub).reason,'NATIVE_SHARE_USE_DEDICATED_THREAD');
-    const accepted=f.runtime.local(request('session.create',{project:'demo'}));
-    await waitFor(()=>f.runtime.core('default').store.state.work.some(w=>w.id===accepted.id&&w.status==='completed'));
-    const row=f.runtime.core('default').store.state.work.find(w=>w.id===accepted.id)!;
-    const dedicated=row.resultRef!.threadId!;
-    assert.notEqual(dedicated,THREAD);
-    const id=await f.subscribe(SPECTATOR_ROOT,'default',dedicated);
-    await f.grant(id);
-    assert.equal(f.inspection(id).status,'active');
-    assert.equal(f.inspection(sub).status,'pending');
-    assert.equal(b.calls.filter(c=>c.method==='thread/start').length,1);
-    assert.equal(b.responses.length,0);
+    const source=await f.subscribe(),before=f.backends.get('default')!;
+    const entered=deferred(),abandoned=deferred<any>();
+    before.onStart=async()=>{entered.resolve();return abandoned.promise;};
+    // Model a process exit before receiving an acknowledgement. Deliberately
+    // do not resolve work in the old process after reopening the same ledger.
+    void f.create(source).catch(()=>{});
+    await entered.promise;
+    assert.equal(f.inspect(source).dedicatedCreation?.status,'creating');
+    assert.equal(f.stores.get('default')!.createCount,1);
+    await f.restart();
+    assert.equal(f.inspect(source).dedicatedCreation?.status,'uncertain');
+    assert.equal(f.inspect(source).dedicatedCreation?.newNativeThreadId,null);
+    await assert.rejects(()=>f.create(source),/ALREADY_PENDING/);
+    const after=f.backends.get('default')!;
+    after.publish(FRESH,'orphan-new-turn',[reply('orphan-new-body','This unacknowledged fresh thread must never post.')]);
+    await sleep(30);never(f,'unacknowledged fresh thread');
+    assert.equal(f.stores.get('default')!.createCount,1);
   }finally{await f.close();}
 });
 
-test('long replies are screened as a whole and delivered as bounded native chunks, only to the verified address',async()=>{
+test('exact consent cannot follow live destination/identity changes or a revoked creation',async()=>{
   const f=await fixture();try{
-    await f.start();await f.grant(await f.subscribe(EMPLOYEES_ROOT));
+    await f.start();const source=await f.subscribe();
+    f.rootCheck(async()=>false);
+    const refused=await f.create(source);
+    assert.equal(refused.status,'failed');assert.equal(refused.reason,'NATIVE_SHARE_DESTINATION_UNVERIFIED');assert.equal(f.stores.get('default')!.createCount,0);
+    f.rootCheck();
+    let entered=deferred(),release=deferred();
     const b=f.backends.get('default')!;
-    const benign='This paragraph belongs in our teaching example. '.repeat(155).trim();
-    b.publish('long-content',[reply('many-parts',benign),reply('secret-tail',benign+' Password: hide-this-at-the-end')]);
-    const core=f.runtime.core('default');
-    await waitFor(()=>core.store.state.outbox.filter(o=>o.nativeShare?.projection.itemId==='many-parts'&&o.status==='sent').length===4);
-    const pieces=core.store.state.outbox.filter(o=>o.nativeShare?.projection.itemId==='many-parts');
-    const ids=new Set(pieces.map(p=>p.id)),delivered=f.posts.filter(p=>ids.has(p.id));
-    assert.equal(delivered.map(p=>p.text).join(''),'Codex reply\n'+benign);
-    assert.ok(delivered.every(p=>Buffer.byteLength(p.text)<=2300&&p.threadTs===EMPLOYEES_ROOT));
-    assert.ok(!core.store.state.outbox.some(o=>o.nativeShare?.projection.itemId==='secret-tail'));never(f,'hide-this-at-the-end');
+    b.onStart=async(thread)=>{entered.resolve();await release.promise;return{thread};};
+    const task=f.create(source);await entered.promise;
+    await f.runtime.enableSlack('USELF','CHANGEDBOT');
+    release.resolve();
+    assert.equal((await task).status,'uncertain');
+    assert.equal(f.runtime.core('default').store.state.nativeShares?.length??0,0);
+    f.runtime.nativeShare('default','revoke',source);
+    entered=deferred();release=deferred();
+    const next=f.create(source);await entered.promise;
+    const revoke=await f.runtime.nativeShare('default','revoke',source);
+    assert.ok('inFlightMayStillCreate' in revoke&&revoke.inFlightMayStillCreate===true);
+    release.resolve();assert.equal((await next).status,'revoked');
+    assert.equal(f.runtime.core('default').store.state.nativeShares?.length??0,0);
   }finally{await f.close();}
 });
 
-test('Slack membership denial between root read and actual post retires the generation',async()=>{
+test('the new subscription can be unsubscribed or revoked; rollback and failed post permission remain closed',async()=>{
   const f=await fixture();try{
-    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT);
-    const b=f.backends.get('default')!;await f.grant(id);
-    f.deny('Attachment update ready');
-    b.publish('before-denial',[reply('denied-only-once','Attachment update ready.'),reply('skip-on-denial','The follow-up should not be attempted.')]);
-    await waitFor(()=>f.inspection(id).status==='retired');
-    assert.equal(f.posts.filter(p=>p.text.includes('Attachment update ready')).length,1);
-    never(f,'The follow-up should not be attempted.');
-    f.deny('no matching body');
-    b.publish('no-revive',[reply('later','Regaining membership does not restore a grant.')]);
-    await sleep(30);never(f,'Regaining membership');
+    await f.start();const source=await f.subscribe(),initial=await f.create(source),b=f.backends.get('default')!,core=f.runtime.core('default');
+    const stop=request('session.unsubscribe',{serverId:'default',subscriptionId:initial.newSubscriptionId});
+    assert.ok(f.runtime.accept(event(stop,{thread_ts:ROOT})));
+    await waitFor(()=>core.store.state.work.some(w=>w.request.id===stop.id&&w.status==='completed'));
+    b.publish(initial.newNativeThreadId!,'cancelled',[reply('after-cancel','Do not share after unsubscribe.')]);
+    await waitFor(()=>f.inspect(initial.newSubscriptionId!).status==='retired');never(f,'after unsubscribe.');
+    const second=await f.create(source),third=await f.create(source);
+    assert.equal(second.status,'proven');assert.equal(third.status,'proven');
+    f.runtime.nativeShare('default','revoke',second.newSubscriptionId!);
+    b.publish(second.newNativeThreadId!,'operator-revoked',[reply('after-revoke','No body after local revoke.')]);
+    b.notice('thread/rolledBack',third.newNativeThreadId!);
+    assert.equal(f.inspect(third.newSubscriptionId!).status,'retired');
+    b.publish(third.newNativeThreadId!,'rolled', [reply('after-rollback','No body after native rollback.')]);
+    const fourth=await f.create(source);
+    f.fault(text=>{if(text.includes('Posting lost membership'))throw Object.assign(Error('refused'),{code:'slack_webapi_platform_error',data:{error:'not_in_channel'}});});
+    b.publish(fourth.newNativeThreadId!,'lost-slack',[reply('blocked','Posting lost membership.'),reply('follow-up','Do not follow up after denied membership.')]);
+    await waitFor(()=>f.inspect(fourth.newSubscriptionId!).status==='retired');
+    ['body after local revoke','body after native rollback','follow up after denied'].forEach(x=>never(f,x));
   }finally{await f.close();}
 });
 
-test('same native thread, turn, item and request IDs across three Homes: open questions stay scoped and offline resolution is not replayed',async()=>{
+test('identical native thread, turn, item and RPC IDs are isolated across three Homes; prior tool evidence survives reconnect',async()=>{
   const f=await fixture(3);try{
-    await f.start();
-    const roots=['101.2','211.2','311.2'];
-    const subs=await Promise.all(f.ids.map((id,i)=>f.subscribe(roots[i]!,id)));
-    await Promise.all(subs.map((sub,i)=>f.grant(sub,f.ids[i])));
-    let blocked=false, release!:(v:boolean)=>void;
-    f.pause(async ts=>ts===roots[0]?new Promise<boolean>(r=>{blocked=true;release=r;}):true);
-    f.ids.forEach((id,i)=>{
-      const b=f.backends.get(id)!;b.ongoing('shared-turn',[],true);
-      b.ask('shared-turn','shared-item',101,false,{questions:[{id:'layout-same-id',header:'Which visual arrangement?',question:'Choose a layout in Home '+(i+1)+'.',isOther:false,isSecret:false,options:null}]});
-    });
-    await waitFor(()=>blocked);
-    await observe(f,'layout in Home 2.',roots[1]);await observe(f,'layout in Home 3.',roots[2]);
-    const b=f.backends.get('default')!;
-    b.connected=false;b.emit('disconnect',b.epoch);
-    // Resolution happened offline. There is no current native request to
-    // verify on reconnect even though the Connecter's durable row exists.
-    b.history[0]=turn('shared-turn','completed');b.threads.get(THREAD).status={type:'idle'};
-    release(true);f.pause();
+    await f.start();const roots=[ROOT,'211.2','311.2'];
+    const seeds=await Promise.all(f.ids.map((id,i)=>f.subscribe(roots[i]!,id)));
+    const grants=await Promise.all(seeds.map((id,i)=>f.create(id,f.ids[i])));
+    assert.ok(grants.every(g=>g.newNativeThreadId===FRESH));
+    const first=f.backends.get('default')!;
+    first.ongoing(FRESH,'same-turn',[],true);
+    first.notice('item/started',FRESH,{turnId:'same-turn',item:{id:'same-item',type:'mcpToolCall'}});
+    first.ask(FRESH,'same-turn','same-item',101,'This tool-linked question must not escape?');
+    await sleep(35);never(f,'tool-linked question');
+    const deny=f.runtime.core('default').store.state.nativeShares![0]!.questionDeny;
+    assert.equal(deny?.length,1);
     await f.restart();
-    const core=f.runtime.core('default');
-    core.store.transaction(d=>{for(const o of d.outbox)if(o.nativeShare?.projection.kind==='input'&&o.status==='queued')o.nextAttemptAt=0;});
-    core.flush();
-    await waitFor(()=>core.store.state.outbox.some(o=>o.nativeShare?.projection.kind==='input'&&o.status==='failed'));
-    never(f,'layout in Home 1.');
-    assert.equal(f.posts.filter(p=>p.text.includes('layout in Home')).length,2);
-    assert.ok(!f.posts.some(p=>p.text.includes('Home 2.')&&p.threadTs!==roots[1]));
-    assert.ok(!f.posts.some(p=>p.text.includes('Home 3.')&&p.threadTs!==roots[2]));
-    assert.ok([...f.backends.values()].every(x=>x.responses.length===0));
-  }finally{await f.close();}
-});
-
-test('consent is durable before reading the frontier; excluded turns stay private across a pending restart',async()=>{
-  const f=await fixture();try{
-    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
-    const offer=await f.preview(id);
-    assert.equal(b.calls.filter(x=>x.method==='thread/turns/list').length,0,'preview identifies thread only');
-    // This completes before owner confirmation, after the identity preview.
-    b.publish('complete-before-confirm',[reply('prewrite','Pre-consent content is not shared.')]);
-    let release!:(v:boolean)=>void,held=false;
-    f.pause(()=>new Promise(r=>{release=r;held=true;}));
-    const accepted=Promise.resolve(f.runtime.nativeShare('default','grant',id,offer.confirmationId,offer.confirmationPhrase));
-    const saved=f.runtime.core('default').store.state.nativeShares![0]!;
-    assert.equal(saved.state,'pending');assert.equal(saved.anchor,null);assert.equal(saved.activatedAt,undefined);
-    assert.equal(f.inspection(id).status,'pending');
-    await waitFor(()=>held);
-    assert.equal(b.calls.filter(x=>x.method==='thread/turns/list').length,0);
-    // Busy before the first verified frontier: stay pending, no historical fetch.
-    b.ongoing('active-during-consent',[reply('during-hold','Pending-stage content also stays private.','commentary')],true);
-    release(true);await accepted;
-    assert.equal(f.inspection(id).reason,'NATIVE_SHARE_WAIT_UNTIL_IDLE');
-    f.pause();
-    // Restart with the confirmed pending row. The first eligible ordered
-    // checkpoint includes everything through this now-completed turn.
-    b.history[0]=turn('active-during-consent','completed',[reply('during-finished','This was still before the verified snapshot.')]);
-    await f.restart();
-    await waitFor(()=>f.inspection(id).status==='active');
-    assert.equal(f.runtime.core('default').store.state.nativeShares![0]!.anchor,'active-during-consent');
-    f.backends.get('default')!.publish('after-activation',[reply('approved-final','The new overview is ready to read.')]);
-    await observe(f,'The new overview is ready to read.');
-    ['Pre-consent content','Pending-stage content','before the verified snapshot'].forEach(text=>never(f,text));
-  }finally{await f.close();}
-});
-
-test('tool evidence observed before a same-item question survives reconnect and stays inside its verified Home',async()=>{
-  const f=await fixture(3);try{
-    await f.start();const roots=['101.2','211.2','311.2'];
-    const subs=await Promise.all(f.ids.map((id,index)=>f.subscribe(roots[index]!,id)));
-    await Promise.all(subs.map((sub,i)=>f.grant(sub,f.ids[i])));
-    const special=f.backends.get('default')!;
-    special.ongoing('same-turn',[],true);
-    // No body/related item in bounded readback, but the exact MCP item
-    // notification arrives before an ordinary-shaped request.
-    special.notice('item/started',{turnId:'same-turn',item:{id:'identical-item',type:'mcpToolCall'}});
-    special.ask('same-turn','identical-item',101,false,{questions:[{id:'unclassified',header:'Layout',question:'A prior tool would get exposed?',isOther:false,isSecret:false,options:null}]});
-    await sleep(30);never(f,'prior tool would');
-    const before=f.runtime.core('default').store.state.nativeShares![0]!.questionDeny;
-    assert.equal(before?.length,1);
-    assert.ok(before?.every(x=>/^[a-f0-9]{64}$/.test(x.item)&&/^[a-f0-9]{64}$/.test(x.connection)));
-    await f.restart();
-    await Promise.all(subs.map((sub,i)=>waitFor(()=>f.inspection(sub,f.ids[i]!).status==='active')));
+    await Promise.all(grants.map((g,i)=>waitFor(()=>f.inspect(g.newSubscriptionId!,f.ids[i]).status==='active')));
     f.ids.forEach((id,i)=>{
       const b=f.backends.get(id)!;
-      if(i===0)b.threads.get(THREAD).status={type:'active',activeFlags:['waitingOnUserInput']};
-      else b.ongoing('same-turn',[],true);
-      b.ask('same-turn','identical-item',101,false,{questions:[{id:'unclassified',header:'Layout',question:'Select an arrangement for workspace '+(i+1)+'.',isOther:false,isSecret:false,options:null}]});
+      if(i>0)b.ongoing(FRESH,'same-turn',[],true);
+      b.ask(FRESH,'same-turn','same-item',101,'Which style should Home '+(i+1)+' use?');
     });
-    await observe(f,'for workspace 2.',roots[1]);await observe(f,'for workspace 3.',roots[2]);
-    never(f,'for workspace 1.');
-    assert.deepEqual(f.runtime.core('default').store.state.nativeShares![0]!.questionDeny,before);
-    assert.ok(f.ids.slice(1).every(id=>!f.runtime.core(id).store.state.nativeShares![0]!.questionDeny?.length));
+    await observed(f,'Home 2 use?',roots[1]);await observed(f,'Home 3 use?',roots[2]);
+    never(f,'Home 1 use?');
+    assert.ok(!f.posts.some(p=>p.text.includes('Home 2 use?')&&p.root!==roots[1]));
+    assert.ok(!f.posts.some(p=>p.text.includes('Home 3 use?')&&p.root!==roots[2]));
+    assert.deepEqual(f.runtime.core('default').store.state.nativeShares![0]!.questionDeny,deny);
   }finally{await f.close();}
 });
 
-test('an older consent scope cannot resume grant or cached body',async()=>{
+test('offline recovery remains causal on a proven new ID; a resolved offline question and uncertain Slack post are never retried',async()=>{
   const f=await fixture();try{
-    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
-    await f.grant(id);
-    let release!:(v:boolean)=>void,held=false;f.pause(()=>new Promise(r=>{release=r;held=true;}));
-    b.publish('old-revision-delivery',[reply('old-projection','No older candidate writes from an unsafe gate.')]);
-    await waitFor(()=>held);
-    const core=f.runtime.core('default');
-    // Trusted on-disk upgrade fixture, not a caller bypass of the auth API.
-    core.store.transaction(d=>{const row=d.nativeShares![0]!;row.consentVersion=2;delete row.boundaryPolicy;});
-    f.runtime.disableSlack();release(true);f.pause();
+    await f.start();const source=await f.subscribe(),created=await f.create(source),b=f.backends.get('default')!,core=f.runtime.core('default');
+    const rootEntered=deferred(),release=deferred<boolean>();
+    f.rootCheck(async()=>{rootEntered.resolve();return release.promise;});
+    b.ongoing(FRESH,'offline-turn',[],true);
+    b.ask(FRESH,'offline-turn','offline-question',22,'A question resolved offline must not appear?');
+    await rootEntered.promise;
+    b.connected=false;b.emit('disconnect',b.epoch);
+    b.publish(FRESH,'offline-turn',[reply('offline-final','An eligible response is recovered on reconnect.')]);
+    release.resolve(true);f.rootCheck();
     await f.restart();
-    assert.equal(f.inspection(id).status,'retired');assert.equal(f.inspection(id).reason,'NATIVE_SHARE_EXPLICIT_REAUTHORIZATION_REQUIRED');
-    await sleep(30);never(f,'No older candidate writes');
-    assert.ok(!f.runtime.core('default').store.state.outbox.some(o=>o.nativeShare&&o.status==='queued'));
+    f.runtime.core('default').store.transaction(d=>{for(const o of d.outbox)if(o.nativeShare&&o.status==='queued')o.nextAttemptAt=0;});
+    f.runtime.core('default').flush();
+    await observed(f,'eligible response is recovered');
+    never(f,'question resolved offline');
+    f.fault(text=>{if(text.includes('Slack transport uncertain'))throw Error('unknown outcome');});
+    f.backends.get('default')!.publish(FRESH,'uncertain-turn',[reply('uncertain','Slack transport uncertain for this reply.')]);
+    const fresh=f.runtime.core('default');
+    await waitFor(()=>fresh.store.state.outbox.some(o=>o.nativeShare?.projection.itemId==='uncertain'&&o.status==='uncertain'));
+    const old=fresh.store.state.outbox.find(o=>o.nativeShare?.projection.itemId==='uncertain')!;
+    assert.throws(()=>f.runtime.recover('outbox',old.id),/SCOPE_UNVERIFIED/);
+    assert.equal(f.posts.filter(p=>p.text.includes('Slack transport uncertain')).length,1);
   }finally{await f.close();}
 });
 
-test('pending verification cannot cross Slack identity change or survive native rollback',async()=>{
-  const f=await fixture();try{
-    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
-    const first=await f.preview(id);
-    let release!:(v:boolean)=>void,held=false;
-    f.pause(()=>new Promise(r=>{release=r;held=true;}));
-    const old=f.runtime.nativeShare('default','grant',id,first.confirmationId,first.confirmationPhrase);
-    await waitFor(()=>held);
-    await f.runtime.enableSlack('USELF','NEWIDENTITY');
-    release(true);f.pause();await old;
-    assert.notEqual(f.inspection(id).status,'active');
-    b.publish('new-identity-current',[reply('recipient-changed','A previous authorization cannot follow recipient changes.')]);
-    await waitFor(()=>f.inspection(id).status==='retired');
-    never(f,'cannot follow recipient');
-    held=false;const fresh=await f.preview(id);
-    f.pause(()=>new Promise(r=>{release=r;held=true;}));
-    const rolling=f.runtime.nativeShare('default','grant',id,fresh.confirmationId,fresh.confirmationPhrase);
-    await waitFor(()=>held);
-    b.notice('thread/rolledBack',{});
-    release(true);f.pause();await rolling;
-    assert.equal(f.inspection(id).status,'retired');
-    b.publish('rolled-boundary',[reply('rolled-no-output','Rollback will not reopen the content gate.')]);
-    await sleep(25);never(f,'will not reopen');
-  }finally{await f.close();}
-});
-
-test('owner sees and confirms the native checkpoint rather than the local pending-to-active write',async()=>{
-  const f=await fixture();try{
-    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
-    const old=await f.preview(id);
-    assert.match(old.disclosure,/strictly after the first verified native turn boundary/);
-    assert.match(old.disclosure,/while Connector still says setting up \(pending\)/);
-    assert.match(old.disclosure,/No messages are sent until the boundary is verified and delivery opens/);
-    assert.equal(old.confirmationPhrase,'SHARE AFTER NATIVE CUT '+THREAD+' TO T1/CIN/'+EMPLOYEES_ROOT);
-    await assert.rejects(async()=>f.runtime.nativeShare('default','grant',id,old.confirmationId,'SHARE FUTURE '+THREAD+' TO T1/CIN/'+EMPLOYEES_ROOT),/CONFIRMATION_REQUIRED/);
-    assert.equal(f.inspection(id).status,'unshared');
-    const offer=await f.preview(id);
-    b.ongoing('notified-before-confirmation',[reply('early-event','An early native event cannot escape.','commentary')]);
-    b.history[0]=turn('notified-before-confirmation','completed',[reply('early-event','An early native event cannot escape.')]);
-    b.threads.get(THREAD).status={type:'idle'};
-    b.notice('turn/completed',{turn:{id:'notified-before-confirmation',status:'completed'}});
-    const original=b.rpc.bind(b);
-    let cutWaiting=false,cutRead=false,identityWaiting=false,recheckTaken=false;
-    let allowCut!:()=>void,allowIdentity!:()=>void;
-    b.rpc=async(method,p)=>{
-      if(method==='thread/turns/list'&&p.limit===1&&!cutRead){
-        await new Promise<void>(r=>{allowCut=r;cutWaiting=true;});
-        const result=await original(method,p);
-        cutRead=true;
-        return result;
-      }
-      if(method==='thread/read'&&cutRead&&!recheckTaken){
-        recheckTaken=true;await new Promise<void>(r=>{allowIdentity=r;identityWaiting=true;});
-      }
-      return original(method,p);
-    };
-    const task=f.runtime.nativeShare('default','grant',id,offer.confirmationId,offer.confirmationPhrase);
-    await waitFor(()=>cutWaiting);
-    assert.deepEqual([f.inspection(id).status,f.inspection(id).activation?.boundaryPolicy,f.inspection(id).activation?.nativeBoundary],['pending','first-verified-native-frontier-v1',null]);
-    const finish=(turnId:string,item:string,text:string)=>{
-      b.ongoing(turnId);
-      b.history[0]=turn(turnId,'completed',[reply(item,text)]);
-      b.threads.get(THREAD).status={type:'idle'};
-      b.notice('turn/completed',{turn:{id:turnId,status:'completed'}});
-    };
-    finish('completed-before-first-cut','excluded-prefix','This round finished before the native checkpoint.');
-    allowCut();await waitFor(()=>identityWaiting);
-    finish('completed-after-first-cut','eligible-pending','This round started after the native checkpoint.');
-    b.ongoing('live-after-first-cut',[reply('eligible-active','Should we use the new arrangement?','commentary')],true);
-    assert.equal(f.inspection(id).status,'pending');
-    assert.equal(f.runtime.core('default').store.state.outbox.filter(o=>o.nativeShare).length,0);
-    never(f,'started after the native checkpoint');never(f,'use the new arrangement');
-    allowIdentity();await task;
-    await observe(f,'started after the native checkpoint');
-    await observe(f,'use the new arrangement');
-    assert.equal(f.inspection(id).activation?.nativeBoundary?.excludedThroughTurnId,'completed-before-first-cut');
-    never(f,'finished before the native checkpoint');never(f,'early native event');
-  }finally{await f.close();}
-});
-
-test('a turn already running in the native snapshot cannot be included by a later idle proof',async()=>{
-  const f=await fixture();try{
-    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
-    const p=await f.preview(id);
-    let held=false,release!:()=>void;
-    b.blockedTurns=async()=>{if(!held)await new Promise<void>(r=>{release=r;held=true;});};
-    const work=f.runtime.nativeShare('default','grant',id,p.confirmationId,p.confirmationPhrase);
-    await waitFor(()=>held);
-    // The preceding metadata check returned idle. The authoritative page now
-    // contains an in-progress turn, so it cannot become the accepted cut.
-    b.ongoing('overlaps-native-snapshot',[reply('private-overlap','The in-progress material remains in Codex.','commentary')],true);
-    release();await work;
-    assert.equal(f.inspection(id).status,'pending');
-    assert.equal(f.inspection(id).reason,'NATIVE_SHARE_WAIT_UNTIL_IDLE');
-    assert.equal(f.inspection(id).activation?.nativeBoundary,null);
-    b.history[0]=turn('overlaps-native-snapshot','completed',[reply('overlap-completed','The earlier in-progress material must remain native.')]);
-    b.threads.get(THREAD).status={type:'idle'};
-    b.notice('turn/completed',{turn:{id:'overlaps-native-snapshot',status:'completed'}});
-    await waitFor(()=>f.inspection(id).status==='active');
-    assert.equal(f.inspection(id).activation?.nativeBoundary?.excludedThroughTurnId,'overlaps-native-snapshot');
-    b.publish('beyond-overlap',[reply('ordinary-answer','An eligible response follows the checkpoint.')]);
-    await observe(f,'eligible response follows');
-    never(f,'in-progress material');
-  }finally{await f.close();}
-});
-
-test('an uncompleted authorization under the earlier consent wording is not upgraded on restart',async()=>{
-  const f=await fixture();try{
-    await f.start();const id=await f.subscribe(EMPLOYEES_ROOT),b=f.backends.get('default')!;
-    b.ongoing('previous-policy-pending',[],true);
-    await f.grant(id);
-    assert.equal(f.inspection(id).status,'pending');
-    f.runtime.core('default').store.transaction(d=>{const row=d.nativeShares![0]!;row.consentVersion=2;delete row.boundaryPolicy;});
-    b.history[0]=turn('previous-policy-pending','completed',[reply('previous-policy-body','An earlier pending consent cannot resume under the new scope.')]);
+test('legacy snapshot authorization cannot resume and scoped loopback credentials cannot create sharing sessions',async()=>{
+  const f=await fixture();const api=apiServer(f.runtime,OP);
+  await new Promise<void>(r=>api.listen(0,'127.0.0.1',r));const port=(api.address() as {port:number}).port;
+  const http=(body:any,auth=OP)=>fetch('http://127.0.0.1:'+port+'/v1/command',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+auth},body:JSON.stringify(body)});
+  try{
+    await f.start();const source=await f.subscribe();
+    for(const operation of ['inspect','preview-create','create','revoke']){
+      assert.equal((await http({action:'native.share',operation,serverId:'default',subscriptionId:source},AGENT)).status,403);
+    }
+    const obsolete=await http({action:'native.share',operation:'preview',serverId:'default',subscriptionId:source});
+    assert.deepEqual(await obsolete.json(),{error:'NATIVE_SHARE_EXISTING_SESSION_UNSUPPORTED'});
+    const newSession=await f.create(source);
+    f.runtime.core('default').store.transaction(d=>{
+      const grant=d.nativeShares![0]!;grant.consentVersion=3;grant.boundaryPolicy='first-verified-native-frontier-v1';delete grant.creationId;
+    });
     await f.restart();
-    assert.equal(f.inspection(id).status,'retired');
-    assert.equal(f.inspection(id).reason,'NATIVE_SHARE_EXPLICIT_REAUTHORIZATION_REQUIRED');
-    f.backends.get('default')!.publish('new-runtime-old-consent',[reply('cannot-forward','Continue waiting for new consent.')]);
-    await sleep(25);never(f,'earlier pending consent');never(f,'waiting for new consent');
-    assert.ok(!f.runtime.core('default').store.state.outbox.some(o=>o.nativeShare));
-  }finally{await f.close();}
+    assert.equal(f.inspect(newSession.newSubscriptionId!).status,'retired');
+    assert.equal(f.inspect(newSession.newSubscriptionId!).reason,'NATIVE_SHARE_EXPLICIT_REAUTHORIZATION_REQUIRED');
+    f.backends.get('default')!.publish(FRESH,'old-policy',[reply('old-activation','An older cutoff policy does not grant this body.')]);
+    await sleep(30);never(f,'older cutoff policy');
+  }finally{await new Promise<void>(r=>{api.close(()=>r());api.closeAllConnections();});await f.close();}
 });

@@ -115,13 +115,14 @@ export class Runtime {
   receipt(params:{serverId?:string;workId:string},p:LocalPrincipal){return this.core(params.serverId,p).receipt(params.workId,p);}
   events(params:Page,p:LocalPrincipal,signal?:AbortSignal){return this.core(params.serverId,p).readEvents(params,p,signal);}
   unwatch(params:{serverId?:string;sessionId:string;subscriptionId:string},p:LocalPrincipal){return this.core(params.serverId,p).unwatch(params,p);}
-  nativeShare(serverId:unknown,operation:'inspect'|'preview'|'grant'|'revoke',id:string,challenge?:string,phrase?:string){
+  nativeShare(serverId:unknown,operation:'inspect'|'preview'|'grant'|'preview-create'|'create'|'revoke',id:string,challenge?:string,phrase?:string){
     const core=this.core(serverId);
     if(core.runtime!.id!==serverId||!core.nativeSharing)throw new ConnectorError('SERVER_UNAVAILABLE');
     if(operation==='inspect')return core.nativeSharing.view(id);
-    if(operation==='preview')return core.nativeSharing.preview(id);
+    if(operation==='preview'||operation==='grant')return core.nativeSharing.grantExisting();
+    if(operation==='preview-create')return core.nativeSharing.previewCreate(id);
     if(operation==='revoke')return core.nativeSharing.revoke(id);
-    return core.nativeSharing.grant(id,challenge!,phrase!);
+    return core.nativeSharing.create(id,challenge!,phrase!);
   }
   status(serverId?:string){const selected=serverId===undefined?defaultServer(this.config):resolveServerId(this.config,serverId);if(serverId!==undefined&&!this.cores.has(selected!))throw new ConnectorError('SERVER_UNAVAILABLE');const core=selected?this.cores.get(selected):undefined;return{...(core?.status()??{}),serverId:selected??null,servers:this.servers(),slackConnected:this.slackReady};}
   sessionPage(params:Record<string,unknown>={}){const {serverId,...rest}=params;return this.core(serverId).sessionPage(rest);}

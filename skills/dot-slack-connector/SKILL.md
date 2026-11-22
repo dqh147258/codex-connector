@@ -58,7 +58,7 @@ In Slack-only and dual mode alike, do not call `session.history`, `session.overv
 
 For a request to watch an existing loaded session, prefer **observation**, not send/attach/create:
 
-- `session.subscribe {"threadId":"EXACT_CODEX_THREAD_ID"}` registers fixed status observation for one currently loaded shared thread. Fixed notices need evidence of the original authorized operation. Subscribing alone never grants native text. An independent local operator may explicitly opt in on that exact root to eligible future replies and questions; display the real status returned, never infer or request the grant through Slack.
+- `session.subscribe {"threadId":"EXACT_CODEX_THREAD_ID"}` registers fixed status observation for one currently loaded shared thread. Fixed notices need evidence of the original authorized operation. Subscribing alone never grants native text. Existing native sessions remain status-only. An independent local operator may explicitly create a separate new dedicated session for eligible replies and questions to that exact Slack root. Display the real status returned; never infer or request the grant through Slack or use the source session as the shared session.
 - `session.subscriptions {}` lists this authenticated actor's subscriptions in this channel/thread.
 - `session.unsubscribe {"subscriptionId":"EXACT_SUBSCRIPTION_ID"}` disables that subscription. It does not interrupt, unload or stop the backend session. An already in-flight message can still arrive; inspect the returned flag.
 

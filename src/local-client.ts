@@ -64,9 +64,9 @@ export function localClient(portValue?: string, targetValue?: string) {
       for(const k of ['sessionId','subscriptionId'])if(typeof args[k]!=='string'||!idPattern.test(args[k] as string))throw Error('Invalid '+k);
       return request({action:'unwatch',serverId:validServer(args.serverId),sessionId:args.sessionId,subscriptionId:args.subscriptionId});
     },
-    nativeShare:(operation:'inspect'|'preview'|'grant'|'revoke',serverId:string,subscriptionId:string,approval?:{confirmationId:string;phrase:string})=>{
+    nativeShare:(operation:'inspect'|'preview-create'|'create'|'revoke',serverId:string,subscriptionId:string,approval?:{confirmationId:string;phrase:string})=>{
       if(!serverId||!validServer(serverId)||!idPattern.test(subscriptionId))throw Error('Supply an exact canonical --server and --subscription-id');
-      return request({action:'native.share',operation,serverId,subscriptionId,...approval},45000);
+      return request({action:'native.share',operation,serverId,subscriptionId,...approval},65000);
     },
     recover:(kind:string,id:string,observedTs?:string,serverId?:string)=>request({action:'recover',kind,id,observedTs,serverId:validServer(serverId)})
   };
