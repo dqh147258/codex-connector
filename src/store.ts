@@ -2,6 +2,7 @@ import { closeSync, copyFileSync, constants, existsSync, fstatSync, fsyncSync, f
 import { join } from 'node:path';
 import { validateNativeShareState, retirePreGateSharing } from './native-share.js';
 import { validateMessageDelivery } from './session-delivery.js';
+import { recoverQuestionEvidence,validateQuestionEvidence } from './native-question-evidence.js';
 import { validateActivityRecords } from './session-activity.js';
 import type { State } from './types.js';
 const empty = (): State => ({ version: 2, sessions: [], work: [], outbox: [], pending: [], seenEvents: {}, seenNotifications: {} });
@@ -20,9 +21,11 @@ export class Store {
       if(legacy){const backup=join(dir,'state.before-server-profiles.json');if(!existsSync(backup))copyFileSync(statePath,backup,constants.COPYFILE_EXCL);}
       validateActivityRecords(this.value.activity);
       validateNativeShareState(this.value);
+      validateQuestionEvidence(this.value);
       for (const work of this.value.work) validateMessageDelivery(work);
       this.transaction(s => {
         retirePreGateSharing(s);
+        recoverQuestionEvidence(s);
         if(pin)(s as State & {targetPin?:unknown}).targetPin={id:pin.id,fingerprint:pin.fingerprint};
         if(legacy){
           for(const w of s.work)if(w.status==='queued'){w.status='uncertain';w.error='MIGRATION_REQUIRES_RECONCILIATION';}

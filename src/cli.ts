@@ -25,7 +25,7 @@ const allowedOptions:Record<string,string[]>={
   'service-template':['platform','mode','user','node','script','cwd'],
   servers:[],unwatch:['server','session-id','subscription-id'],status:['server'],receipt:['server','work-id'],events:['server','session-id','cursor','wait-ms','limit'],
   command:['name','params','params-file','id','server'],envelope:['name','params','params-file','id','server'],mcp:[],
-  'native-share':['operation','server','subscription-id'],
+  'native-share':['operation','server','subscription-id','answer-users'],
   recover:['kind','id','observed-ts','server']
 };
 
@@ -43,7 +43,7 @@ async function start(){
   let server:ReturnType<typeof apiServer>|undefined;
   const link=slack?new SlackLink(config.slack.teamId,runtime,()=>slack.web.auth.test(),()=>new SocketModeClient({
     appToken:appToken!,logLevel:LogLevel.ERROR,autoReconnectEnabled:false,clientOptions:{retryConfig:{retries:0},rejectRateLimitedCalls:true,timeout:10000}
-  })):undefined;
+  }),local?{client:slack,gateway:runtime}:undefined):undefined;
   let stopping=false,stopTask:Promise<void>|undefined,timer:NodeJS.Timeout|undefined;
   let tick:Promise<void>|undefined,connecting:Promise<void>|undefined,slackTask:Promise<void>|undefined;
   const stop=()=>stopTask??=(async()=>{
@@ -95,7 +95,7 @@ command --name NAME [--params JSON | --params-file FILE|-] [--server ID] [--id R
 receipt --work-id ID [--server ID]
 events --session-id ID [--server ID] [--cursor CURSOR] [--wait-ms 0..30000] [--limit 1..100]
 unwatch --session-id ID --subscription-id ID [--server ID]
-native-share --operation inspect|create|revoke --server CANONICAL_ID --subscription-id ID (local operator; create requires consent to a new, dedicated session)
+native-share --operation inspect|create|revoke --server CANONICAL_ID --subscription-id ID [--answer-users U_ID,U_ID only with create] (local operator; create requires consent to a new, dedicated session)
 mcp (stdio; use a scoped CONNECTOR_TOKEN for agents)
 Local clients may use --port PORT --target INSTANCE with CONNECTOR_TOKEN instead of accessing operator files.
 envelope --name NAME --params JSON [--server ID] [--id ID]
@@ -134,9 +134,11 @@ ${formatHelp(f.command)}`);return;}
     if(f.operation==='grant')throw Error('Existing Codex sessions remain status-only in Slack. Use native-share --operation create to explicitly create a new dedicated sharing session.');
     if(Object.hasOwn(process.env,'CONNECTOR_TOKEN')||!['inspect','create','revoke'].includes(f.operation??'')||!f.server||!f['subscription-id'])throw Error('Use the local operator terminal: native-share --operation inspect|create|revoke --server CANONICAL_ID --subscription-id ID (no CONNECTOR_TOKEN)');
     const owner=localClient(),subscriptionId=f['subscription-id'];
+    if(f['answer-users']!==undefined&&f.operation!=='create')throw Error('--answer-users is only allowed when creating a new shared session');
+    const answerUsers=f['answer-users']?.split(',').map(id=>id.trim());
     if(f.operation==='create'){
       if(!process.stdin.isTTY||!process.stdout.isTTY)throw Error('Native sharing requires an interactive local operator terminal; no automatic consent');
-      const offer=await owner.nativeShare('preview-create',f.server,subscriptionId) as {confirmationId:string;confirmationPhrase:string;disclosure:string;serverId:string;nativeThreadId:string;workspaceId:string;channel:string;rootThreadTs:string;project:string};
+      const offer=await owner.nativeShare('preview-create',f.server,subscriptionId,answerUsers?{answerUsers}:undefined) as {confirmationId:string;confirmationPhrase:string;disclosure:string;serverId:string;nativeThreadId:string;workspaceId:string;channel:string;rootThreadTs:string;project:string};
       console.log(`Verified server: ${offer.serverId}; project: ${offer.project}
 Existing route reference (not shared): ${offer.nativeThreadId}
 Slack destination: ${offer.workspaceId} / ${offer.channel} / ${offer.rootThreadTs}

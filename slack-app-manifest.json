@@ -29,6 +29,9 @@
       ]
     },
     "socket_mode_enabled": true,
-    "org_deploy_enabled": false
+    "org_deploy_enabled": false,
+    "interactivity": {
+      "is_enabled": true
+    }
   }
 }

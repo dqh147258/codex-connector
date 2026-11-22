@@ -1,4 +1,5 @@
 import { ScreenError, validateScreenImages, type ScreenImage } from './screens.js';
+import { questionBlocks,validAction,SlackQuestionTransport,type SlackQuestionAction,type SlackQuestionGateway } from './slack-questions.js';
 import { WebClient, LogLevel } from '@slack/web-api';
 import type { SlackPort } from './types.js';
 export const escapeSlack=(text:string)=>text.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
@@ -12,10 +13,27 @@ export function isSlackRootPermissionDenial(e:unknown){
 export class SlackClient implements SlackPort {
   readonly web:WebClient;
   constructor(token:string){this.web=new WebClient(token,{logLevel:LogLevel.ERROR,retryConfig:{retries:0},rejectRateLimitedCalls:true,timeout:10000});}
-  async post(channel:string,text:string,opts:{threadTs?:string;mentionUserId?:string;deliveryId:string}){
+  private questionTransport?:{active:()=>boolean;appId:string};
+  questionActionsAvailable(){return this.questionTransport?.active()===true;}
+  questionAppId(){return this.questionTransport?.active()?this.questionTransport.appId:undefined;}
+  async interactive(teamId:string,botUserId:string,botId:string,gateway:SlackQuestionGateway,active:()=>boolean){
+    // auth.test authenticates the bot and workspace, but does not identify the
+    // Slack app. Resolve *our* authenticated bot via the Web API, not an event.
+    const {ok,bot}=await this.web.bots.info({bot:botId});
+    if(!ok||!bot||bot.deleted!==false||bot.id!==botId||bot.user_id!==botUserId||!/^A[A-Z0-9]{1,63}$/.test(bot.app_id??''))
+      throw Error('SLACK_QUESTION_APP_UNVERIFIED');
+    if(!active())return;
+    this.questionTransport={active,appId:bot.app_id!};
+    return new SlackQuestionTransport(this.web,{teamId,botId,botUserId,appId:bot.app_id!},gateway,active);
+  }
+  async post(channel:string,text:string,opts:{threadTs?:string;mentionUserId?:string;deliveryId:string;questionAction?:SlackQuestionAction}){
     if(!opts.threadTs||!/^\d{1,20}\.\d{1,10}$/.test(opts.threadTs))throw Error('THREAD_DESTINATION_REQUIRED');
-    const r=await this.web.chat.postMessage({channel,text:`${opts.mentionUserId?`<@${opts.mentionUserId}> `:''}${escapeSlack(text)}`,thread_ts:opts.threadTs,reply_broadcast:false,mrkdwn:true,parse:'none',link_names:false,unfurl_links:false,unfurl_media:false});
-    if(!r.ts)throw Error('SLACK_OUTCOME_UNCERTAIN');return r.ts;
+    const action=opts.questionAction,usable=action&&validAction(action)&&this.questionActionsAvailable()&&text.length<=2900;
+    const body=action&&!usable?text+'\n请在原生 Codex 中回答。':text;
+    const r=await this.web.chat.postMessage({channel,...(usable?{blocks:questionBlocks(text,action)}:{}),text:`${opts.mentionUserId?`<@${opts.mentionUserId}> `:''}${escapeSlack(body)}`,thread_ts:opts.threadTs,reply_broadcast:false,mrkdwn:true,parse:'none',link_names:false,unfurl_links:false,unfurl_media:false});
+    if(!r.ts||usable&&(r.ok!==true||r.channel!==channel||!/^\d{1,20}\.\d{1,10}$/.test(r.ts)||r.ts===opts.threadTs))
+      throw Error('SLACK_OUTCOME_UNCERTAIN');
+    return r.ts;
   }
   async uploadScreens(channel:string,threadTs:string,images:ScreenImage[],requestId:string){
     if(!/^[CG][A-Z0-9]+$/.test(channel)||!/^\d{1,20}\.\d{1,10}$/.test(threadTs))throw new ScreenError('SCREEN_SLACK_THREAD_REQUIRED');

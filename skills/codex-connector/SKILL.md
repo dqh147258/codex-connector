@@ -5,7 +5,7 @@ description: Operate an already configured local Codex Connector through scoped 
 
 # Local Codex Connector
 
-Use the configured local agent identity; do not read the operator token, inspect session files, search for sockets or start a replacement daemon. No Slack workspace or output thread is required. For a request explicitly involving Slack, use the separate Slack workflow; a local permission does not imply permission to publish. Never use an operator credential or attempt consent on behalf of the owner: only the local operator can independently approve creating a new dedicated session for eligible replies and ordinary questions to one exact Slack root. Existing native sessions remain status-only on Slack. Even for a new sharing session, answer or approve only in the original Codex window.
+Use the configured local agent identity; do not read the operator token, inspect session files, search for sockets or start a replacement daemon. No Slack workspace or output thread is required. For a request explicitly involving Slack, use the separate Slack workflow; a local permission does not imply permission to publish. Never use an operator credential or attempt consent on behalf of the owner: only the local operator can independently approve creating a new dedicated session for eligible replies and ordinary questions to one exact Slack root. Existing native sessions remain status-only on Slack. Do not answer or approve through Agent tools. In an explicitly opted-in new session, an authorized human may submit a regular fixed-choice question from its Slack card; free text, other input and all approvals remain in the original Codex window.
 
 ## Pick the server and session
 

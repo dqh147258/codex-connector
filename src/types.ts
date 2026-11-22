@@ -2,6 +2,7 @@ import type { MessageDelivery } from './session-delivery.js';
 import type { ActivityRecord } from './session-activity.js';
 import type { NativeDelivery, NativeShare, NativeShareCreation } from './native-share.js';
 import type { Subscription } from './subscriptions.js';
+import type { QuestionState } from './native-question-evidence.js';
 import type { CommandEnvelope } from './protocol.js';
 export interface Config {
   version: 2; instanceId: string; port: number;
@@ -31,17 +32,19 @@ export interface Pending {
   method: string; kind: 'command'|'file'|'input'|'unsupported'; status: 'pending'|'responding'|'resolved'|'stale'|'expired'|'local-required';
   details: Record<string, any>; expiresAt: number; decisions: string[];
 }
-export interface State { version: 2; nativeShares?:NativeShare[]; nativeShareCreations?:NativeShareCreation[]; slackVisibility?:{policy:string;generation:string}; activity?:ActivityRecord[]; subscriptions?:Subscription[]; subscriptionEvents?:Record<string,string[]>; results?:ResultSnapshot[]; sessions: Session[]; work: Work[]; outbox: Delivery[]; pending: Pending[]; seenEvents: Record<string, string>; seenNotifications: Record<string, true>; dot?: { userId: string; name: string; selector?: string } }
+export interface State extends QuestionState { version: 2; nativeShares?:NativeShare[]; nativeShareCreations?:NativeShareCreation[]; slackVisibility?:{policy:string;generation:string}; activity?:ActivityRecord[]; subscriptions?:Subscription[]; subscriptionEvents?:Record<string,string[]>; results?:ResultSnapshot[]; sessions: Session[]; work: Work[]; outbox: Delivery[]; pending: Pending[]; seenEvents: Record<string, string>; seenNotifications: Record<string, true>; dot?: { userId: string; name: string; selector?: string } }
 export interface Backend {
   epoch: string; connected: boolean;
   readonly observation?: { checkedAt:string|null; version:string|null; homeVerified?:boolean };
-  connect(): Promise<void>; close(): Promise<void>; rpc(method: string, params: unknown): Promise<any>; respond(id: string|number, result: unknown): Promise<void>;
+  connect(): Promise<void>; close(): Promise<void>; rpc(method: string, params: unknown): Promise<any>; respond(id: string|number, result: unknown, expectedEpoch?:string): Promise<void>;
   capabilities(): Record<string, unknown>;
   on(event: 'notification'|'request'|'disconnect', listener: (...args: any[]) => void): this;
 }
 export interface SlackPort {
   uploadScreens?(channel: string, threadTs: string, images: import('./screens.js').ScreenImage[], requestId: string): Promise<void>;
-  post(channel: string, text: string, options: { threadTs?: string; mentionUserId?: string; deliveryId: string }): Promise<string>;
+  questionActionsAvailable?():boolean;
+  questionAppId?():string|undefined;
+  post(channel: string, text: string, options: { threadTs?: string; mentionUserId?: string; deliveryId: string; questionAction?:import('./slack-questions.js').SlackQuestionAction }): Promise<string>;
   resolveDot(name: string, userId?: string): Promise<{userId: string; name: string}>;
   verifySharedRoot?(channel: string, threadTs: string): Promise<boolean>;
   threadExists(channel: string, threadTs: string): Promise<boolean>;

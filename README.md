@@ -14,7 +14,7 @@
 - 输入频道与输出频道可分离；dot 可按名称唯一解析，保存稳定 user ID。更改名称选择会重新解析，不会继续偷偷 mention 旧对象。
 - 共享会话发现、绑定、创建、发送、显式 steer/queue/interrupt；按能力报告无法管理的例外。授权本机客户端可另查可见历史；Slack 命令不能调阅原生正文。
 - 只读文件 `list/stat/read/search`：兼容项目别名；可在本地明确启用绝对路径读取，无需项目别名。保留 OS 权限、敏感路径/内容和输出量限制，默认关闭全系统只读。
-- 原生审批和回答必须在原 Codex 界面完成。Slack 不显示审批详情或操作按钮；普通结构化提问只有在已授权的全新专用会话中才可转发。
+- 原生审批必须在原 Codex 界面完成。新专用会话可另行允许指定 Slack 真人提交可验证选择题的选项；普通聊天、自由输入及其它问题仍在原生界面处理。
 - 持久命令 inbox 与独立 outbox；发送失败不会重跑 Codex；同一会话输出保序。
 - Linux / macOS / Windows 的登录/登录前启动**模板生成**，不自动安装、不提权、不保存系统登录密码。
 
@@ -181,7 +181,7 @@ npm test
 
 ## 简洁 Slack 输出与关键消息订阅
 
-Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:active` 从当前 loaded 元数据筛选，历史单独用 `view:history`。使用 `result.next` 获取下一页，`result.page` 显式读取短期、同身份同线程的详情，避免自动 JSON 刷屏。`session.subscribe` / `session.unsubscribe` 默认管理固定状态提醒，取消不会停止 Codex。双入口下，本机操作者只能另行确认新建专用 Codex 会话，再把这个新会话的合规回复和普通问题发往这一确切 Slack 线程；不会分享现有会话或旧历史，也不会代答。完整边界见 [输出与订阅](docs/SLACK-OUTPUT.md)。
+Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:active` 从当前 loaded 元数据筛选，历史单独用 `view:history`。使用 `result.next` 获取下一页，`result.page` 显式读取短期、同身份同线程的详情，避免自动 JSON 刷屏。`session.subscribe` / `session.unsubscribe` 默认管理固定状态提醒，取消不会停止 Codex。双入口下，本机操作者只能另行确认新建专用 Codex 会话，再把这个新会话的合规回复和普通问题发往这一确切 Slack 线程；不会分享现有会话或旧历史，不会代答。指定真人选择题答复必须另行开启，默认关闭。完整边界见 [输出与订阅](docs/SLACK-OUTPUT.md)。
 
 提供两份可手动安装/阅读的 Skill：[Codex 本地](skills/codex-connector/SKILL.md) 与 [dot Slack 操作](skills/dot-slack-connector/SKILL.md)。没有自动安装到用户电脑或修改 dot 内部指令。
 

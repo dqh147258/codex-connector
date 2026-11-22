@@ -1,3 +1,5 @@
+import type { SlackClient } from './slack.js';
+import type { SlackQuestionGateway, SlackQuestionTransport } from './slack-questions.js';
 import type { Runtime } from './runtime.js';
 
 interface SlackSocket {
@@ -17,7 +19,8 @@ export class SlackLink {
   private stopped = false;
   private nextTry = 0;
   constructor(private team: string, private runtime: Pick<Runtime,'accept'|'enableSlack'|'disableSlack'>,
-    private authenticate: () => Promise<Auth>, private makeSocket: () => SlackSocket) {}
+    private authenticate: () => Promise<Auth>, private makeSocket: () => SlackSocket,
+    private questions?:{client:SlackClient;gateway:SlackQuestionGateway}) {}
   connect(): Promise<void> {
     if (this.stopped || this.permanent || this.ready || Date.now() < this.nextTry) return Promise.resolve();
     return this.attempt ??= this.open().finally(()=>{this.attempt=undefined;});
@@ -36,6 +39,13 @@ export class SlackLink {
         this.runtime.disableSlack();
       };
       socket.on('disconnected', lost);
+      let questions:SlackQuestionTransport|undefined;
+      const live=()=>!this.stopped&&this.ready&&this.current===socket;
+      socket.on('interactive',async({body,ack}:any)=>{
+        // No content-bearing logs or use of response_url. Don't send through
+        // a retired connection, even if an async identity check was in flight.
+        try {if(questions&&live())await questions.accept(body,ack);else await ack();}catch{/* fixed fail-closed; native UI remains available */}
+      });
       socket.on('message', async ({body,ack}:any) => {
         if (this.stopped || !this.ready || this.current !== socket) return;
         try { this.runtime.accept(body); await ack(); }
@@ -55,6 +65,12 @@ export class SlackLink {
       await this.runtime.enableSlack(auth.user_id,auth.bot_id);
       if (this.stopped || this.current !== socket) { this.runtime.disableSlack(); return; }
       this.ready = true;
+      // Socket transport for ordinary Slack use stays available if the app
+      // identity or scope for questions cannot be independently confirmed.
+      if(this.questions){
+        try {questions=await this.questions.client.interactive(this.team,auth.user_id,auth.bot_id,this.questions.gateway,live);}
+        catch {/* no answer capability on this socket; use the native app */}
+      }
     } catch (cause) {
       this.runtime.disableSlack(); this.ready=false;
       const e=cause as {code?:string;data?:{error?:string}} | undefined;

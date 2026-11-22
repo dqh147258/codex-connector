@@ -99,7 +99,10 @@ export class Connector {
       joined:id=>this.subscriptions.deliveryAllowed(id),
       threadExists:(channel,ts)=>this.slack.verifySharedRoot?this.slack.verifySharedRoot(channel,ts):this.slack.threadExists(channel,ts),
       queue:(d,sub,projected,text)=>this.outputNative(d,sub,projected,text),
-      flush:()=>this.flush()
+      flush:()=>this.flush(),
+      questionUIAvailable:()=>slack.questionActionsAvailable?.()===true&&Boolean(slack.questionAppId?.()),
+      answerAllowed:user=>config.slack.allowedHumans.includes(user)&&user!==this.selfUserId&&user!==this.store.state.dot?.userId&&!config.slack.trustedBots.some(b=>b.userId===user)
+
     });
     backend.on('notification',(method,params,epoch)=>{try{this.nativeSharing?.observe(method,params,epoch);}catch{/* Healthy storage is required for delivery. */}this.event(()=>this.notification(method,params,epoch));});
     backend.on('request',request=>{try{this.nativeSharing?.request(request);}catch{/* No native reply or data logging. */}this.event(()=>this.serverRequest(request));});
@@ -127,7 +130,7 @@ export class Connector {
     }catch{/* Server remains usable for help/files/status. No independent fallback. */}
     this.nativeSharing?.tick();this.pump();this.flush();
   }
-  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],screenCapture:{enabled:this.config.screenPolicy?.enabled===true,desktopAvailable:!!this.screens,commands:['screen.list','screen.capture'],oneShot:true,unredacted:true,slackThreadOnly:true,maxDisplays:8,maxImageDimension:2560},fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:this.runtime?'Original Codex UI only. Expiry only changes the reminder; no decision or interruption.':'direct configured humans or verified same-thread human envelope; bots alone cannot approve',sessionDelivery:{command:'session.delivery',correlation:'queue start turn ID or userMessage.clientId',automaticRetry:false,completion:'matched terminal turn only'},sessionRecent:{command:'session.recent',defaultLimit:5,maxLimit:20,globalTopN:false,observation:'Producer lifecycle timestamps only; no content or automatic subscriptions'},sessionSearch:{command:'session.search',defaultSessionLimit:10,maxSessionLimit:20,roles:['all','user','assistant'],modes:['and','or'],recentBy:'backend updated_at, not execution activity',matching:'case-insensitive literal terms within one message',readOnly:true,continuation:'result.next'},sessionContent:{overview:'session.overview',messages:'session.messages',slackNativeText:this.runtime===undefined,batchMax:5,readOnly:true,semanticSummary:false},subscriptions:{commands:['session.subscribe','session.unsubscribe','session.subscriptions'],loadedOnly:true,localCancellationOnly:true,slackFutureContent:'Only a fresh dedicated session created after local operator consent. Existing sessions offer status only; answer in original Codex.'},slackOutput:{mode:'compact',sessionDefaultView:'loaded',maxRowsPerSource:10,resultDetail:'result.page',nextPage:'result.next'},serviceManagement:'local template generation only'};}
+  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],screenCapture:{enabled:this.config.screenPolicy?.enabled===true,desktopAvailable:!!this.screens,commands:['screen.list','screen.capture'],oneShot:true,unredacted:true,slackThreadOnly:true,maxDisplays:8,maxImageDimension:2560},fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:this.runtime?'Original Codex UI only. Expiry only changes the reminder; no decision or interruption.':'direct configured humans or verified same-thread human envelope; bots alone cannot approve',sessionDelivery:{command:'session.delivery',correlation:'queue start turn ID or userMessage.clientId',automaticRetry:false,completion:'matched terminal turn only'},sessionRecent:{command:'session.recent',defaultLimit:5,maxLimit:20,globalTopN:false,observation:'Producer lifecycle timestamps only; no content or automatic subscriptions'},sessionSearch:{command:'session.search',defaultSessionLimit:10,maxSessionLimit:20,roles:['all','user','assistant'],modes:['and','or'],recentBy:'backend updated_at, not execution activity',matching:'case-insensitive literal terms within one message',readOnly:true,continuation:'result.next'},sessionContent:{overview:'session.overview',messages:'session.messages',slackNativeText:this.runtime===undefined,batchMax:5,readOnly:true,semanticSummary:false},subscriptions:{commands:['session.subscribe','session.unsubscribe','session.subscriptions'],loadedOnly:true,localCancellationOnly:true,slackFutureContent:'Only a fresh dedicated session created after local operator consent. Existing sessions are status-only. A separate exact-human grant may enable currently open choice cards; otherwise answer in original Codex.'},slackOutput:{mode:'compact',sessionDefaultView:'loaded',maxRowsPerSource:10,resultDetail:'result.page',nextPage:'result.next'},serviceManagement:'local template generation only'};}
   private authorizeEvent(body:any):Source|undefined{
     const e=body?.event,s=this.config.slack;
     if(body?.team_id!==s.teamId||typeof body.event_id!=='string'||!e||e.type!=='message'||!['',undefined,'bot_message'].includes(e.subtype)||typeof e.text!=='string'||typeof e.user!=='string'||typeof e.ts!=='string'||!this.validTimestamp(e.ts)||(e.thread_ts!==undefined&&!this.validTimestamp(e.thread_ts)))return;
@@ -1062,10 +1065,19 @@ export class Connector {
       const destination=this.deliveryTarget(current,state),dot=state.dot;
       if(!destination||!dot){this.refuseDelivery(next.id);continue;}
       // No await between these final current checks and invoking the adapter.
-      this.store.transaction(s=>{const o=s.outbox.find(o=>o.id===next.id)!;o.status='sending';o.attempts++;});
+      const questionAction=this.store.transaction(s=>{
+        const o=s.outbox.find(o=>o.id===next.id)!;
+        const action=o.nativeShare?this.nativeSharing?.stageAnswerCard(o,s):undefined;
+        o.status='sending';o.attempts++;
+        return action;
+      });
       try{
-        const ts=await this.slack.post(current.channel,destination.text,{threadTs:destination.threadTs,mentionUserId:current.mention===false?undefined:dot.userId,deliveryId:current.id});this.lastPost=Date.now();
-        this.store.transaction(s=>{const o=s.outbox.find(o=>o.id===next.id)!;o.status='sent';o.ts=ts;o.deliveryEvidence='slack-api-ack';});
+        const body=questionAction?destination.text.replace('Answer in the original Codex window.','Authorized readers can choose an answer below or answer in the original Codex window.'):destination.text;
+        const ts=await this.slack.post(current.channel,body,{threadTs:destination.threadTs,mentionUserId:current.mention===false?undefined:dot.userId,deliveryId:current.id,...(questionAction?{questionAction}:{})});this.lastPost=Date.now();
+        this.store.transaction(s=>{
+          const o=s.outbox.find(o=>o.id===next.id)!;o.status='sent';o.ts=ts;o.deliveryEvidence='slack-api-ack';
+          if(o.nativeShare)this.nativeSharing?.acknowledgeQuestionPost(o,s,ts);
+        });
       }catch(e:any){
         if(current.nativeShare&&isSlackRootPermissionDenial(e)){
           this.store.transaction(s=>{const o=s.outbox.find(o=>o.id===next.id)!;o.status='failed';o.error='NATIVE_SHARE_DESTINATION_UNVERIFIED';});

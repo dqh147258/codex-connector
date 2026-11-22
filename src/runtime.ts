@@ -1,3 +1,4 @@
+import type { SlackQuestionOrigin } from './slack-questions.js';
 import { mkdirSync, closeSync, openSync, unlinkSync, writeFileSync, realpathSync, lstatSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { isBackendResourceExhaustion, SharedAppServer } from './codex.js';
@@ -46,7 +47,7 @@ export class Runtime {
   private activeStarts=0;private stoppingConnections=false;
   private readonly dir:string;
   private readonly slackIds:string[];
-  constructor(readonly config:Config,dir:string,slack:SlackPort,screens?:ScreenPort,
+  constructor(readonly config:Config,dir:string,private slack:SlackPort,screens?:ScreenPort,
     makeBackend?:MakeBackend){
     const profiles=configuredServers(config),preferred=defaultServer(config),targets=validateIdentities(profiles);
     const selected=resolve(dir);
@@ -115,15 +116,26 @@ export class Runtime {
   receipt(params:{serverId?:string;workId:string},p:LocalPrincipal){return this.core(params.serverId,p).receipt(params.workId,p);}
   events(params:Page,p:LocalPrincipal,signal?:AbortSignal){return this.core(params.serverId,p).readEvents(params,p,signal);}
   unwatch(params:{serverId?:string;sessionId:string;subscriptionId:string},p:LocalPrincipal){return this.core(params.serverId,p).unwatch(params,p);}
-  nativeShare(serverId:unknown,operation:'inspect'|'preview'|'grant'|'preview-create'|'create'|'revoke',id:string,challenge?:string,phrase?:string){
+  nativeShare(serverId:unknown,operation:'inspect'|'preview'|'grant'|'preview-create'|'create'|'revoke',id:string,challenge?:string,phrase?:string,answerUsers?:string[]){
     const core=this.core(serverId);
     if(core.runtime!.id!==serverId||!core.nativeSharing)throw new ConnectorError('SERVER_UNAVAILABLE');
     if(operation==='inspect')return core.nativeSharing.view(id);
     if(operation==='preview'||operation==='grant')return core.nativeSharing.grantExisting();
-    if(operation==='preview-create')return core.nativeSharing.previewCreate(id);
+    if(operation==='preview-create')return core.nativeSharing.previewCreate(id,answerUsers);
     if(operation==='revoke')return core.nativeSharing.revoke(id);
     return core.nativeSharing.create(id,challenge!,phrase!);
   }
+  private questionOwner(o:SlackQuestionOrigin){
+    if(!this.slackReady||this.closed||!o||o.teamId!==this.config.slack.teamId||
+      !o.appId||o.appId!==this.slack.questionAppId?.()||this.slack.questionActionsAvailable?.()!==true)return;
+    const matches=this.slackIds.flatMap(id=>{
+      const core=!this.blocked.has(id)&&this.cores.get(id);
+      return core&&core.nativeSharing?.hasQuestionReference(o.reference)?[core.nativeSharing]:[];
+    });
+    return matches.length===1?matches[0]:undefined;
+  }
+  async openQuestion(origin:SlackQuestionOrigin){return this.questionOwner(origin)?.openQuestion(origin);}
+  async submitQuestion(origin:SlackQuestionOrigin,choices:readonly number[]){return this.questionOwner(origin)?.submitQuestion(origin,choices)??'denied' as const;}
   status(serverId?:string){const selected=serverId===undefined?defaultServer(this.config):resolveServerId(this.config,serverId);if(serverId!==undefined&&!this.cores.has(selected!))throw new ConnectorError('SERVER_UNAVAILABLE');const core=selected?this.cores.get(selected):undefined;return{...(core?.status()??{}),serverId:selected??null,servers:this.servers(),slackConnected:this.slackReady};}
   sessionPage(params:Record<string,unknown>={}){const {serverId,...rest}=params;return this.core(serverId).sessionPage(rest);}
   recover(kind:'command'|'outbox',id:string,ts?:string,serverId?:string){this.core(serverId).recover(kind,id,ts);}

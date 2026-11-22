@@ -176,7 +176,7 @@ export class SharedAppServer extends EventEmitter implements Backend {
     if(!METHODS.has(method))throw new BackendError('RPC_FORBIDDEN');if(this.unsupported.has(method))throw new BackendError('METHOD_UNSUPPORTED');if(!this.connected)throw new BackendError('BACKEND_UNAVAILABLE');
     try{return await this.request(method,params);}catch(e){if(e instanceof BackendError&&e.code==='METHOD_UNSUPPORTED')this.unsupported.add(method);throw e;}
   }
-  async respond(id:string|number,result:unknown) { if(!this.connected)throw new BackendError('BACKEND_UNAVAILABLE');await this.write({id,result}); }
+  async respond(id:string|number,result:unknown,expectedEpoch?:string) { if(!this.connected||expectedEpoch!==undefined&&expectedEpoch!==this.epoch)throw new BackendError('BACKEND_UNAVAILABLE');await this.write({id,result}); }
   async close() {
     this.stopped=true;if(this.connecting)await this.connecting.catch(()=>{});const child=this.child;this.disconnect('STOPPED');if(!child)return;
     // End only this proxy connection. Never daemon stop, process-name kills, or shared-turn interruption.
