@@ -26,7 +26,7 @@ test('prepared credentials validate and encrypt before interruption, only commit
 test('desktop round-trips CLI local-only registry and authorization without exposing hashes in renderer drafts',()=>{
   const f=fixture(),drafts=new DesktopConfigDrafts(),hash='a'.repeat(64),codexHome=join(f.dir,'mock-home');
   try{
-    const raw={...f.config,backend:undefined,slack:undefined,backends:{A:{executable:process.execPath,codexHome,aliases:['first']},B:{executable:process.execPath,socketPath:join(f.dir,'b.sock')}},defaultServerId:'A',
+    const raw={...f.config,backend:undefined,slack:undefined,backends:{A:{executable:process.execPath,codexHome,aliases:['first']},B:{executable:process.execPath,codexHome:join(f.dir,'mock-home-b'),socketPath:join(f.dir,'b.sock')}},defaultServerId:'A',
       local:{enabled:true,agents:[{id:'robot',tokenHash:hash,servers:['A'],projects:['repo'],commands:['session.list','server.list']}]}};
     f.settings.saveConfig(raw);f.settings.initRuntimeFiles();assert.equal(existsSync(join(f.dir,'api.token')),true);
     const current=f.settings.readConfig(),view=drafts.snapshot(current);

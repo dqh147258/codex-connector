@@ -20,7 +20,7 @@ test('legacy and extra profiles keep the official inherited default; aliased sel
   const f=setup();try{
     const legacy=parseConfig(f.raw);assert.equal(defaultServer(legacy),'default');assert.equal(legacy.backend.socketPath,undefined);assert.equal(legacy.backend.codexHome,undefined);assert.equal(legacy.backend.autoStartDaemon,undefined);
     assert.deepEqual(legacy.slack,{enabled:false,teamId:'',inputChannel:'',outputChannel:'',allowedHumans:[],approvalUsers:[],trustedBots:[],dot:{name:''},servers:[]});
-    const profiles={west:{...f.p,socketPath:join(f.dir,'west.sock'),aliases:['w']}};
+    const profiles={west:{...f.p,codexHome:join(f.dir,'home-west'),socketPath:join(f.dir,'west.sock'),aliases:['w']}};
     const c=parseConfig({...f.raw,backends:profiles});
     for(const config of [c,parseConfig(JSON.parse(JSON.stringify(c))),parseConfig(c)]){
       assert.deepEqual([...configuredServers(config).keys()].sort(),['default','west']);
@@ -30,7 +30,7 @@ test('legacy and extra profiles keep the official inherited default; aliased sel
     assert.equal(resolveServerId(parseConfig({...f.raw,backends:profiles,defaultServerId:'west'})),'west');
     const {backend,...raw}=f.raw;
     assert.equal(resolveServerId(parseConfig({...raw,backends:profiles})),'west');
-    const ambiguous=parseConfig({...raw,backends:{...profiles,east:{...f.p,socketPath:join(f.dir,'east.sock')}}});
+    const ambiguous=parseConfig({...raw,backends:{...profiles,east:{...f.p,codexHome:join(f.dir,'home-east'),socketPath:join(f.dir,'east.sock')}}});
     assert.equal(defaultServer(ambiguous),undefined);assert.throws(()=>resolveServerId(ambiguous),/SERVER_SELECTION_REQUIRED/);
     assert.throws(()=>parseConfig({...f.raw,backends:profiles,defaultServerId:'w'}));
     assert.throws(()=>parseConfig({...f.raw,slack:{enabled:false},local:{enabled:false}}));
@@ -44,11 +44,16 @@ test('duplicate sockets, home aliases and conflicting identity grants are reject
     assert.equal(targetFingerprint({...f.p,codexHome:home,aliases:['new-name']}),fingerprint);
     process.env.CODEX_HOME=other;assert.notEqual(targetFingerprint(f.p),fingerprint);
     const sock=join(home,'missing.sock');
+    assert.throws(()=>parseConfig({...f.raw,backends:{a:{...f.p,socketPath:sock}}}),/require codexHome/);
+    assert.equal(defaultServer(parseConfig({...f.raw,backend:{...f.p,socketPath:sock}})),'default');
+    assert.throws(()=>parseConfig({...f.raw,backends:{a:{...f.p,codexHome:other,socketPath:sock}}}),/Duplicate backend target/);
+    assert.throws(()=>parseConfig({...f.raw,backends:{a:{...f.p,codexHome:home,socketPath:sock},b:{...f.p,codexHome:join(f.dir,'different-home'),socketPath:join(alias,'missing.sock')}}}),/Duplicate backend target/);
+
     for(const backends of [
       {a:{...f.p,codexHome:other}},
       {a:{...f.p,codexHome:home},b:{...f.p,codexHome:alias,socketPath:sock}},
-      {a:{...f.p,socketPath:sock},b:{...f.p,socketPath:join(alias,'missing.sock')}},
-      {a:{...f.p,socketPath:sock,aliases:['default']}},
+      {a:{...f.p,socketPath:sock},b:{...f.p,codexHome:home,socketPath:join(alias,'missing.sock')}},
+      {a:{...f.p,codexHome:home,socketPath:sock,aliases:['default']}},
       {default:{...f.p,socketPath:sock}},
       {constructor:{...f.p,socketPath:sock}},
       {a:{...f.p,codexHome:'relative'}},
@@ -63,7 +68,7 @@ test('duplicate sockets, home aliases and conflicting identity grants are reject
 });
 test('server.list projects only granted IDs and inert cached metadata, including unknown/online/offline',()=>{
   const f=setup();try{
-    const config=parseConfig({...f.raw,backends:{other:{...f.p,socketPath:join(f.dir,'private.sock'),aliases:['alias']}}});
+    const config=parseConfig({...f.raw,backends:{other:{...f.p,codexHome:join(f.dir,'other-home'),socketPath:join(f.dir,'private.sock'),aliases:['alias']}}});
     const stub=(connected:boolean)=>({connected,observation:{checkedAt:'2026-01-01T00:00:00.000Z',version:'1.2.3'},connect(){throw Error('must not connect');},rpc(){throw Error('must not rpc');},capabilities(){throw Error('must not probe');}} as unknown as Backend);
     for(const connected of [true,false]){
       const rows=listServers(config,['other'],new Map([['other',stub(connected)]]));

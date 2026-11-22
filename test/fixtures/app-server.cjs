@@ -19,12 +19,14 @@ const forbidden = ['sandbox', 'sandboxPolicy', 'approvalPolicy', 'permissions', 
 let initialized = false, turnSequence = 0;
 const message = line => {
   let m; try { m = JSON.parse(line); } catch { process.exit(93); }
-  record({ kind: 'message', value: m });
+  record({ kind: 'message', value: m, home:process.env.CODEX_HOME });
   if (m.jsonrpc) process.exit(94);
   if (m.method === 'initialize') {
     if (m.params?.capabilities?.experimentalApi !== true || m.params?.clientInfo?.name !== 'codex_connector') process.exit(95);
     if (process.env.CONNECTOR_FIXTURE_EARLY_EVENT) reply({method:'thread/started',params:{thread:{id:'unverified'}}});
-    reply({ id: m.id, result: { userAgent: 'local-fixture', codexHome: process.env.CONNECTOR_FIXTURE_REPORT_HOME || process.env.CODEX_HOME } }); return;
+    const omitHome=process.env.CONNECTOR_FIXTURE_NO_HOME==='all'||(process.env.CONNECTOR_FIXTURE_NO_HOME==='default'&&args.length===2);
+    const reported=omitHome?undefined:(args[3]&&process.env.CONNECTOR_FIXTURE_SOCKET_HOME)||process.env.CONNECTOR_FIXTURE_REPORT_HOME||process.env.CODEX_HOME;
+    reply({ id: m.id, result: { userAgent: 'local-fixture', codexHome: reported } }); return;
   }
   if (m.method === 'initialized') { initialized = true; return; }
   if (!initialized) process.exit(96);

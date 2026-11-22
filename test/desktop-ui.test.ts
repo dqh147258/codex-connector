@@ -169,7 +169,7 @@ test('a delayed pre-save poll cannot restore stale config or runtime after a suc
 
 test('local-only registry preview can save without Slack tokens, ID fields or a fabricated backend',async()=>{
   const state:any=initial();state.configDraftId='native-draft';delete state.config.backend;
-  state.config.backends={A:{executable:'/fixture/a',codexHome:'/mock/home-a'},B:{executable:'/fixture/b',aliases:['other'],socketPath:'/mock/b.sock'}};
+  state.config.backends={A:{executable:'/fixture/a',codexHome:'/mock/home-a'},B:{executable:'/fixture/b',codexHome:'/mock/home-b',aliases:['other'],socketPath:'/mock/b.sock'}};
   state.config.local={enabled:true};state.config.slack={enabled:false};state.credentials={};
   state.runtime={state:'running',owned:true,servers:[{serverId:'A',connected:true},{serverId:'B',connected:false}]};
   const f=fixture({saveConfig:v=>({...state,config:v.config})},state);

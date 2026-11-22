@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { SharedAppServer } from './codex.js';
 import { Connector, ConnectorError, type RuntimeContext } from './connector.js';
 import { Store } from './store.js';
-import { configuredServers, defaultServer, listServers, resolveServerId, targetFingerprint } from './servers.js';
+import { configuredServers, defaultServer, listServers, resolveServerId, targetFingerprint, validateIdentities } from './servers.js';
 import { OPERATOR, type Config, type LocalPrincipal, type Backend, type SlackPort } from './types.js';
 import type { ScreenPort } from './screens.js';
 import type { CommandEnvelope } from './protocol.js';
@@ -19,19 +19,22 @@ export class Runtime {
   private readonly blocked=new Set<string>();
   private readonly slackIds:string[];
   constructor(readonly config:Config,private dir:string,slack:SlackPort,screens?:ScreenPort,
-    makeBackend:MakeBackend=profile=>new SharedAppServer(profile)){
-    const profiles=configuredServers(config),preferred=defaultServer(config);
+    makeBackend?:MakeBackend){
+    const profiles=configuredServers(config),preferred=defaultServer(config),targets=validateIdentities(profiles);
     this.slackIds=config.slack.servers??(preferred?[preferred]:[]);
     mkdirSync(dir,{recursive:true,mode:0o700});this.lock=openSync(join(dir,'runtime.lock'),'wx',0o600);
     try{
       writeFileSync(this.lock,String(process.pid));
       for(const [id,profile] of profiles){
+        const target=targets.get(id)!;
         const subdir=id==='default'?dir:join(dir,'servers',id);
         let store:Store;
-        try{store=new Store(subdir,{id,fingerprint:targetFingerprint(profile),allowLegacy:id==='default'&&profiles.size===1});}
+        try{store=new Store(subdir,{id,fingerprint:targetFingerprint(profile,target),allowLegacy:id==='default'&&profiles.size===1});}
         catch(e){if(['TARGET_CHANGED','LEGACY_TARGET_AMBIGUOUS'].includes((e as Error).message)){this.blocked.add(id);continue;}throw e;}
         try{
-          const backend=makeBackend(profile,id);this.backends.set(id,backend);
+          const requireHome=profiles.size>1||!!profile.codexHome;
+          const backend=makeBackend?makeBackend(profile,id):new SharedAppServer(profile,undefined,requireHome?target.home!:undefined);
+          this.backends.set(id,backend);
           const context:RuntimeContext={id,defaultRoute:id===this.slackIds.find(a=>!this.blocked.has(a)),
             slackReady:()=>this.slackReady&&this.slackIds.includes(id),
             principal:principal=>this.principal(principal),

@@ -31,11 +31,15 @@ function effectiveHome(profile: BackendProfile): string | null {
   if (profile.socketPath && !profile.codexHome) return null;
   return canonicalPath(profile.codexHome || (process.env.CODEX_HOME ? resolve(process.env.CODEX_HOME) : join(homedir(), '.codex')));
 }
-export function targetFingerprint(profile: BackendProfile): string {
+export interface BackendTarget { readonly home: string | null; readonly socket: string | null }
+function backendTarget(profile: BackendProfile): BackendTarget {
+  return {home:effectiveHome(profile),socket:profile.socketPath?canonicalPath(profile.socketPath):null};
+}
+export function targetFingerprint(profile: BackendProfile, target = backendTarget(profile)): string {
   // Policy, aliases and version pins are NOT target identities. Socket recreation on
   // daemon restart must not invalidate the pin. Never persist or expose the raw paths.
   const launcher = normalize(profile.executable);
-  return createHash('sha256').update(JSON.stringify([process.platform==='win32'?launcher.toLowerCase():launcher,effectiveHome(profile), profile.socketPath ? canonicalPath(profile.socketPath) : null])).digest('hex');
+  return createHash('sha256').update(JSON.stringify([process.platform==='win32'?launcher.toLowerCase():launcher,target.home,target.socket])).digest('hex');
 }
 export function configuredServers(config: Config): Map<string, BackendProfile> {
   const map = new Map(Object.entries(config.backends || {}));
@@ -65,7 +69,8 @@ export function resolveServerId(config: Config, selector?: string): string {
   }
   throw Error('SERVER_UNAVAILABLE');
 }
-export function validateIdentities(profiles: Map<string, BackendProfile>): void {
+export function validateIdentities(profiles: ReadonlyMap<string, BackendProfile>): Map<string, BackendTarget> {
+  const targets=new Map<string,BackendTarget>();
   const names = new Set<string>(), homes = new Set<string>(), sockets = new Set<string>();
   if (!profiles.size || profiles.size > 32) throw Error('Configure between 1 and 32 backend profiles');
   for (const [id, p] of profiles) {
@@ -73,10 +78,16 @@ export function validateIdentities(profiles: Map<string, BackendProfile>): void 
       if (!validServerId(name) || names.has(name.toLowerCase())) throw Error('Duplicate or invalid server ID/alias');
       names.add(name.toLowerCase());
     }
-    const home = effectiveHome(p), socket = p.socketPath ? canonicalPath(p.socketPath) : null;
+    const target=backendTarget(p),{home,socket}=target;
+    // An absolute socket may forward to the platform's inherited default (or
+    // another registered daemon). Different socket strings do not establish
+    // different physical daemons. Require a unique, verifiable Home for each.
+    if (profiles.size>1 && !home) throw Error('Multiple backend profiles require codexHome on every explicit socket');
+    targets.set(id,target);
     if ((home && homes.has(home)) || (socket && sockets.has(socket))) throw Error('Duplicate backend target');
     if (home) homes.add(home); if (socket) sockets.add(socket);
   }
+  return targets;
 }
 
 export interface ServerObservation { checkedAt: string | null; version: string | null; homeVerified?: boolean }
@@ -90,6 +101,6 @@ export function listServers(config: Config, allowedIds: readonly string[], backe
     const checkedAt = observation?.checkedAt ?? null, connected = backend?.connected === true;
     return { serverId, aliases: [...(p.aliases || [])], isDefault: serverId === preferred,
       status: connected ? 'online' : checkedAt ? 'offline' : 'unknown', connected,
-      checkedAt, version: observation?.version ?? null, versionSource:'cli', homeVerified:!!p.codexHome && connected && observation?.homeVerified===true };
+      checkedAt, version: observation?.version ?? null, versionSource:'cli', homeVerified:connected && observation?.homeVerified===true };
   });
 }

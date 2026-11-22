@@ -39,7 +39,9 @@ export function verifyHandshakeHome(expected: string | undefined, reply: unknown
   if (!expected) return; // Compatibility with older daemons reached by an unpinned official proxy.
   const reported = reply && typeof reply === 'object' && 'codexHome' in reply ? reply.codexHome : undefined;
   if (typeof reported !== 'string' || !reported) throw new BackendError('BACKEND_HOME_UNVERIFIED');
-  try { if (canonicalPath(reported) === canonicalPath(expected)) return; } catch { /* Do not leak either path. */ }
+  // 'expected' was already canonicalized before any launch. Do not resolve it
+  // again: retargeting a local symlink must not silently change the active pin.
+  try { if (canonicalPath(reported) === expected) return; } catch { /* Do not leak either path. */ }
   throw new BackendError('BACKEND_HOME_MISMATCH');
 }
 export class SharedAppServer extends EventEmitter implements Backend {
@@ -51,7 +53,11 @@ export class SharedAppServer extends EventEmitter implements Backend {
   private failureStage: string | null = null;
   private verifiedHome = false;
   get observation(): ServerObservation { return { checkedAt: this.checkedAt, homeVerified:this.connected && this.verifiedHome, version: /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,64})?$/.test(this.version) ? this.version : null }; }
-  constructor(private config: Config['backend'], private timeoutMs = 30000) { super(); }
+  private readonly expectedHome?:string;
+  constructor(private config: Config['backend'], private timeoutMs = 30000, expectedHome?:string) {
+    super();
+    this.expectedHome=expectedHome ?? (config.codexHome ? canonicalPath(config.codexHome) : undefined);
+  }
   capabilities() { return { transport:'shared-daemon-proxy', daemonStart:{enabled:this.config.autoStartDaemon===true,attempted:this.daemonStartAttempted,result:this.daemonStartResult}, connected:this.connected, homeVerified:this.observation.homeVerified, epoch:this.epoch, versionSource:'cli', version:this.version || null, expectedVersion:this.config.expectedVersion || null, lastFailure:this.lastFailure || null,lastFailureStage:this.failureStage, unsupportedMethods:[...this.unsupported], arbitraryRpc:false, policyOverrides:false, sharedTakeover:'requires runtime verification; no fallback to independent app-server' }; }
   async connect(): Promise<void> {
     if (this.stopped) throw new BackendError('BACKEND_STOPPED'); if (this.connected) return; if (this.connecting) return this.connecting;
@@ -113,7 +119,7 @@ export class SharedAppServer extends EventEmitter implements Backend {
       stage='initialize';
       const hello = await this.request('initialize', {clientInfo:{name:'codex_connector',title:'Codex Connector',version:'0.2.0'},capabilities:{experimentalApi:true}});
       stage='home-verification';
-      verifyHandshakeHome(this.config.codexHome, hello); this.verifiedHome=!!this.config.codexHome;
+      verifyHandshakeHome(this.expectedHome, hello); this.verifiedHome=!!this.expectedHome;
       stage='initialized';
       await this.write({method:'initialized',params:{}}); this.failureStage = null; this.checkedAt = new Date().toISOString(); this.connected = true; this.lastFailure = ''; this.unsupported.clear();
     } catch (e) {

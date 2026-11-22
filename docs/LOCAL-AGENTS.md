@@ -40,7 +40,7 @@ node dist/src/cli.js status --server default
 }
 ```
 
-每个 profile 使用已有的明确 Home 或绝对 socket 路径；例子不创建它们。不可用多份配置冒充同一目标。不同 socket 路径不证明下层一定是不同 daemon；只指定 socket 时并不能验证该 daemon 的实际 Home。操作者须核实物理目标不同，避免同时管理同一后端。列表不暴露 Home、socket 或启动路径。Slack 启用时可用 `slack.servers` 限定其可见的规范 ID；代理授权列表同样使用规范 ID，而非别名。客户端可传别名，保留回执返回的**规范 serverId**用于后续请求。显式选择失败不是切换其它服务的授权。不要用同一个持久 server ID 指向另一台后端；如状态标记为 blocked，应由操作者核对配置，不能直接丢弃状态/锁重试。
+多目标时，每个目标都必须对应一个不同且可验证的 Codex Home。配置绝对 `socketPath` 的目标必须同时填写 `codexHome`；不同 socket 路径可能转发到同一个 daemon，不能靠路径区分。未配置 `socketPath` 的默认连接仍使用官方代理自己选路；其预期 Home 是显式 `codexHome`，否则是启动环境继承的 `CODEX_HOME` 或当前账户默认 `~/.codex`。在发送任何会话请求之前，连接器会核对 daemon 握手的真实 Home；缺失或不匹配时该目标保持离线，不切换到其它目标。旧版单目标未固定 Home 时仍可使用官方代理，但 `homeVerified:false`，不要当成身份已核实。列表不暴露 Home、socket 或启动路径。Slack 启用时可用 `slack.servers` 限定其可见的规范 ID；代理授权列表同样使用规范 ID，而非别名。客户端可传别名，保留回执返回的**规范 serverId**用于后续请求。显式选择失败不是切换其它服务的授权。不要用同一个持久 server ID 指向另一台后端；如状态标记为 blocked，应由操作者核对配置，不能直接丢弃状态/锁重试。
 
 区分两个名字：命令 envelope 的 `target` 是 Connector 的 `instanceId`，`params.serverId` 才选择后端。CLI 的 `--server` 对应后者。无默认值且有多个候选时须显式选择。即使两个后端的原生 threadId 相同，也不是同一会话。
 
