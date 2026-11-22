@@ -3,6 +3,10 @@
   "instanceId": "my-computer",
   "port": 17381,
   "slack": {
+    "enabled": true,
+    "servers": [
+      "default"
+    ],
     "teamId": "T_REPLACE",
     "inputChannel": "C_COMMANDS",
     "outputChannel": "C_REPLIES",
@@ -40,5 +44,10 @@
   },
   "screenPolicy": {
     "enabled": false
-  }
+  },
+  "local": {
+    "enabled": true,
+    "agents": []
+  },
+  "backends": {}
 }

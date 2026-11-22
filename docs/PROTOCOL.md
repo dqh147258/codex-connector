@@ -55,7 +55,7 @@ The optional transport address is one leading `<@CONNECTOR_SELF_USER_ID>` follow
 References: [Slack formatting and escaping](https://docs.slack.dev/messaging/formatting-message-text/) and [Slack legacy label parsing](https://github.com/slackhq/slack-api-docs/blob/master/page_formatting.md).
 
 
-Local/Skill `session.create` or a first `session.attach` requires `outputThreadTs` for an existing, readable root in configured `outputChannel`. This is checked before creating a Codex session; Slack-origin commands cannot override their destination with this parameter. Existing session bindings and bound Skill replies continue to work. Missing/unverified destinations fail closed; unbound local command output is not posted to Slack. On restart, persisted origins are retained. Old pending top-level or destinationless deliveries are marked failed, not silently rerouted. Channel revocation prevents delivery rather than choosing another channel.
+Local/Skill `session.create` and `session.attach` do not require a Slack destination. For an explicitly requested Slack binding, an operator can provide `outputThreadTs` for an existing, readable root in configured `outputChannel`. Scoped agents and MCP cannot choose Slack destinations. This is checked before creating a Codex session; Slack-origin commands cannot override their destination with this parameter. Existing session bindings and bound Skill replies continue to work. Missing/unverified destinations fail closed; unbound local command output is not posted to Slack. On restart, persisted origins are retained. Old pending top-level or destinationless deliveries are marked failed, not silently rerouted. Channel revocation prevents delivery rather than choosing another channel.
 
 ## 文件与会话只读查询
 
@@ -80,3 +80,7 @@ Slack 默认响应是有界摘要，不再保证直接输出完整 JSON。需要
 参数为 `terms`（1–10 个字符串，提交值每个最多 200 UTF-16 code unit、总计不超过 1000，去首尾空白后非空，不允许控制字符）、`mode:and|or`（默认 and）、`role:all|user|assistant`（默认 all）、`sessionLimit`（1–20，默认 10）、`limit`（1–50 条命中，默认 20）、`maxChars`（每条摘录 100–2000，默认 1000）与返回的不透明 `cursor`。大小写不敏感的字面子串匹配在**同一条**完整安全可见消息内完成，之后才截断；不支持正则、跨消息 AND 或查询语言。敏感消息被隐藏，不通过匹配结果探测秘密。
 
 结果包含命中消息、对应会话基础信息及覆盖/排除/失败信息；有界读取、无权限或不可用历史不能被解释为全局没有命中。搜索是非原子实时读取，不是稳定历史快照。Slack `result.next` 延续同一搜索，遵守同认证身份、同频道/线程及有限结果保留策略；`result.page` 只展开已有结果，不继续扫描。完整语义见 [SESSION-SEARCH.md](SESSION-SEARCH.md)。
+
+## Server-scoped local clients
+
+`target` still addresses the connector instance. Optional `params.serverId` selects a registered backend (ID or alias); it never accepts a socket path or Home. For Slack, use `server.list` to discover the configured and authorized subset. See [local API and stdio MCP](LOCAL-AGENTS.md) for authentication, exact command receipts and scoped event cursors.

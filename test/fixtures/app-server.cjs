@@ -5,7 +5,7 @@ const { WebSocketServer } = require('ws');
 const { appendFileSync } = require('node:fs');
 const args = process.argv.slice(2);
 const record = value => { if (process.env.CONNECTOR_FIXTURE_LOG) appendFileSync(process.env.CONNECTOR_FIXTURE_LOG, JSON.stringify(value) + '\n'); };
-record({ kind: 'launch', args, credentialPresent: ['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN', 'CONNECTOR_TOKEN'].some(key => !!process.env[key]) });
+record({ kind: 'launch', args, home:process.env.CODEX_HOME, credentialPresent: ['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN', 'CONNECTOR_TOKEN','LOCAL_AGENT_BEARER_TOKEN','CONNECTOR_AGENT_TOKEN'].some(key => !!process.env[key]) });
 if (args.length === 1 && args[0] === '--version') {
   process.stdout.write('codex-cli ' + (process.env.CONNECTOR_FIXTURE_VERSION || '0.166.0-alpha.1') + '\n');
   process.exit(0);
@@ -23,7 +23,8 @@ const message = line => {
   if (m.jsonrpc) process.exit(94);
   if (m.method === 'initialize') {
     if (m.params?.capabilities?.experimentalApi !== true || m.params?.clientInfo?.name !== 'codex_connector') process.exit(95);
-    reply({ id: m.id, result: { userAgent: 'local-fixture' } }); return;
+    if (process.env.CONNECTOR_FIXTURE_EARLY_EVENT) reply({method:'thread/started',params:{thread:{id:'unverified'}}});
+    reply({ id: m.id, result: { userAgent: 'local-fixture', codexHome: process.env.CONNECTOR_FIXTURE_REPORT_HOME || process.env.CODEX_HOME } }); return;
   }
   if (m.method === 'initialized') { initialized = true; return; }
   if (!initialized) process.exit(96);

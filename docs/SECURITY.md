@@ -42,3 +42,7 @@ No guarantee for arbitrary older/newer app-server versions, standalone `--no-dae
 ## RPC diagnostic privacy
 
 JSON-RPC failures retain only a safe integer code and an allowlisted classification. Queue classifications require the exact method/code/message shape; no raw message or error data is copied into error objects, persisted delivery diagnostics or Slack output. Unknown wording is not displayed as a sanitized excerpt. Classification does not authorize a retry, resend, implicit steering, or a new turn, and does not itself establish message processing.
+
+## Local clients and multiple shared daemons
+
+[Local agent setup](LOCAL-AGENTS.md) separates agent bearer credentials from the operator token. Scope each agent to explicit server IDs, project aliases and commands, including event reads. MCP is a finite allowlist of public tools, not raw app-server RPC, a second daemon, a Slack bot, or a way to answer approvals. Keep the operator home and credentials unreadable to untrusted client processes; an application-level token scope does not isolate two processes that can read the same files. No client-selected URL, executable, Home, socket or origin is forwarded. An event cursor is not bearer authorization. Read/list operations remain scoped and absence after a gap is not proof of non-delivery.

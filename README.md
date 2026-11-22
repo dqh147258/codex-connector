@@ -1,10 +1,12 @@
-# Codex Connector 0.2 — 本机共享 Codex server ↔ Slack dot
+# Codex Connector 0.2：本机 Agent 和 Slack 共用已授权的 Codex server
 
-这是一次**共享 daemon 架构重构**：不再只管理连接器自己启动的独立 app-server。连接器使用官方 `codex app-server proxy` 接入当前账户的默认共享 daemon；列出、显式绑定并管理它可见的会话。一个绑定会话对应一个输出 Slack thread，所有输出 `@` 配置并验证过的 dot 用户 ID。
+连接器使用官方 `codex app-server proxy` 接入当前账户已配置的共享 daemon。**不使用 Slack 也能工作**：本机 Agent 通过 CLI、stdio MCP 或 Skill 选择 server、创建或绑定会话并读取回复。Slack 可以单独启用，也可以与本机模式并存；本机操作不会自动转发到 Slack。快速配置与多 server 示例见[本机 Agent 接入](docs/LOCAL-AGENTS.md)。
 
 > **用户上传的本机验证记录报告：已在 macOS 实机验证共享 daemon 的 WebSocket 握手和只读会话发现，Slack 凭据与 dot 身份核验通过。** 真实活动会话的发送、接管和审批回放仍待专项验收，不代表所有会话均可管理。完整证据与验收范围见 [runtime report](docs/RUNTIME-VERIFICATION.md)。
 
 ## 已实现的边界
+
+- `servers` / `server.list` 只列已注册、当前身份获准的 server 和最近观察状态，不扫描电脑。后续请求用明确的 `serverId`；同名会话、回执、游标不可跨 server 混用。
 
 - Node.js 22+ 持续运行服务器，Slack Socket Mode，无公网入口。
 - 仅接受配置的工作区、输入频道、dot 的 **botId + userId + appId**，以及配置的人类 ID；不信任正文里的 `actor` / `approvedBy`。
@@ -25,11 +27,9 @@ Electron 桌面包装正在独立 Draft PR 中验收：图形向导、私密令�
 ```sh
 git clone https://github.com/dqh147258/codex-connector.git
 cd codex-connector
-# 若重构 PR 尚未合并，切到其分支：
-git checkout refactor/shared-daemon-slack-server
 npm ci
 npm run build
-node dist/src/cli.js init
+node dist/src/cli.js init --mode local  # 仅本机；配置 Slack 用 init --mode slack
 ```
 
 编辑 `~/.codex-connector/config.json`（Windows 为 `%USERPROFILE%\.codex-connector\config.json`）。`--home PATH` / `CONNECTOR_HOME` 可选择另一个私有目录。模板中的 `*_REPLACE` 等值必须替换，不能原样运行。
@@ -49,7 +49,7 @@ node dist/src/cli.js init
 
 **共享 daemon 必须在同一非管理员 OS 账户下可用。** 默认需要先启动；可由操作者选择上述冷启动开关，再结合系统启动模板。连接器从不自动执行 `daemon stop`，不抢占 `--no-daemon` 独立进程，不读 rollout/session 文件。若默认 daemon 不可用，`capabilities` 显示失败，仍可用 help/只读文件工具；不会假装接管成功。
 
-### Slack App 与令牌
+### Slack App 与令牌（仅启用 Slack 时）
 
 导入 [`slack-app-manifest.json`](slack-app-manifest.json)，开启 Socket Mode，安装到工作区；创建带 `connections:write` 的 app-level token。daemon 终端需要：
 
@@ -107,7 +107,7 @@ node dist/src/cli.js help --command session.create
 
 1. `session.list {"limit":20}` 分别分页读取共享 daemon 当前 loaded ID 与已索引交互历史（不扫描会话文件），返回 `manageable` / `reason`；可加 `project` 过滤。每来源最多 `limit` 条，合并后可达两倍；有 `nextCursor` 就继续分页，不能把第一页当全部。`loaded:true` 是读取时已加载观察，stored-only 为未知而非断言未加载；元数据不可读仍保留 ID，并标记 `METADATA_UNAVAILABLE`。桌面「会话列表」可只读刷新/逐页加载、去重，不自动恢复或读取内容。
 2. 选定明确的 `threadId`，发送 `session.attach {"threadId":"...","project":"demo"}`。对于项目外会话，先由操作者在本机启用 `sessionPolicy.allowAllSharedSessions` 并重启，再用 `session.attach {"threadId":"..."}`；无需把外部目录加入文件工具 roots。
-3. 返回 `sessionId`。首次 Slack 绑定使用发起命令的原 Thread（顶层命令用该消息自身作为根），并在其中 mention dot；已有绑定不会移动。本地/Skill 首次绑定需要 `outputThreadTs` 指定配置输出频道内可读取的已有 Thread。
+3. 返回 `sessionId`。首次 Slack 绑定使用发起命令的原 Thread（顶层命令用该消息自身作为根），并在其中 mention dot；已有绑定不会移动。本机绑定不需要 Slack 目标；只有操作者明确要求绑定到 Slack 时才给出已配置输出频道内可读取的 `outputThreadTs`。
 4. 用同一 `sessionId` 发送后续命令：
 
 ```json
@@ -136,14 +136,15 @@ node dist/src/cli.js help --command session.create
 
 ## 5. Codex Skill / 本地 API
 
-复制 `skills/codex-connector/` 到项目 `.agents/skills/codex-connector/`，让现有 Codex 通过本地 CLI 调用命令，见 [Skill](skills/codex-connector/SKILL.md)。例如：
+从 [本机 Agent 指南](docs/LOCAL-AGENTS.md) 选择 CLI、stdio MCP 或 [Skill](skills/codex-connector/SKILL.md)。例如：
 
 ```sh
-node /ABS/connector/dist/src/cli.js command --name session.reply --params-file progress.json
-node /ABS/connector/dist/src/cli.js status
+node /ABS/connector/dist/src/cli.js servers
+node /ABS/connector/dist/src/cli.js command --name session.list --server default --params '{"view":"loaded","limit":5}'
+node /ABS/connector/dist/src/cli.js receipt --server default --work-id WORK_ID
 ```
 
-`progress.json` 为 `{"sessionId":"明确的绑定ID","text":"进展"}`。避免把不可信文本拼入 shell，使用 UTF-8 JSON 文件或 stdin。
+将 `WORK_ID` 换成上一步返回的 `result.id`。接纳回执不代表模型完成。已绑定会话用 `events` 获取本地最终回复；新 Agent 请配独立权限令牌，不要共享操作者的 `api.token`。用于发送文字的参数建议从 UTF-8 JSON 文件或标准输入读取。
 
 API 只监听 `127.0.0.1`，需要私有 token，拒绝浏览器 Origin / 异常 Host。CLI 使用独立 direct HTTP Agent，不会把 bearer token 交给环境 HTTP_PROXY；这也意味着仅允许代理、禁止直连 localhost 的 Codex 沙箱中，CLI 不保证可用。必须由用户审查合法访问设置，不关闭沙箱绕过。**本地 API 不接受 approval/input 决定**；Skill 不能用 owner token 自己批准。
 
@@ -183,7 +184,7 @@ npm test
 
 命令成功、失败和格式错误都回复发起命令的原 Thread；顶层命令以该消息自身建立回复 Thread。异步 Codex 输出/审批继续留在既有会话绑定，后续从别的 Thread 查询不会偷偷改绑。找不到有效目的 Thread 时拒绝发送，不回退到群聊顶层。
 
-本地/Skill 新建或首次绑定时，在参数中提供 `outputThreadTs`（配置输出频道中已存在的 Slack Thread 根时间戳）；Connector 验证可读取后才启动新 Codex 会话。已有绑定仍可直接 `session.reply`。完整边界见 [协议说明](docs/PROTOCOL.md#reply-destination-and-explicit-address)。
+本地新建或绑定默认不发 Slack，无需 `outputThreadTs`。仅操作者明确要求 Slack 绑定时提供已配置输出频道内的根时间戳；Connector 先验证可读取性。MCP 不接受该字段。完整边界见 [协议说明](docs/PROTOCOL.md#reply-destination-and-explicit-address)。
 
 ## 简洁 Slack 输出与关键消息订阅
 

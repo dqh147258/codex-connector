@@ -1,3 +1,7 @@
+# Local, Slack-only and dual startup
+
+Start the operator-owned connector once in the foreground, using its own state directory. Select `local.enabled` and `slack.enabled` independently. For a local-only setup, initialize with `init --mode local`; no Slack tokens are needed. For MCP, configure a separate scoped credential, not the operator bearer. Use [local agent setup and commands](LOCAL-AGENTS.md), [profile configuration](../config.example.json), and [Windows read-only candidate checks](WINDOWS-CANDIDATE.md).
+
 # Cold-start option added in0.2
 
 `backend.autoStartDaemon` defaults to false. The local operator may set it to true to run fixed `codex app-server daemon start` once after version probing (and matching only when optional expectedVersion is explicitly configured), before connecting the shared proxy. Timeout 15 seconds; no retry storm, stop/update call or elevation. Do not combine it with explicit `socketPath`. Official Codex start can provision its daemon package/manage its updater according to the existing Codex settings; this connector does not alter update policy. On failure capabilities reports the outcome and the server stays available for help/status. Actual startup on each OS still needs validation.

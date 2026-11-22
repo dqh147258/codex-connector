@@ -1,3 +1,16 @@
+# 2026-11-22 candidate: what was tested
+
+**Scope:** isolated Dot cloud Linux test environment, Node 24.22.3. Candidate based on `main@a27bf6a76ee1c3372b198576167f1f40f4208023`. Existing signed-in services, Slack channels, native Desktop sessions and user config were not modified by these tests.
+
+- Real processes: CLI startup in local, Slack-only and dual modes; MCP stdio initialization, tool enumeration, new thread, send, receipt, correlated final + terminal events and unwatch through a real loopback HTTP server. The App Server and Slack in these tests are controlled fixtures, not the user's accounts.
+- Distinct official-proxy-shaped fixture targets, including the same thread/turn IDs on different servers, one disabled/unavailable target, ambient vs explicit Home, collision denial, and explicit expected Home A vs reported Home B failing at initialization before thread requests. Listing known server health never starts a process.
+- v2 migration preview/backups, unknown write recovery, transport grants and project roots, local-only turn not posted to a dual-bound Slack session, exact Slack thread for proven Slack turns, scoped local credentials and result revocation, stable request IDs and single queue submission, native read-only paged reconciliation across reconnect, stale approval isolation and no autoapproval.
+- Windows diagnostic package: built by `npm run build && python3 scripts/package-owner-probe.py OUTPUT.zip` using the checked-in allowlist, source and generated JS, pure JS ws and its license. Fresh unpack and fixture-only run passed. See [Windows instructions](WINDOWS-CANDIDATE.md) for exactly what it can certify.
+- Windows evidence collected separately by the operator/host, distinct from this cloud run: packaged Desktop 26.1117.4957.0, bundled CLI 0.171.0-alpha.13, earlier official default `app-server daemon version` exited 1 with Windows error 10050. This does not establish the cause, or whether a candidate can reach the Desktop owner. Do not infer a firewall issue, path length issue, or service version. An authenticated real Windows native test and real Slack still require their respective existing, authorized test owner/channel. An offline Windows fixture cannot satisfy either.
+- No Electron page or control has been changed. Existing Desktop regressions are included; a visible Desktop round-trip is **not claimed**. No deployment, PR, or release is part of this candidate.
+
+---
+
 # Runtime capability evidence — 2026-11-02
 
 ## Operator-reported local macOS verification after the proxy transport fix

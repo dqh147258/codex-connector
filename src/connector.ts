@@ -1,6 +1,7 @@
 import { ScreenError, validateScreenImages, type ScreenPort } from './screens.js';
+import { LocalEvents } from './local-events.js';
 import { realpathSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { resolve,relative,isAbsolute,sep } from 'node:path';
 import { RecentSessions, RecentError } from './session-recent.js';
 import { deliveryId, deliveryStatus, deliveryView, observeMessage, observeTurn, terminalExecution, type MessageDelivery } from './session-delivery.js';
@@ -15,23 +16,31 @@ import { parseEnvelope, validateCommand, ProtocolError, formatHelp, COMMANDS, ST
 import { BackendError } from './codex.js';
 import { formatRpcDiagnostic } from './rpc-diagnostics.js';
 import { parseSlackEnvelope, isSlackAddressed, SlackTransportError, SLACK_TRANSPORT_REVISION } from './slack-envelope.js';
-import type { Backend, Config, Delivery, Pending, Session, SlackPort, Source, State, Work } from './types.js';
+import type { Backend, Config, Delivery, LocalPrincipal, Pending, Session, SlackPort, Source, State, Work } from './types.js';
 export class ConnectorError extends Error { constructor(readonly code:string){super(code);} }
 const codeOf=(e:unknown)=>e instanceof ScreenError||e instanceof RecentError||e instanceof SessionContentError||e instanceof SubscriptionError||e instanceof ConnectorError||e instanceof BackendError||e instanceof FileAccessError ? e.code : 'OPERATION_FAILED';
 const decisionCommands=new Set(['approval.respond','input.respond']);
 const boundCommands=new Set(['session.delivery','session.info','session.history','session.send','session.steer','session.queue','session.interrupt','session.reply']);
 function short(value:unknown,max=20000){const text=typeof value==='string'?value:JSON.stringify(value,null,2);return text.length>max?text.slice(0,max)+'\n[truncated; request a smaller page]':text;}
+export interface RuntimeContext {
+  id:string; slackReady():boolean; servers(source:Source):unknown; principal(id:string):LocalPrincipal|undefined;
+  route(serverId:unknown,command:string):'accept'|'other'|'reject'; defaultRoute:boolean;
+}
+const stable=(v:unknown):string=>JSON.stringify(v,(_,x)=>x&&typeof x==='object'&&!Array.isArray(x)?Object.fromEntries(Object.entries(x).sort(([a],[b])=>a<b?-1:a>b?1:0)):x);
+const localTools=new Set(['server.list','session.list','session.attach','session.create','session.history','session.info','session.send','session.queue','session.interrupt','session.steer','session.delivery']);
 export class Connector {
   private running=new Map<string,Promise<void>>();private delivering?:Promise<void>;private closing=false;private lastPost=0;
   private deliveryTurns=new Map<string,{threadId:string;turn:{id:string;status:string};conflict?:true}>();
   private events=Promise.resolve();private attached=new Set<string>();private items=new Map<string,any>();
+  readonly localEvents?:LocalEvents;
   readonly files:ReadonlyFiles;
   readonly subscriptions:SessionSubscriptions;
   readonly content:SessionContent;
   readonly search:SessionSearch;
   readonly recent:RecentSessions;
   selfUserId='';selfBotId='';
-  constructor(readonly config:Config,readonly store:Store,readonly backend:Backend,readonly slack:SlackPort,private postIntervalMs=1100,private screens?:ScreenPort){
+  constructor(readonly config:Config,readonly store:Store,readonly backend:Backend,readonly slack:SlackPort,private postIntervalMs=1100,private screens?:ScreenPort, readonly runtime?:RuntimeContext){
+    if(runtime)this.localEvents=new LocalEvents(store,backend,runtime.id);
     this.files=new ReadonlyFiles(config.projects,{},config.filePolicy?.allowAbsolutePaths===true);
     this.recent=new RecentSessions(backend,()=>this.store.state.activity||[],t=>this.threadSummary(t));
     const authorizeContent=(thread:any)=>{const cwd=this.canonicalCwd(thread?.cwd);if(!cwd||(!this.config.sessionPolicy?.allowAllSharedSessions&&!this.projectFor(cwd)))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');return this.threadSummary({...thread,cwd});};
@@ -48,19 +57,23 @@ export class Connector {
     backend.on('disconnect',epoch=>this.event(()=>this.disconnected(epoch)));
   }
   private event(operation:()=>Promise<void>|void){this.events=this.events.then(operation).catch(()=>{/* Persisted state stays authoritative. No raw payload logs. */});}
-  async initialize(){
+  async initialize(){await this.initializeSlack();await this.reconnect();}
+  async initializeSlack(){
     const saved=this.store.state.dot;const dot=await this.slack.resolveDot(this.config.slack.dot.name,this.config.slack.dot.userId||(saved?.selector===this.config.slack.dot.name?saved.userId:undefined));
     this.store.transaction(s=>{s.dot={...dot,selector:this.config.slack.dot.name};});
-    await this.reconnect();
   }
   async reconnect(){
     if(this.closing)return;
     try{
       await this.backend.connect();
-      await this.subscriptions.rejoin();
+      if(!this.runtime||this.runtime.slackReady())await this.subscriptions.rejoin();
       for(const s of this.store.state.sessions){
         if(this.attached.has(s.threadId)||!this.authorizedSession(s))continue;
-        try{const r=await this.backend.rpc('thread/read',{threadId:s.threadId,includeTurns:false});this.checkSessionThread(r.thread,s);await this.backend.rpc('thread/resume',{threadId:s.threadId,excludeTurns:true});this.attached.add(s.threadId);}catch{/* Capabilities/status exposes unavailable attachment; never starts a replacement thread. */}
+        try{const r=await this.backend.rpc('thread/read',{threadId:s.threadId,includeTurns:false});this.checkSessionThread(r.thread,s);
+          // A new connection does not prove continuity of the previous writer. Recover
+          // observations read-only; require a fresh explicit attach before writes.
+          if(this.runtime){for(const {principal:owner} of this.localEvents!.list().filter(row=>row.sessionId===s.id)){const p=this.runtime.principal(owner);if(p&&this.localBinding(p,s)&&(p.role==='operator'||p.servers?.includes(this.runtime.id)&&p.commands?.includes('session.events')))await this.localEvents!.recover({principal:owner,sessionId:s.id,project:s.project,threadId:s.threadId});}continue;}
+          await this.backend.rpc('thread/resume',{threadId:s.threadId,excludeTurns:true});this.attached.add(s.threadId);}catch{/* Capabilities/status exposes unavailable attachment; never starts a replacement thread. */}
       }
     }catch{/* Server remains usable for help/files/status. No independent fallback. */}
     this.pump();this.flush();
@@ -77,29 +90,36 @@ export class Connector {
   }
   /** Persist-before-ack. Returns false for irrelevant/unauthorized events, never executes here. */
   accept(body:any):boolean{
-    this.store.assertHealthy();const source=this.authorizeEvent(body);if(!source)return false;
+    if(this.runtime&&!this.runtime.slackReady())return false;this.store.assertHealthy();const source=this.authorizeEvent(body);if(!source)return false;
     if(Object.hasOwn(this.store.state.seenEvents,source.eventId))return true;
     const mention=this.selfUserId?`<@${this.selfUserId}>`:'';const addressed=Boolean(mention&&isSlackAddressed(body.event.text,mention,source.kind==='bot'));
     if(!body.event.text.startsWith(START_MARKER)&&!addressed)return false;
     let request:CommandEnvelope;
-    try{request=parseSlackEnvelope(body.event.text,body.event.blocks,this.config.instanceId,source.kind==='bot',addressed?mention:undefined);}catch(e){this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,`Command rejected: ${e instanceof ProtocolError?e.code:'invalid_envelope'}. Transport ${SLACK_TRANSPORT_REVISION}: ${e instanceof SlackTransportError?e.stage:'envelope'}. Use the generated help envelope exactly.`,undefined,source);});return true;}
+    try{request=parseSlackEnvelope(body.event.text,body.event.blocks,this.config.instanceId,source.kind==='bot',addressed?mention:undefined);}catch(e){if(this.runtime&&!this.runtime.defaultRoute)return false;this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,`Command rejected: ${e instanceof ProtocolError?e.code:'invalid_envelope'}. Transport ${SLACK_TRANSPORT_REVISION}: ${e instanceof SlackTransportError?e.stage:'envelope'}. Use the generated help envelope exactly.`,undefined,source);});return true;}
+    if(this.runtime){
+      const route=this.runtime.route(request.params.serverId,request.command);if(route==='other')return false;
+      if(route==='reject'){this.store.transaction(state=>{Object.defineProperty(state.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(state,'Command rejected: SERVER_UNAVAILABLE. Select an authorized, configured server; no operation was executed.',undefined,source);});return true;}
+      request={...request,params:{...request.params,serverId:this.runtime.id}};
+    }
     if(source.channel!==this.config.slack.inputChannel&&!decisionCommands.has(request.command)&&!['result.page','session.unsubscribe','session.subscriptions'].includes(request.command)){this.store.transaction(s=>{Object.defineProperty(s.seenEvents,source.eventId,{value:'rejected',enumerable:true,writable:true,configurable:true});this.output(s,'Command rejected: COMMAND_CHANNEL_NOT_ALLOWED. Use the configured command channel; no session operation executed.',undefined,source);});return true;}
     this.record(request,source);return true;
   }
-  local(request:CommandEnvelope){
+  local(request:CommandEnvelope,principal:LocalPrincipal={id:'local',role:'operator'}){
+    if(this.runtime){this.localAuthority(principal,request);}
     if(request.target!==this.config.instanceId)throw new ConnectorError('WRONG_TARGET');request={...request,params:validateCommand(request.command,request.params)};
     if(decisionCommands.has(request.command))throw new ConnectorError('NEED_VERIFIABLE_HUMAN_DECISION');
-    const id=this.record(request,{kind:'local',userId:'local',channel:this.config.slack.inputChannel,threadTs:'',ts:'',eventId:`local-${request.id}`});this.pump();return{id,requestId:request.id,status:'accepted',acceptance:'connector-inbox-only',deliveryConfirmed:false};
+    const id=this.record(request,{kind:'local',userId:principal.id,channel:this.runtime?'':this.config.slack.inputChannel,threadTs:'',ts:'',eventId:`local-${principal.id}:${request.id}`});this.pump();return{id,requestId:request.id,...(this.runtime?{serverId:this.runtime.id}:{}),status:'accepted',acceptance:'connector-inbox-only',deliveryConfirmed:false};
   }
   private record(request:CommandEnvelope,source:Source):string{
     return this.store.transaction(s=>{
-      if(Object.hasOwn(s.seenEvents,source.eventId))return s.seenEvents[source.eventId]!;
+      if(Object.hasOwn(s.seenEvents,source.eventId)){const id=s.seenEvents[source.eventId]!;if(source.kind==='local'){const previous=s.work.find(x=>x.id===id);if(!previous||stable(previous.request)!==stable(request))throw new ConnectorError('REQUEST_ID_CONFLICT');}return id;}
       const existing=s.work.find(w=>w.request.id===request.id&&w.source.kind===source.kind&&w.source.userId===source.userId);
       const id=existing?.id||randomUUID();
       Object.defineProperty(s.seenEvents,source.eventId,{value:id,enumerable:true,writable:true,configurable:true});
-      if(existing){if(JSON.stringify(existing.request)!==JSON.stringify(request))this.output(s,`REQUEST_ID_CONFLICT: ${request.id}; use a new ID for a different command.`,undefined,source);else this.output(s,`REQUEST_ALREADY_ACCEPTED: ${request.id}; work ${existing.id}; status ${existing.status}${existing.messageDelivery?`; message evidence ${deliveryView(existing).deliveryStatus}; check session.delivery with workId ${existing.id}`:''}. No operation was repeated.`,undefined,source);return id;}
+      if(existing){if(source.kind==="local"){if(stable(existing.request)!==stable(request))throw new ConnectorError("REQUEST_ID_CONFLICT");return id;}if(stable(existing.request)!==stable(request))this.output(s,`REQUEST_ID_CONFLICT: ${request.id}; use a new ID for a different command.`,undefined,source);else this.output(s,`REQUEST_ALREADY_ACCEPTED: ${request.id}; work ${existing.id}; status ${existing.status}${existing.messageDelivery?`; message evidence ${deliveryView(existing).deliveryStatus}; check session.delivery with workId ${existing.id}`:''}. No operation was repeated.`,undefined,source);return id;}
       if(s.work.filter(w=>['queued','executing'].includes(w.status)).length>=500)throw new ConnectorError('QUEUE_FULL');
-      s.work.push({id,eventId:source.eventId,request,source,status:'queued',createdAt:new Date().toISOString()});return id;
+      const principal=source.kind==='local'&&this.runtime?this.runtime.principal(source.userId):undefined;
+      s.work.push({id,...(principal?{localGrant:this.grantFingerprint(principal)}:{}),eventId:source.eventId,request,source,status:'queued',createdAt:new Date().toISOString()});return id;
     });
   }
   private key(w:Work){
@@ -109,7 +129,7 @@ export class Connector {
   }
   pump(){
     if(this.closing)return;try{this.store.assertHealthy();}catch{return;}
-    for(const w of this.store.state.work.filter(w=>w.status==='queued')){
+    for(const w of this.store.state.work.filter(w=>w.status==='queued'&&(!this.runtime||w.source.kind==='local'||this.runtime.slackReady()))){
       const key=this.key(w);if(this.running.has(key))continue;
       if(w.request.command!=='screen.capture'&&this.store.state.work.some(x=>this.key(x)===key&&x.status==='uncertain'))continue;
       const task=this.drain(key).catch(()=>{}).finally(()=>{this.running.delete(key);queueMicrotask(()=>this.pump());});this.running.set(key,task);
@@ -117,11 +137,11 @@ export class Connector {
   }
   private async drain(key:string){
     while(!this.closing){
-      const w=this.store.state.work.find(w=>w.status==='queued'&&this.key(w)===key);if(!w)return;
+      const w=this.store.state.work.find(w=>w.status==='queued'&&this.key(w)===key&&(!this.runtime||w.source.kind==='local'||this.runtime.slackReady()));if(!w)return;
       this.store.transaction(s=>{s.work.find(x=>x.id===w.id)!.status='executing';});
       try{
         this.reauthorize(w);let result=await this.execute(w);
-        this.store.transaction(s=>{const done=s.work.find(x=>x.id===w.id)!;done.status='completed';if(done.messageDelivery&&['session.send','session.queue'].includes(w.request.command))result=deliveryView(done);const snapshot=w.source.kind!=='local'&&w.request.command!=='result.page'?storeResult(s,w,result,this.config):undefined;done.resultRef={sessionId:this.outputSession(w,result),threadId:typeof result?.threadId==='string'?result.threadId:undefined,turnId:typeof result?.turnId==='string'?result.turnId:typeof result?.turn?.id==='string'?result.turn.id:undefined,resultId:snapshot?.id};const text=w.source.kind==='local'?`[request ${w.request.id}; work ${w.id}] ${short(result,w.request.command.startsWith('files.')||['session.list','session.recent','session.history','session.search'].includes(w.request.command)||result?.kind==='session.search'?500000:20000)}`:compactResult(w,result,snapshot);this.output(s,text+this.bindingNote(w,result),this.outputSession(w,result),w.source);});
+        this.store.transaction(s=>{const done=s.work.find(x=>x.id===w.id)!;done.status='completed';if(done.messageDelivery&&['session.send','session.queue'].includes(w.request.command))result=deliveryView(done);if(this.runtime&&w.source.kind==='local'){const str=JSON.stringify(result??null);done.localResult=Buffer.byteLength(str)>256*1024?{truncated:true,note:'Result exceeds 256 KiB. Request a smaller page.'}:containsSensitiveContent(str)||resultSensitive(result)?{withheld:true}:result;}const snapshot=w.source.kind!=='local'&&w.request.command!=='result.page'?storeResult(s,w,result,this.config):undefined;done.resultRef={sessionId:this.outputSession(w,result),threadId:typeof result?.threadId==='string'?result.threadId:undefined,turnId:typeof result?.turnId==='string'?result.turnId:typeof result?.turn?.id==='string'?result.turn.id:undefined,resultId:snapshot?.id};const text=w.source.kind==='local'?`[request ${w.request.id}; work ${w.id}] ${short(result,w.request.command.startsWith('files.')||['session.list','session.recent','session.history','session.search'].includes(w.request.command)||result?.kind==='session.search'?500000:20000)}`:compactResult(w,result,snapshot);this.output(s,text+this.bindingNote(w,result),this.outputSession(w,result),w.source);});
       }catch(e){
         const code=codeOf(e),uncertain=code==='SCREEN_UPLOAD_UNCERTAIN'||code==='RPC_OUTCOME_UNCERTAIN'&&COMMANDS[w.request.command].permission!=='read';
         const reason=uncertain?(code==='SCREEN_UPLOAD_UNCERTAIN'?': inspect the Slack thread for partial or completed uploads; no automatic retry.':': inspect backend state; operation will not be replayed.'):code==='SCREEN_RESTART_REQUIRED'||code==='SCREEN_TIMEOUT'?': quit and reopen the desktop app before a new explicit capture request.':code==='SCREEN_PERMISSION_DENIED'?': grant Screen Recording permission in local OS settings, then restart the desktop app.':code==='SCREEN_UPLOAD_REJECTED'?': check Slack files:write scope, channel membership and rate limits; no automatic retry.':'';
@@ -130,8 +150,48 @@ export class Connector {
       }finally{this.flush();}
     }
   }
+  private grantFingerprint(p:LocalPrincipal){
+    const projects=Object.keys(this.config.projects).filter(a=>this.localProject(p,a)).sort().map(a=>[a,this.canonicalCwd(this.config.projects[a]!)??null]);
+    return createHash('sha256').update(stable([p.id,p.role,[...(p.servers??[])].sort(),projects,[...(p.commands??[])].sort()])).digest('hex');
+  }
+  private localBinding(p:LocalPrincipal,s:Session){return this.localProject(p,s.project)&&!!s.cwd&&this.within(this.config.projects[s.project]!,s.cwd)&&s.localOwners?.includes(p.id)===true;}
+  private localProject(p:LocalPrincipal,project:string){return Object.hasOwn(this.config.projects,project)&&(p.role==='operator'||p.projects?.includes(project)===true);}
+  private localAuthority(principal:LocalPrincipal,req:CommandEnvelope){
+    if(!this.runtime)return;
+    if(this.runtime.principal(principal.id)?.role!==principal.role)throw new ConnectorError('ACTOR_REVOKED');
+    if(principal.role==='agent'&&(!localTools.has(req.command)||!principal.commands?.includes(req.command)||!principal.servers?.includes(this.runtime.id)))throw new ConnectorError('LOCAL_SCOPE_DENIED');
+    if(!localTools.has(req.command)&&!(principal.role==='operator'&&['help','capabilities','files.list','files.stat','files.read','files.search','session.reply'].includes(req.command)))throw new ConnectorError('LOCAL_ACTION_REQUIRED');
+    const p=req.params;
+    if(p.project!==undefined&&(typeof p.project!=='string'||!this.localProject(principal,p.project)))throw new ConnectorError('LOCAL_SCOPE_DENIED');
+    if(p.outputThreadTs!==undefined&&(principal.role!=='operator'||!this.runtime.slackReady()))throw new ConnectorError('SLACK_EXPLICIT_BINDING_UNAVAILABLE');
+    if(typeof p.sessionId==='string'){
+      const session=this.session(p.sessionId);
+      if(!this.localBinding(principal,session))throw new ConnectorError('LOCAL_BINDING_REQUIRED');
+    }
+  }
+  receipt(workId:string,principal:LocalPrincipal){
+    const w=this.store.state.work.find(x=>x.id===workId&&x.source.kind==='local'&&x.source.userId===principal.id);if(!w)throw new ConnectorError('RECEIPT_NOT_FOUND');
+    this.localAuthority(principal,w.request);if(w.localGrant!==this.grantFingerprint(principal))throw new ConnectorError('LOCAL_GRANT_CHANGED');return{id:w.id,requestId:w.request.id,serverId:this.runtime?.id,status:w.status,result:w.localResult,error:w.error,delivery:w.messageDelivery?deliveryView(w):undefined};
+  }
+  async readEvents(params:{sessionId:string,cursor?:string,waitMs?:number,limit?:number},p:LocalPrincipal,signal?:AbortSignal){
+    if(!this.localEvents)throw new ConnectorError('LOCAL_EVENTS_UNAVAILABLE');
+    if(p.role==='agent'&&(!p.servers?.includes(this.runtime!.id)||!p.commands?.includes('session.events')))throw new ConnectorError('LOCAL_SCOPE_DENIED');
+    const check=()=>{const current=this.runtime!.principal(p.id),s=this.session(params.sessionId);if(!current||!this.localBinding(current,s)||current.role==='agent'&&(!current.servers?.includes(this.runtime!.id)||!current.commands?.includes('session.events')))throw new ConnectorError('LOCAL_BINDING_REQUIRED');return s;};
+    const s=check(),scope={principal:p.id,project:s.project,sessionId:s.id,threadId:s.threadId};
+    const epoch=this.backend.epoch;if(!this.backend.connected)throw new ConnectorError('SERVER_UNAVAILABLE');
+    await this.metadata(s);check();if(epoch!==this.backend.epoch)throw new ConnectorError('SERVER_UNAVAILABLE');
+    const sub=this.localEvents.subscribe(scope);await this.localEvents.recover(scope);
+    const page=await this.localEvents.poll(scope,{subscriptionId:sub.subscriptionId,cursor:params.cursor,waitMs:params.waitMs,limit:params.limit},signal);
+    check();if(!this.backend.connected||epoch!==this.backend.epoch)throw new ConnectorError('SERVER_UNAVAILABLE');await this.metadata(s);check();
+    return{...page,subscriptionId:sub.subscriptionId,serverId:this.runtime!.id};
+  }
+  unwatch(params:{sessionId:string;subscriptionId:string},p:LocalPrincipal){
+    if(!this.localEvents||p.role==='agent'&&(!p.servers?.includes(this.runtime!.id)||!p.commands?.includes('session.events')))throw new ConnectorError('LOCAL_SCOPE_DENIED');
+    const s=this.session(params.sessionId);if(!this.localBinding(p,s))throw new ConnectorError('LOCAL_BINDING_REQUIRED');
+    return this.localEvents.cancel({project:s.project,sessionId:s.id,threadId:s.threadId,principal:p.id},params.subscriptionId);
+  }
   private reauthorize(w:Work){
-    const s=this.config.slack,a=w.source;if(a.kind==='local')return;
+    const s=this.config.slack,a=w.source;if(a.kind==='local'){if(this.runtime){const principal=this.runtime.principal(a.userId);if(!principal)throw new ConnectorError('ACTOR_REVOKED');this.localAuthority(principal,w.request);if(w.localGrant!==this.grantFingerprint(principal))throw new ConnectorError('LOCAL_GRANT_CHANGED');}return;}if(this.runtime&&!this.runtime.slackReady())throw new ConnectorError('SLACK_UNAVAILABLE');
     if(a.kind==='human'&&!s.allowedHumans.includes(a.userId))throw new ConnectorError('ACTOR_REVOKED');
     if(a.kind==='bot'&&!s.trustedBots.some(b=>b.userId===a.userId))throw new ConnectorError('ACTOR_REVOKED');
     if(![s.inputChannel,s.outputChannel].includes(a.channel))throw new ConnectorError('CHANNEL_REVOKED');
@@ -142,6 +202,7 @@ export class Connector {
   private validChannel(channel:string){return[this.config.slack.inputChannel,this.config.slack.outputChannel].includes(channel);}
   private originDestination(source?:Source){return source&&source.kind!=='local'&&this.validChannel(source.channel)&&this.validTimestamp(source.threadTs)?{channel:source.channel,threadTs:source.threadTs}:undefined;}
   private output(state:State,text:string,sessionId?:string,source?:Source){
+    if(this.runtime&&(source?.kind==='local'||!this.runtime.slackReady()))return;
     if(containsSensitiveContent(text))text='Sensitive-looking output withheld; inspect the original local Codex session. No credentials were sent.';
     const session=state.sessions.find(s=>s.id===sessionId&&this.authorizedSession(s));if(!session)sessionId=undefined;
     const origin=source?.kind!=='local'?source:undefined;
@@ -180,8 +241,8 @@ export class Connector {
   private within(root:string,cwd:string){const a=this.canonicalCwd(root),b=this.canonicalCwd(cwd);if(!a||!b)return false;const rel=relative(a,b);return rel===''||(!rel.startsWith('..'+sep)&&rel!=='..'&&!isAbsolute(rel));}
   private projectFor(cwd:string){return Object.entries(this.config.projects).find(([,root])=>this.within(root,cwd))?.[0];}
   private validCwd(cwd:unknown):cwd is string{return typeof cwd==='string'&&isAbsolute(cwd)&&!/[\x00-\x1f]/.test(cwd)&&!/[\\/]\.codex[\\/]sessions(?:[\\/]|$)/i.test(cwd);}
-  private authorizedSession(s:Session){const cwd=s.cwd||this.config.projects[s.project];return this.validChannel(s.channel)&&this.validCwd(cwd)&&(this.config.sessionPolicy?.allowAllSharedSessions===true||Boolean(this.projectFor(cwd)));}
-  private checkSessionThread(thread:any,s:Session){const cwd=s.cwd||this.config.projects[s.project];if(!this.authorizedSession(s)||!this.validCwd(thread?.cwd)||(this.canonicalCwd(thread.cwd)||resolve(thread.cwd))!==(this.canonicalCwd(cwd!)||resolve(cwd!)))throw new ConnectorError('THREAD_PROJECT_MISMATCH');}
+  private authorizedSession(s:Session){const cwd=s.cwd||this.config.projects[s.project];return (this.validChannel(s.channel)||Boolean(this.runtime&&!s.channel&&s.localOwners?.length))&&this.validCwd(cwd)&&(this.config.sessionPolicy?.allowAllSharedSessions===true||Boolean(this.projectFor(cwd)));}
+  private checkSessionThread(thread:any,s:Session){const cwd=s.cwd||this.config.projects[s.project];if(thread?.id!==s.threadId||!this.authorizedSession(s)||!this.validCwd(thread?.cwd)||(this.canonicalCwd(thread.cwd)||resolve(thread.cwd))!==(this.canonicalCwd(cwd!)||resolve(cwd!)))throw new ConnectorError('THREAD_PROJECT_MISMATCH');}
   private project(alias:unknown){if(typeof alias!=='string'||!Object.hasOwn(this.config.projects,alias))throw new ConnectorError('PROJECT_NOT_ALLOWED');return this.config.projects[alias]!;}
   private checkProject(thread:any,alias:string){if(!this.validCwd(thread?.cwd)||!this.within(this.project(alias),thread.cwd))throw new ConnectorError('THREAD_PROJECT_MISMATCH');}
   private async metadata(s:Session){const r=await this.backend.rpc('thread/read',{threadId:s.threadId,includeTurns:false});this.checkSessionThread(r.thread,s);return r.thread;}
@@ -234,7 +295,7 @@ export class Connector {
   }
   private async messageDelivery(w:Work,s:Session){
     const p=w.request.params as any,original=this.store.state.work.find(x=>x.id===p.workId&&x.request.params.sessionId===s.id&&['session.send','session.queue'].includes(x.request.command));
-    if(!original||(w.source.kind!=='local'&&(original.source.kind!==w.source.kind||original.source.userId!==w.source.userId||original.source.channel!==w.source.channel||original.source.threadTs!==w.source.threadTs)))throw new ConnectorError('DELIVERY_NOT_FOUND');
+    if(!original||(this.runtime&&w.source.kind==='local'&&(original.source.kind!=='local'||original.source.userId!==w.source.userId))||(w.source.kind!=='local'&&(original.source.kind!==w.source.kind||original.source.userId!==w.source.userId||original.source.channel!==w.source.channel||original.source.threadTs!==w.source.threadTs)))throw new ConnectorError('DELIVERY_NOT_FOUND');
     const coverage:any={mode:p.refresh===false?'cached':'bounded-readback',queue:'not-read',items:'not-read',turns:'not-read',errors:[]};
     if(p.refresh!==false&&original.messageDelivery){
       const epoch=this.backend.epoch;
@@ -291,6 +352,7 @@ export class Connector {
   }
   private async execute(w:Work):Promise<any>{
     const p=w.request.params as any,c=w.request.command;
+    if(c==='server.list')return this.runtime?.servers(w.source)??[];
     if(c==='session.search')return this.searchSessions(w,p);
     if(c==='session.overview')return this.content.overview(p.threadIds,p.maxChars);
     if(c==='session.messages')return this.content.messages(p);
@@ -321,18 +383,37 @@ export class Connector {
     if(c==='approval.list')return this.store.state.pending.filter(r=>r.status==='pending'&&(!p.sessionId||r.sessionId===p.sessionId)).map(({rpcId,details,...r})=>r);
     if(decisionCommands.has(c))return this.answer(w);
     if(c==='session.recent')return this.recent.query(p.limit);
+    if(c==='session.list'&&this.runtime&&w.source.kind==='local'){
+      const principal=this.runtime.principal(w.source.userId)!;return this.list(p, Object.keys(this.config.projects).filter(a=>this.localProject(principal,a)),principal.id);
+    }
     if(c==='session.list')return this.list(w.source.kind==='local'?p:{...p,view:p.view||'loaded',limit:Math.min(p.limit||10,10)});
     if(c==='session.create'||c==='session.attach')return this.attachOrCreate(p,c==='session.create',w.source);
     if(!boundCommands.has(c))throw new ConnectorError('UNKNOWN_COMMAND');
     const s=this.session(p.sessionId);
+    if(this.runtime&&w.source.kind!=='local'&&!s.channel)throw new ConnectorError('SLACK_EXPLICIT_BINDING_REQUIRED');
     if(c==='session.delivery')return this.messageDelivery(w,s);
-    if(c==='session.reply'){this.store.transaction(state=>this.sessionText(state,p.text,s.id,w.source));return{sessionId:s.id,queued:true};}
-    if(c==='session.info'){const meta=await this.metadata(s);const turns=await this.backend.rpc('thread/turns/list',{threadId:s.threadId,limit:3,itemsView:'summary',sortDirection:'desc'});return{sessionId:s.id,threadId:s.threadId,outputThread:s.threadTs||null,attached:this.attached.has(s.threadId),...this.threadSummary(meta),recentTurns:(turns.data||[]).map((t:any)=>({id:t.id,status:t.status}))};}
+    if(c==='session.reply'){if(this.runtime&&(!s.channel||!this.runtime.slackReady()))throw new ConnectorError('SLACK_EXPLICIT_BINDING_UNAVAILABLE');this.store.transaction(state=>this.sessionText(state,p.text,s.id,w.source.kind==='local'&&this.runtime?undefined:w.source));return{sessionId:s.id,queued:true};}
+    if(c==='session.info'){const meta=await this.metadata(s);const turns=await this.backend.rpc('thread/turns/list',{threadId:s.threadId,limit:3,itemsView:'summary',sortDirection:'desc'});return{sessionId:s.id,threadId:s.threadId,outputThread:w.source.kind==='local'&&this.runtime?null:s.threadTs||null,attached:this.attached.has(s.threadId),...this.threadSummary(meta),recentTurns:(turns.data||[]).map((t:any)=>({id:t.id,status:t.status}))};}
     if(c==='session.history'){
-      await this.metadata(s);const r=await this.backend.rpc('thread/items/list',{threadId:s.threadId,limit:p.limit||20,cursor:p.cursor,sortDirection:'desc'});
-      return{items:(r.data||[]).filter((e:any)=>['userMessage','agentMessage'].includes((e.item||e).type)).map((e:any)=>{const item=e.item||e;const text=item.type==='agentMessage'?String(item.text||''):Array.isArray(item.content)?item.content.filter((c:any)=>c.type==='text').map((c:any)=>c.text).join('\n'):'';return{turnId:e.turnId,type:item.type,text:text.slice(0,2000),truncated:text.length>2000};}),nextCursor:r.nextCursor||null,note:'Only user/assistant text; raw tool output and reasoning withheld'};
+      await this.metadata(s);
+      const principal=this.runtime&&w.source.kind==='local'?this.runtime.principal(w.source.userId):undefined;
+      const identity=this.runtime?stable([this.runtime.id,s.id,s.threadId,w.source.kind,w.source.userId,w.source.channel,w.source.threadTs,principal?this.grantFingerprint(principal):null]):'';
+      const scopeKey=identity&&createHash('sha256').update(identity).digest('hex');
+      let cursor=p.cursor;
+      if(cursor&&this.runtime){try{const [bound,native]=JSON.parse(Buffer.from(cursor,'base64url').toString());if(bound!==scopeKey||typeof native!=='string'||!native||native.length>1024)throw Error();cursor=native;}catch{throw new ConnectorError('INVALID_CURSOR');}}
+      const r=await this.backend.rpc('thread/items/list',{threadId:s.threadId,limit:p.limit||20,cursor,sortDirection:'desc'});
+      if(!Array.isArray(r?.data)||r.data.length>(p.limit||20)||(r.nextCursor!=null&&(typeof r.nextCursor!=='string'||!r.nextCursor||r.nextCursor===cursor||r.nextCursor.length>1024)))throw new ConnectorError('INVALID_SESSION_PAGE');
+      const next=this.runtime&&r.nextCursor?Buffer.from(JSON.stringify([scopeKey,r.nextCursor])).toString('base64url'):r.nextCursor||null;
+      // A project-level history grant authorizes discovery, not broadcasting other
+      // principals' turns from a session deliberately bound to multiple entries.
+      const shared=principal?.role==='agent'&&(!!s.channel||(s.localOwners?.length??0)>1);
+      const mine=(turnId:unknown)=>{const evidence=this.store.state.work.filter(x=>typeof turnId==='string'&&x.messageDelivery?.threadId===s.threadId&&x.messageDelivery?.turnId===turnId);return evidence.length>0&&evidence.every(x=>x.source.kind==='local'&&x.source.userId===principal!.id&&this.usableEvidence(x));};
+      return{items:r.data.filter((e:any)=>(!shared||mine(e.turnId))&&['userMessage','agentMessage'].includes((e.item||e).type)).map((e:any)=>{const item=e.item||e;const text=item.type==='agentMessage'?String(item.text||''):Array.isArray(item.content)?item.content.filter((c:any)=>c.type==='text').map((c:any)=>c.text).join('\n'):'';return{turnId:e.turnId,type:item.type,text:containsSensitiveContent(text)?'[sensitive text withheld]':text.slice(0,2000),truncated:text.length>2000};}),nextCursor:next,note:'Only user/assistant text; raw tool output and reasoning withheld'};
     }
     const t=await this.direct(s);
+    if(this.runtime&&s.localOwners?.length&&(s.channel||s.localOwners.length>1)&&['session.interrupt','session.steer'].includes(c)){
+      const rows=this.turnEvidence(s,p.turnId);if(!rows.length||!rows.every(row=>this.usableEvidence(row)&&this.samePrincipal(row.source,w.source)))throw new ConnectorError('TURN_OWNER_UNVERIFIED');
+    }
     if(c==='session.interrupt')return this.backend.rpc('turn/interrupt',{threadId:s.threadId,turnId:p.turnId});
     const input=[{type:'text',text:p.text}];
     if(c==='session.steer')return this.backend.rpc('turn/steer',{threadId:s.threadId,expectedTurnId:p.turnId,input,clientUserMessageId:w.id});
@@ -341,8 +422,8 @@ export class Connector {
     return this.submitMessage(w,s,true);
   }
   async sessionPage(params:unknown={}){if(!params||typeof params!=='object'||Array.isArray(params)||Object.keys(params).some(k=>!['limit','cursor','view'].includes(k)))throw new ConnectorError('INVALID_SESSION_QUERY');return this.list(validateCommand('session.list',params));}
-  private async list(p:any){
-    const view=p.view||'all',project=p.project||null,roots=project?[this.project(project)]:undefined,limit=p.limit||50;
+  private async list(p:any,allowedProjects?:string[],scope?:string){
+    const view=p.view||'all',project=p.project||null,roots=project?[this.project(project)]:allowedProjects?.map(a=>this.project(a)),limit=p.limit||50;
     type Cursor={v?:number;view?:string;project?:string|null;stored?:string;loaded?:string;storedDone?:boolean;loadedDone?:boolean};
     let cursor:Cursor={};
     const validBackendCursor=(value:unknown)=>typeof value==='string'&&value.length>0&&value.length<=512&&!/[\x00-\x1f]/.test(value);
@@ -350,11 +431,12 @@ export class Connector {
       if(typeof p.cursor!=='string'||p.cursor.length>2048||!/^[A-Za-z0-9_-]+$/.test(p.cursor))throw Error();
       cursor=JSON.parse(Buffer.from(p.cursor,'base64url').toString());
       if(!cursor||Array.isArray(cursor)||typeof cursor!=='object'||['storedDone','loadedDone'].some(k=>(cursor as any)[k]!==undefined&&typeof(cursor as any)[k]!=='boolean')||['stored','loaded'].some(k=>(cursor as any)[k]!==undefined&&!validBackendCursor((cursor as any)[k])))throw Error();
+      if(this.runtime&&(cursor as any).server!==this.runtime.id||((cursor as any).scope??undefined)!==scope)throw Error();
       if(cursor.v===undefined){
         // Old desktop cursors did not carry filter context. Never reinterpret them under a filter.
-        if(view!=='all'||project!==null||Object.keys(cursor).some(k=>!['stored','loaded','storedDone','loadedDone'].includes(k)))throw Error();
+        if(view!=='all'||project!==null||Object.keys(cursor).some(k=>!['stored','loaded','storedDone','loadedDone','scope','server'].includes(k)))throw Error();
       }else{
-        if(cursor.v!==2||cursor.view!==view||cursor.project!==project||Object.keys(cursor).some(k=>!['v','view','project','stored','loaded','storedDone','loadedDone'].includes(k))||typeof cursor.storedDone!=='boolean'||typeof cursor.loadedDone!=='boolean')throw Error();
+        if(cursor.v!==2||cursor.view!==view||cursor.project!==project||Object.keys(cursor).some(k=>!['v','view','project','stored','loaded','storedDone','loadedDone','scope','server'].includes(k))||typeof cursor.storedDone!=='boolean'||typeof cursor.loadedDone!=='boolean')throw Error();
         if(cursor.storedDone===Boolean(cursor.stored)||cursor.loadedDone===Boolean(cursor.loaded))throw Error();
         if((view==='loaded'||view==='active')&&!cursor.storedDone||view==='history'&&!cursor.loadedDone)throw Error();
       }
@@ -381,34 +463,57 @@ export class Connector {
         if(view!=='active'&&(!roots||previous))byId.set(id,{thread:previous?.thread||{id},loaded:true,sources,unavailable:true});
       }
     }
-    const next=stored.nextCursor||loaded.nextCursor?Buffer.from(JSON.stringify({v:2,view,project,stored:stored.nextCursor||undefined,loaded:loaded.nextCursor||undefined,storedDone:!stored.nextCursor,loadedDone:!loaded.nextCursor})).toString('base64url'):null;
+    const next=stored.nextCursor||loaded.nextCursor?Buffer.from(JSON.stringify({v:2,view,project,scope,server:this.runtime?.id,stored:stored.nextCursor||undefined,loaded:loaded.nextCursor||undefined,storedDone:!stored.nextCursor,loadedDone:!loaded.nextCursor})).toString('base64url'):null;
     if(next&&next.length>2048)throw new ConnectorError('INVALID_SESSION_PAGE');
     const sessions=[...byId.values()].map(row=>{
       const summary=this.threadSummary(row.thread),binding=this.store.state.sessions.find(s=>s.threadId===summary.id&&this.authorizedSession(s));
-      return{...summary,...(row.unavailable?{manageable:null,reason:'METADATA_UNAVAILABLE',canAcceptDirectInput:null,status:{type:'unknown'}}:{}),loaded:row.loaded,discoverySources:row.sources,binding:binding?{channel:binding.channel,threadTs:binding.threadTs}:null};
+      return{...summary,...(scope!==undefined&&!binding?.localOwners?.includes(scope)?{connectorSessionId:null}:{}),...(row.unavailable?{manageable:null,reason:'METADATA_UNAVAILABLE',canAcceptDirectInput:null,status:{type:'unknown'}}:{}),loaded:row.loaded,discoverySources:row.sources,binding:binding&&scope===undefined?{channel:binding.channel,threadTs:binding.threadTs}:null};
     });
     const sources=view==='all'?'Current shared-daemon loaded IDs plus indexed interactive history (default thread/list sources)':view==='history'?'Indexed interactive history (default thread/list sources)':view==='active'?'Current shared-daemon loaded IDs with freshly read active status':'Current shared-daemon loaded IDs';
-    return{sessions,nextCursor:next,project,unresolvedLoadedIds,pageLimitPerSource:limit,view,returnedCount:sessions.length,scanned:{loaded:loaded.data.length,history:stored.data.length},unknownLoadedCount:unknownLoadedIds.size,hasMore:next!==null,scope:`${sources}; one bounded page per selected source, not a global session count or complete enumeration. Filters may return an empty page with a continuation cursor. Stored-only rows do not prove unloaded status. Metadata failures remain unknown. No resume, content preload, filesystem history scan, or control-policy filtering. Separate CODEX_HOME, standalone --no-daemon and other servers are not guaranteed visible.`};
+    return{sessions,nextCursor:next,project,unresolvedLoadedIds:allowedProjects?[]:unresolvedLoadedIds,pageLimitPerSource:limit,view,returnedCount:sessions.length,scanned:{loaded:loaded.data.length,history:stored.data.length},unknownLoadedCount:unknownLoadedIds.size,hasMore:next!==null,scope:`${sources}; one bounded page per selected source, not a global session count or complete enumeration. Filters may return an empty page with a continuation cursor. Stored-only rows do not prove unloaded status. Metadata failures remain unknown. No resume, content preload, filesystem history scan, or control-policy filtering. Separate CODEX_HOME, standalone --no-daemon and other servers are not guaranteed visible.`};
   }
 
   private async attachOrCreate(p:any,create:boolean,source:Source){
     if(source.kind!=='local'&&p.outputThreadTs)throw new ConnectorError('SLACK_ORIGIN_REQUIRED');
     let destination=this.originDestination(source);
     if(source.kind==='local'&&p.outputThreadTs){let exists=false;try{exists=await this.slack.threadExists(this.config.slack.outputChannel,p.outputThreadTs);}catch{}if(!exists)throw new ConnectorError('THREAD_DESTINATION_UNVERIFIED');destination={channel:this.config.slack.outputChannel,threadTs:p.outputThreadTs};}
-    if(create&&!destination)throw new ConnectorError('THREAD_DESTINATION_REQUIRED');
+    if(create&&!destination&&!(this.runtime&&source.kind==='local'))throw new ConnectorError('THREAD_DESTINATION_REQUIRED');
     let thread:any;let alias:string;
     if(create){const cwd=this.project(p.project);thread=(await this.backend.rpc('thread/start',{cwd})).thread;this.checkProject(thread,p.project);alias=p.project;}
     else{thread=(await this.backend.rpc('thread/read',{threadId:p.threadId,includeTurns:false})).thread;if(!this.validCwd(thread?.cwd))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');if(p.project){this.checkProject(thread,p.project);alias=p.project;}else{const known=this.projectFor(thread.cwd);if(!known&&!this.config.sessionPolicy?.allowAllSharedSessions)throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');alias=known||'@shared';}}
+    if(!thread?.id||(!create&&p.threadId!==thread.id))throw new ConnectorError('INVALID_THREAD_METADATA');
+    if(this.runtime&&source.kind==='local'&&!this.localProject(this.runtime.principal(source.userId)!,alias))throw new ConnectorError('LOCAL_SCOPE_DENIED');
     let s=this.store.state.sessions.find(s=>s.threadId===thread.id);
-    if(s&&!this.authorizedSession(s))throw new ConnectorError('SESSION_SCOPE_REVOKED');
-    if(!s){if(!destination)throw new ConnectorError('THREAD_DESTINATION_REQUIRED');s={id:randomUUID(),threadId:thread.id,project:alias,cwd:thread.cwd,channel:destination.channel,threadTs:destination.threadTs,createdAt:new Date().toISOString()};const saved=s;this.store.transaction(state=>{state.sessions.push(saved);this.output(state,`Codex session ${saved.id}\nThread ${saved.threadId}\nProject ${saved.project}\n${p.title||''}`,saved.id);});}
-    if(!create)thread=(await this.backend.rpc('thread/resume',{threadId:thread.id,excludeTurns:true})).thread;
-    this.attached.add(thread.id);this.flush();return{sessionId:s.id,threadId:thread.id,canAcceptDirectInput:thread.canAcceptDirectInput??null,status:thread.status,outputChannel:s.channel,outputThread:s.threadTs,observation:{attachCreatesSubscription:false,note:'Control binding only; attach does not subscribe to commentary or partial answers (including ordinary questions). Use session.subscribe in the desired Slack thread, then session.subscriptions to check status. Existing explicit subscriptions and cancellation remain unchanged.',subscribe:{command:'session.subscribe',params:{threadId:thread.id}}}};
+    if(s){this.checkSessionThread(thread,s);if(this.runtime&&source.kind==='local'&&(s.project!==alias||!s.cwd||!this.within(this.config.projects[alias]!,s.cwd)))throw new ConnectorError('LOCAL_SCOPE_DENIED');}
+    if(!create){
+      const initial=thread;thread=(await this.backend.rpc('thread/resume',{threadId:initial.id,excludeTurns:true})).thread;
+      if(thread?.id!==initial.id||this.canonicalCwd(thread?.cwd)!==this.canonicalCwd(initial.cwd))throw new ConnectorError('THREAD_PROJECT_MISMATCH');
+    }
+    if(!s){
+      if(!destination&&!this.runtime)throw new ConnectorError('THREAD_DESTINATION_REQUIRED');
+      s={id:randomUUID(),threadId:thread.id,project:alias,cwd:thread.cwd,channel:destination?.channel||'',threadTs:destination?.threadTs,createdAt:new Date().toISOString(),...(this.runtime&&source.kind==='local'?{localOwners:[source.userId]}:{})};
+      const saved=s;this.store.transaction(state=>{state.sessions.push(saved);if(destination)this.output(state,`Codex session ${saved.id}\nThread ${saved.threadId}\nProject ${saved.project}\n${p.title||''}`,saved.id);});
+    }else if(this.runtime){
+      const id=s.id;this.store.transaction(state=>{const row=state.sessions.find(x=>x.id===id)!;if(source.kind==='local'&&!row.localOwners?.includes(source.userId))(row.localOwners??=[]).push(source.userId);if(destination&&!row.channel){row.channel=destination.channel;row.threadTs=destination.threadTs;}});s=this.session(id);
+    }
+    this.attached.add(thread.id);this.flush();return{sessionId:s.id,threadId:thread.id,canAcceptDirectInput:thread.canAcceptDirectInput??null,status:thread.status,outputChannel:this.runtime&&source.kind==='local'&&!destination?null:s.channel,outputThread:this.runtime&&source.kind==='local'&&!destination?null:s.threadTs,observation:{attachCreatesSubscription:false,note:'Control binding only; attach does not subscribe to commentary or partial answers (including ordinary questions). Use session.subscribe in the desired Slack thread, then session.subscriptions to check status. Existing explicit subscriptions and cancellation remain unchanged.',subscribe:{command:'session.subscribe',params:{threadId:thread.id}}}};
   }
   private async notification(method:string,p:any,epoch:string){
     if(epoch!==this.backend.epoch||!this.backend.connected)return;
     if(['turn/started','turn/completed','item/started','item/completed'].includes(method)){const activity=recordActivity(this.store.state.activity,method,p,Date.now());if(activity)this.store.transaction(s=>{s.activity=activity;});}
     if(['turn/started','turn/completed','item/started','item/completed'].includes(method))this.observeDelivery(method,p);
+    if(this.localEvents){
+      this.localEvents.observe(method,p,epoch);
+      if(!this.runtime!.slackReady())return;
+      if(method!=='serverRequest/resolved'){
+        const session=this.store.state.sessions.find(s=>s.threadId===p.threadId&&s.localOwners?.length);
+        if(session){
+          const source=this.slackTurnSource(session,p.turnId||p.turn?.id);
+          if(source)this.dualNotice(method,p,session,source);
+          return;
+        }
+      }
+    }
     if(method==='serverRequest/resolved'){
       this.store.transaction(s=>{for(const r of s.pending)if(r.epoch===epoch&&r.rpcId===p.requestId&&['pending','responding','local-required'].includes(r.status))r.status='resolved';});return;
     }
@@ -442,15 +547,43 @@ export class Connector {
     }
     if(method==='error'&&p.willRetry===false){this.store.transaction(state=>this.subscriptions.emit(state,`Session ${p.threadId}; turn ${p.turnId||'unknown'}: execution error. Inspect the original local session.`,p.threadId,`error:${p.threadId}:${p.turnId}`));this.flush();}
   }
+  private samePrincipal(a:Source,b:Source){return a.kind===b.kind&&a.userId===b.userId&&a.channel===b.channel&&a.threadTs===b.threadTs;}
+  private turnEvidence(session:Session,turnId:unknown){
+    return typeof turnId==='string'?this.store.state.work.filter(w=>w.messageDelivery?.threadId===session.threadId&&w.messageDelivery?.turnId===turnId):[];
+  }
+  private usableEvidence(w:Work){return !w.messageDelivery?.correlationConflict&&!(w as Work & {localEventMixedInput?:true}).localEventMixedInput;}
+  private slackTurnSource(session:Session,turnId:unknown):Source|undefined{
+    if(!session.channel||!this.authorizedSession(session))return;
+    const works=this.turnEvidence(session,turnId),a=works[0]?.source;
+    if(!a||a.kind==='local'||!works.every(w=>this.samePrincipal(w.source,a)&&this.usableEvidence(w)))return;
+    try{this.subscriptionActor(a);return a;}catch{return;}
+  }
+  private dualNotice(method:string,p:any,s:Session,a:Source){
+    const turn=p.turnId||p.turn?.id;
+    let key:string|undefined,text:string|undefined;
+    if(method==='item/completed'&&p.item?.type==='agentMessage'&&(!p.item.phase||p.item.phase==='final_answer')&&typeof p.item.text==='string'&&typeof p.item.id==='string'){key=JSON.stringify(['dual-final',s.id,turn,p.item.id]);text=p.item.text;}
+    if(method==='turn/completed'&&terminalExecution(p.turn?.status)){
+      this.store.transaction(st=>{for(const r of st.pending)if(r.threadId===s.threadId&&r.turnId===turn&&['pending','local-required'].includes(r.status))r.status='stale';});
+      key=JSON.stringify(['dual-turn',s.id,turn,p.turn.status]);text='Session '+s.threadId+'; turn '+turn+': '+p.turn.status+'.';
+    }
+    if(!key||!text)return;
+    this.store.transaction(st=>{if(Object.hasOwn(st.seenNotifications,key!))return;this.sessionText(st,text!,s.id,a);st.seenNotifications[key!]=true;});this.flush();
+  }
   private async serverRequest(r:any){
     if(r.epoch!==this.backend.epoch||!this.backend.connected||!['string','number'].includes(typeof r.id))return;
+    this.localEvents?.observeRequest(r);
+    if(this.runtime&&!this.runtime.slackReady())return;
+    const dual=this.runtime&&this.store.state.sessions.find(s=>s.threadId===r.params?.threadId&&s.localOwners?.length);
+    if(dual){const a=this.slackTurnSource(dual,r.params?.turnId);if(!a)return;
+      if(a.channel!==dual.channel||a.threadTs!==dual.threadTs){const key=JSON.stringify(['dual-decision',r.epoch,r.id]);this.store.transaction(st=>{if(!Object.hasOwn(st.seenNotifications,key)){this.output(st,'LOCAL_ACTION_REQUIRED: use the original Codex UI for this decision.',dual.id,a);st.seenNotifications[key]=true;}});this.flush();return;}
+    }
     const previous=this.store.state.pending.find(p=>p.rpcId===r.id&&p.epoch===r.epoch);
     // Check lifecycle before either route: even the fixed observer notice must not
     // resurrect a closed request while a destination is catching up after joining.
     if(previous&&(!['pending','local-required'].includes(previous.status)||previous.expiresAt<=Date.now()||
       previous.threadId!==r.params?.threadId||previous.turnId!==(r.params?.turnId||'unavailable')||previous.method!==r.method))return;
     const s=this.store.state.sessions.find(s=>s.threadId===r.params?.threadId&&this.authorizedSession(s));
-    this.store.transaction(state=>this.subscriptions.emit(state,`Session ${r.params?.threadId}; turn ${r.params?.turnId||'unknown'}: local decision/input required. Use the original local Codex UI or its authorized bound approval thread. This observation does not grant approval authority.`,r.params?.threadId,`request:${r.epoch}:${r.id}`,sub=>!s||sub.owner.channel!==s.channel||sub.owner.threadTs!==s.threadTs));this.flush();
+    if(!dual)this.store.transaction(state=>this.subscriptions.emit(state,`Session ${r.params?.threadId}; turn ${r.params?.turnId||'unknown'}: local decision/input required. Use the original local Codex UI or its authorized bound approval thread. This observation does not grant approval authority.`,r.params?.threadId,`request:${r.epoch}:${r.id}`,sub=>!s||sub.owner.channel!==s.channel||sub.owner.threadTs!==s.threadTs));this.flush();
     if(!s)return;
     if(previous){
       if(previous.threadId===s.threadId&&previous.sessionId===s.id&&['pending','local-required'].includes(previous.status)&&previous.expiresAt>Date.now())this.store.transaction(state=>this.boundNotice(state,this.requestNotice(previous),s,false,`request:${r.epoch}:${r.id}`));
@@ -475,6 +608,7 @@ export class Connector {
   private prompt(p:Pending){
     const params:any={requestId:p.id,epoch:p.epoch,sessionId:p.sessionId,turnId:p.turnId};
     if(p.kind==='input')params.answers=Object.fromEntries((p.details.questions||[]).map((q:any)=>[q.id,['YOUR ANSWER']]));else params.decision='decline';
+    if(this.runtime)params.serverId=this.runtime.id;
     const sample={v:1,id:randomUUID(),target:this.config.instanceId,command:p.kind==='input'?'input.respond':'approval.respond',params};
     return `Human decision required (expires ${new Date(p.expiresAt).toISOString()}). Exact scope only; no session/global grant.\n${short(p.details,16000)}\nReply in THIS thread as an authorized human with:\n${START_MARKER}\n${JSON.stringify(sample)}\n${END_MARKER}`;
   }
@@ -511,7 +645,7 @@ export class Connector {
     return{requestId:pending.id,status:'submitted; awaiting server resolution notification'};
   }
   private disconnected(epoch:string){
-    this.attached.clear();this.items.clear();this.deliveryTurns.clear();this.store.transaction(s=>{for(const w of s.work)if(w.messageDelivery)w.messageDelivery.observationGap=true;for(const p of s.pending)if(p.epoch===epoch&&['pending','responding'].includes(p.status))p.status='stale';});
+    this.localEvents?.markDisconnected();this.attached.clear();this.items.clear();this.deliveryTurns.clear();this.store.transaction(s=>{for(const w of s.work)if(w.messageDelivery)w.messageDelivery.observationGap=true;for(const p of s.pending)if(p.epoch===epoch&&['pending','responding'].includes(p.status))p.status='stale';});
   }
   async expire(){
     if(this.store.state.results?.some(r=>r.expiresAt<=Date.now()))this.store.transaction(s=>{s.results=(s.results||[]).filter(r=>r.expiresAt>Date.now());});
@@ -521,13 +655,13 @@ export class Connector {
     }
     this.flush();
   }
-  flush(){if(this.closing||this.delivering)return;try{this.store.assertHealthy();}catch{return;}this.delivering=this.deliver().catch(()=>{}).finally(()=>{this.delivering=undefined;if(!this.closing&&this.nextDelivery())queueMicrotask(()=>this.flush());});}
+  flush(){if(this.closing||this.delivering||this.runtime&&!this.runtime.slackReady())return;try{this.store.assertHealthy();}catch{return;}this.delivering=this.deliver().catch(()=>{}).finally(()=>{this.delivering=undefined;if(!this.closing&&this.nextDelivery())queueMicrotask(()=>this.flush());});}
   private deliveryLane(o:Delivery,state:Readonly<State>){return `${o.channel}:${o.threadTs||state.sessions.find(s=>s.id===o.sessionId)?.threadTs||'missing'}`;}
   private nextDelivery(){
     const state=this.store.state;return state.outbox.find((o,index)=>o.status==='queued'&&o.nextAttemptAt<=Date.now()&&(!o.subscriptionId||!this.subscriptions.deliveryWaiting(o.subscriptionId))&&!state.outbox.slice(0,index).some(earlier=>this.deliveryLane(earlier,state)===this.deliveryLane(o,state)&&!['sent','failed'].includes(earlier.status)));
   }
   private async deliver(){
-    while(!this.closing){
+    while(!this.closing&&(!this.runtime||this.runtime.slackReady())){
       const state=this.store.state,dot=state.dot;if(!dot)return;
       const next=this.nextDelivery();if(!next)return;
       const session=next.sessionId?state.sessions.find(s=>s.id===next.sessionId):undefined;
@@ -538,7 +672,7 @@ export class Connector {
       if(session&&!this.authorizedSession(session))invalid=true;
       if(invalid){this.store.transaction(s=>{const o=s.outbox.find(o=>o.id===next.id)!;o.status='failed';o.error='THREAD_DESTINATION_INVALID_OR_REVOKED';});continue;}
       await new Promise(r=>setTimeout(r,Math.max(0,this.lastPost+this.postIntervalMs-Date.now())));
-      const current=this.store.state.outbox.find(o=>o.id===next.id);if(!current||current.status!=='queued')continue;
+      if(this.runtime&&!this.runtime.slackReady())return;const current=this.store.state.outbox.find(o=>o.id===next.id);if(!current||current.status!=='queued')continue;
       if(current.subscriptionId&&this.subscriptions.deliveryWaiting(current.subscriptionId))continue;
       if(current.subscriptionId&&!this.subscriptions.deliveryAllowed(current.subscriptionId)||current.notificationThreadId&&!current.subscriptionId&&this.subscriptions.hasExplicitDestination(current.notificationThreadId,current.channel,current.threadTs||'')){this.store.transaction(s=>{const o=s.outbox.find(x=>x.id===next.id)!;o.status='failed';o.error='SUBSCRIPTION_CANCELLED_OR_REVOKED';});continue;}
       this.store.transaction(s=>{const o=s.outbox.find(o=>o.id===next.id)!;o.status='sending';o.attempts++;});
@@ -550,7 +684,7 @@ export class Connector {
       }
     }
   }
-  status(){const s=this.store.state;return{capabilities:this.capabilities(),sessions:s.sessions,work:s.work.map(w=>{const {request,source,...safe}=w;return{...safe,command:request.command,...(['session.send','session.queue'].includes(request.command)?{commandStatus:w.status,deliveryStatus:deliveryStatus(w)}:{})};}),outbox:s.outbox.map(({text,...o})=>o),pending:s.pending.map(({details,rpcId,...p})=>p)};}
+  status(){const s=this.store.state;return{capabilities:this.capabilities(),sessions:s.sessions,work:s.work.map(w=>{const {request,source,localResult,localGrant,...safe}=w;return{...safe,command:request.command,...(['session.send','session.queue'].includes(request.command)?{commandStatus:w.status,deliveryStatus:deliveryStatus(w)}:{})};}),outbox:s.outbox.map(({text,...o})=>o),pending:s.pending.map(({details,rpcId,...p})=>p)};}
   recover(kind:'command'|'outbox',id:string,observedTs?:string){
     this.store.transaction(s=>{
       if(kind==='command'){const w=s.work.find(w=>w.id===id);if(!w||w.status!=='uncertain')throw new ConnectorError('NOT_UNCERTAIN');w.status='failed';w.error='Locally reviewed; not replayed';}
