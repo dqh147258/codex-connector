@@ -11,7 +11,8 @@ import { DesktopScreens, type ScreenAPI } from '../desktop/screens.js';
 import { ScreenError, validateScreenImages, type ScreenPort } from '../src/screens.js';
 import { desktopScreenPort } from '../src/screen-ipc.js';
 import { parseConfig } from '../src/config.js';
-import { DesktopSettings } from '../desktop/settings.js';
+import { DesktopConfigDrafts, DesktopSettings } from '../desktop/settings.js';
+import { configuredServers } from '../src/servers.js';
 import { Connector } from '../src/connector.js';
 import { SlackClient } from '../src/slack.js';
 import { validateCommand } from '../src/protocol.js';
@@ -147,9 +148,12 @@ test('native settings opt-in prompts once, cancellation never saves, unchanged t
     const source=readFileSync('desktop/main.ts','utf8'),start=source.indexOf('saveConfig:async value=>')+'saveConfig:'.length,end=source.indexOf(',\n  saveCredentials:',start);
     let saved=0,asked=0,cancel=true,previous:any={...f.config,screenPolicy:{enabled:false}};
     const connection=new DesktopConnection({snapshot:()=>({state:'stopped',owned:false}),stop:async()=>({state:'stopped',owned:false})},()=>({state:'starting',owned:true}),()=>false);
-    const handler=runInNewContext('('+source.slice(start,end)+')',{connection,settings:{readConfig:()=>previous,prepareConfig:()=>()=>{saved++;}},snapshot:()=>({}),confirm:async(title:string,message:string)=>{asked++;assert.match(title,/截图/);assert.match(message,/密码/);assert.match(message,/无需逐次/);if(cancel)throw Error('CANCELLED');}});
-    const next={...f.config,screenPolicy:{enabled:true}};await assert.rejects(handler(next),/CANCELLED/);assert.equal(saved,0);
-    cancel=false;await handler(next);assert.equal(saved,1);previous=next;await handler(next);assert.equal(saved,2);assert.equal(asked,2);
+    const draftConfig=new DesktopConfigDrafts();
+    const handler=runInNewContext('('+source.slice(start,end)+')',{connection,draftConfig,configuredServers,settings:{readConfig:()=>previous,prepareConfig:()=>()=>{saved++;}},snapshot:()=>({}),confirm:async(title:string,message:string)=>{asked++;assert.match(title,/截图/);assert.match(message,/密码/);assert.match(message,/无需逐次/);if(cancel)throw Error('CANCELLED');}});
+    const next={...f.config,screenPolicy:{enabled:true}};
+    const save=()=>handler({config:next,configDraftId:draftConfig.snapshot(previous).configDraftId});
+    await assert.rejects(save(),/CANCELLED/);assert.equal(saved,0);
+    cancel=false;await save();assert.equal(saved,1);previous=next;await save();assert.equal(saved,2);assert.equal(asked,2);
   }finally{await f.cleanup();}
 });
 class DesktopChild extends EventEmitter{stdout=new EventEmitter();stderr=new EventEmitter();connected=true;sent:any[]=[];send(m:any,cb?:()=>void){this.sent.push(m);cb?.();}}

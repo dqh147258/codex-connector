@@ -154,6 +154,20 @@ prelogin plist 应由管理员审查后安装至 `/Library/LaunchDaemons/local.c
 
 ## Windows（PowerShell，原生环境）
 
+### 先分清默认连接失败在哪一层
+
+仅在目标 Codex Desktop 的**同一普通登录账户**、同一环境、已核对的同一官方 CLI 下做只读对照，不提权或探测其他账户的端点。没有指定 Home 时，默认选择由那个账户中的官方 CLI 决定；另一账户即使也没设 `CODEX_HOME`，也不是在验证同一个默认端点。PowerShell 中可以先用以下命令记录退出码，不需要复制原始输出：
+
+```powershell
+& $CodexExe app-server daemon version *> $null
+$LASTEXITCODE
+```
+
+- 如果同一个官方 `app-server proxy` 已在 OS `connect` 阶段返回 10050、尚无协议字节，这是默认目标的连接失败，**不是** WebSocket 帧或 `initialize` 失败。候选状态可能表现为 `websocket-upgrade` 阶段 proxy 提前退出，不能单凭这个阶段标签判断 OS 原因。
+- 官方 proxy 接入后，WebSocket upgrade 及帧传输失败属于协议通道问题。收到连接响应后，`initialize` 失败与显式配置的 Home 对不上是另外两层；只有明确核对了配置的 Home，才报告 match/mismatch。不要输出真实 Home、socket、用户名或账户路径。
+- 同一 CLI 能接上自己创建的临时监听，只证明 proxy/AF_UNIX 并非普遍失效；不能证明 Desktop 暴露默认共享端点或正在使用哪个端点。无法确认时保持未验证，不切换账户或改安全设置，不启动替代 daemon。
+
+
 先检查 Node 与构建产物路径。以下生成 login task XML；`--user` 必填，使用与目标共享 Codex daemon 相同的实际账户。
 
 ```powershell

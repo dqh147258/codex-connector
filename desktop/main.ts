@@ -1,10 +1,11 @@
 import { DesktopScreens } from './screens.js';
 import { desktopCapturer, screen, systemPreferences, powerMonitor, app, BrowserWindow, ipcMain, dialog, safeStorage, shell, Tray, Menu, nativeImage, clipboard, session } from 'electron';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { DesktopSettings, importConfigPreview, inspectLock, recoverStaleLock } from './settings.js';
+import { DesktopConfigDrafts, DesktopSettings, importConfigPreview, inspectLock, recoverStaleLock } from './settings.js';
+import { configuredServers } from '../src/servers.js';
 import { SlackSetup } from './slack-setup.js';
 import { DesktopRuntime, probeCodex } from './runtime.js';
 import { DesktopConnection } from './connection.js';
@@ -12,7 +13,7 @@ import { readLoginState, updateLoginState } from './login.js';
 import { safeError, strictObject, textField, validSender, sessionListParams } from './ipc-policy.js';
 let window:BrowserWindow|undefined,tray:Tray|undefined,quitting=false,shutdownRequested=false,quitTask:Promise<void>|undefined;
 let settings:DesktopSettings,runtime:DesktopRuntime,connection:DesktopConnection;
-const slack=new SlackSetup();
+const slack=new SlackSetup(), draftConfig=new DesktopConfigDrafts();
 const root=app.getAppPath(),uiPath=join(root,'desktop/ui/index.html'),uiUrl=pathToFileURL(uiPath).href;
 const home=join(app.getPath('userData'),'connector');
 function show(){if(window){window.show();window.focus();}}
@@ -20,18 +21,26 @@ function ensureStopped(){connection.assertIdle();if(runtime.snapshot().owned)thr
 function credentials(){const value=settings.getCredentials();if(!value)throw Error('CREDENTIALS_REQUIRED');return value;}
 function login(){return readLoginState(app,process.platform,app.isPackaged,process.execPath);}
 function detectedExecutable(){for(const p of [join(homedir(),'.local/bin/codex'),'/opt/homebrew/bin/codex','/usr/local/bin/codex',join(homedir(),'.npm-global/bin/codex')]){try{if(existsSync(p))return realpathSync(p);}catch{}}return '';}
-async function snapshot(){const runtimeState=await runtime.refresh();const config=settings.readConfig();if(!config.backend.executable)config.backend.executable=detectedExecutable();const c=settings.credentialStatus();return{config,preferences:settings.readPreferences(),credentials:{appToken:c.appToken,botToken:c.botToken,secureStorage:c.secureStorageAvailable},runtime:runtimeState,settingsBusy:connection.settingsBusy,login:login(),platform:process.platform,packaged:app.isPackaged};}
+async function snapshot(){const runtimeState=await runtime.refresh();const config=settings.readConfig(),draft=draftConfig.snapshot(config);if(draft.config.backend&&!draft.config.backend.executable)draft.config.backend.executable=detectedExecutable();const c=config.slack.enabled===false?{appToken:false,botToken:false,secureStorageAvailable:false}:settings.credentialStatus();return{...draft,preferences:settings.readPreferences(),credentials:{appToken:c.appToken,botToken:c.botToken,secureStorage:c.secureStorageAvailable},runtime:runtimeState,settingsBusy:connection.settingsBusy,login:login(),platform:process.platform,packaged:app.isPackaged};}
 async function confirm(title:string,message:string){if(shutdownRequested)throw Error('CANCELLED');const result=await dialog.showMessageBox(window!,{type:'question',title,message,buttons:['取消','确认'],defaultId:0,cancelId:0,noLink:true});if(shutdownRequested||result.response!==1)throw Error('CANCELLED');}
 const methods:Record<string,(value:any)=>unknown|Promise<unknown>>={
   snapshot:()=>snapshot(),
   listSessions:value=>runtime.listSessions(sessionListParams(value)),
   saveConfig:async value=>{
-    const saved=await connection.save(()=>settings.prepareConfig(value),async()=>{
-      const previous=settings.readConfig();
-      if(value?.sessionPolicy?.allowAllSharedSessions===true&&!previous.sessionPolicy?.allowAllSharedSessions)await confirm('扩大共享会话管理范围','允许管理同账户、项目根以外的共享会话？只读文件范围不会扩大，原 Codex 沙箱不会改变。');
-      if(value?.filePolicy?.allowAbsolutePaths===true&&previous.filePolicy?.allowAbsolutePaths!==true){await confirm('允许系统范围的绝对路径只读访问','高风险：配置中受信任的 Slack 用户和 bot 可以请求读取此操作系统账户可读的任意路径，并将内容发送到 Slack。敏感路径、秘密内容和文件类型防护仍然生效，但不构成完整的数据防泄漏保证；此开关不提升操作系统权限、不允许写入。仅在你明确接受这些接收者访问范围后确认。');}
-      if(value?.screenPolicy?.enabled===true&&previous.screenPolicy?.enabled!==true){await confirm('允许远程屏幕截图','已配置的 Slack 用户和可信 bot 可显式请求截取全部屏幕或选定屏幕，并发送至请求所在的已授权 Slack 线程，无需逐次本机确认。屏幕像素不会自动脱敏，可能包含密码、私人信息或其他应用内容；请先关闭敏感内容。Electron 可在内存中临时取得所有屏幕缩略图，但只发送请求的屏幕。图片不写入本地状态文件；Slack 的文件保留规则仍适用。不会后台定时截图。需要 Slack files:write 和系统屏幕录制权限。');}
-      if(value?.backend?.autoStartDaemon===true&&!previous.backend.autoStartDaemon)await confirm('允许启动共享 Codex daemon','连接时可运行官方 daemon start；它可能准备 daemon 包或管理 Codex 自身更新器。不提权、不停止共享 daemon。');
+    const previous=settings.readConfig(),{config:next,imported}=draftConfig.propose(value,previous);
+    const saved=await connection.save(()=>{
+      if(JSON.stringify(settings.readConfig())!==JSON.stringify(previous))throw Error('CONFIG_CHANGED_ON_DISK');
+      const write=settings.prepareConfig(next);
+      return ()=>{if(JSON.stringify(settings.readConfig())!==JSON.stringify(previous))throw Error('CONFIG_CHANGED_ON_DISK');write();};
+    },async()=>{
+      if(imported&&(next.backends||next.backend.codexHome||next.local?.agents?.length||next.slack.servers||next.local?.enabled!==previous.local?.enabled||next.slack.enabled!==previous.slack.enabled))
+        await confirm('应用导入的连接配置','导入内容可改变连接模式、Codex 目标和已有机器代理的权限。请确认你已核对该文件，并有权使用这些目标。没有复制原文件或明文令牌。');
+      if(next.local?.enabled!==false&&next.local?.agents?.some(agent=>agent.projects.some(id=>next.projects[id]!==previous.projects[id])))
+        await confirm('确认代理可访问的项目目录','此次修改会改变已有 Agent 获准访问的项目路径。请确认它们仍应读取或管理新目录。');
+      if(next.sessionPolicy?.allowAllSharedSessions===true&&!previous.sessionPolicy?.allowAllSharedSessions)await confirm('扩大共享会话管理范围','允许管理同账户、项目根以外的共享会话？只读文件范围不会扩大，原 Codex 沙箱不会改变。');
+      if(next.filePolicy?.allowAbsolutePaths===true&&previous.filePolicy?.allowAbsolutePaths!==true){await confirm('允许系统范围的绝对路径只读访问','高风险：配置中受信任的 Slack 用户和 bot 可以请求读取此操作系统账户可读的任意路径，并将内容发送到 Slack。敏感路径、秘密内容和文件类型防护仍然生效，但不构成完整的数据防泄漏保证；此开关不提升操作系统权限、不允许写入。仅在你明确接受这些接收者访问范围后确认。');}
+      if(next.screenPolicy?.enabled===true&&previous.screenPolicy?.enabled!==true){await confirm('允许远程屏幕截图','已配置的 Slack 用户和可信 bot 可显式请求截取全部屏幕或选定屏幕，并发送至请求所在的已授权 Slack 线程，无需逐次本机确认。屏幕像素不会自动脱敏，可能包含密码、私人信息或其他应用内容；请先关闭敏感内容。Electron 可在内存中临时取得所有屏幕缩略图，但只发送请求的屏幕。图片不写入本地状态文件；Slack 的文件保留规则仍适用。不会后台定时截图。需要 Slack files:write 和系统屏幕录制权限。');}
+      if([...configuredServers(next)].some(([id,p])=>p.autoStartDaemon===true&&configuredServers(previous).get(id)?.autoStartDaemon!==true))await confirm('允许启动共享 Codex daemon','连接时可运行官方 daemon start；它可能准备 daemon 包或管理 Codex 自身更新器。不提权、不停止共享 daemon。');
     });
     // A read-only refresh failure must not turn a completed write into a rejected save.
     try{return {...await snapshot(),save:saved};}
@@ -47,7 +56,7 @@ const methods:Record<string,(value:any)=>unknown|Promise<unknown>>={
   lookupDot:async value=>{const v=strictObject(value,['userId']);return slack.resolveDot(credentials().botToken,textField(v.userId,64));},
   listUsers:async()=>{const r=await slack.listUsers(credentials().botToken);return{users:r.users.map(u=>({id:u.userId,name:u.name,isBot:u.isBot})),hasMore:!!r.nextCursor};},
   listChannels:async()=>{const r=await slack.listChannels(credentials().botToken);return{channels:r.channels.map(c=>({id:c.channelId,name:c.name,isMember:c.isMember})),manual:r.manualEntryRequired,requiredScopes:r.requiredScopes,hasMore:!!r.nextCursor};},
-  choosePath:async value=>{const v=strictObject(value,['kind']);if(!['executable','project','import'].includes(String(v.kind)))throw Error('INVALID_ARGUMENT');const selected=await dialog.showOpenDialog(window!,{title:v.kind==='import'?'选择已有 connector config.json（仅预览）':v.kind==='project'?'选择允许只读访问的项目目录':'选择 Codex 可执行文件或 bin/codex.js',defaultPath:v.kind==='import'?join(homedir(),'.codex-connector/config.json'):undefined,properties:v.kind==='project'?['openDirectory']:['openFile'],filters:v.kind==='import'?[{name:'JSON configuration',extensions:['json']}]:undefined});if(selected.canceled)return{};const path=selected.filePaths[0]!;return v.kind==='import'?{path,config:importConfigPreview(path)}:{path:realpathSync(path)};},
+  choosePath:async value=>{const v=strictObject(value,['kind']);if(!['executable','project','import'].includes(String(v.kind)))throw Error('INVALID_ARGUMENT');const selected=await dialog.showOpenDialog(window!,{title:v.kind==='import'?'选择已有 connector config.json（仅预览）':v.kind==='project'?'选择允许只读访问的项目目录':'选择 Codex 可执行文件或 bin/codex.js',defaultPath:v.kind==='import'?join(homedir(),'.codex-connector/config.json'):undefined,properties:v.kind==='project'?['openDirectory']:['openFile'],filters:v.kind==='import'?[{name:'JSON configuration',extensions:['json']}]:undefined});if(selected.canceled)return{};const path=selected.filePaths[0]!;return v.kind==='import'?{path,...draftConfig.import(importConfigPreview(path),settings.readConfig())}:{path:realpathSync(path)};},
   probeCodex:value=>{const v=strictObject(value,['executable']);return probeCodex(textField(v.executable));},
   start:()=>connection.start(),
   stop:()=>connection.stop(),
@@ -65,7 +74,7 @@ if(!app.requestSingleInstanceLock())app.quit();else{
   app.on('second-instance',show);
   app.whenReady().then(async()=>{
     settings=new DesktopSettings(home,safeStorage);runtime=new DesktopRuntime(home,join(root,'dist/src/cli.js'),process.execPath,undefined,45000,new DesktopScreens({displays:()=>screen.getAllDisplays(),primaryId:()=>screen.getPrimaryDisplay().id,sources:()=>desktopCapturer.getSources({types:['screen'],thumbnailSize:{width:2560,height:2560},fetchWindowIcons:false}),permission:()=>process.platform==='darwin'?systemPreferences.getMediaAccessStatus('screen'):'os-managed',locked:()=>powerMonitor.getSystemIdleState(1)==='locked'},()=>!shutdownRequested&&settings.readConfig().screenPolicy?.enabled===true));
-    connection=new DesktopConnection(runtime,()=>{if(shutdownRequested)throw Error('CANCELLED');if(runtime.snapshot().owned)throw Error('ALREADY_RUNNING');settings.initRuntimeFiles();return runtime.start(settings.readConfig(),credentials());},()=>shutdownRequested);
+    connection=new DesktopConnection(runtime,()=>{if(shutdownRequested)throw Error('CANCELLED');if(runtime.snapshot().owned)throw Error('ALREADY_RUNNING');settings.initRuntimeFiles();const config=settings.readConfig();return runtime.start(config,config.slack.enabled===false?undefined:(config.local?.enabled===false?credentials():settings.credentialStatus().appToken?settings.getCredentials()??undefined:undefined));},()=>shutdownRequested);
     session.defaultSession.setPermissionRequestHandler((_wc,_permission,callback)=>callback(false));session.defaultSession.setPermissionCheckHandler(()=>false);
     window=new BrowserWindow({width:1180,height:820,minWidth:850,minHeight:660,title:'Codex Connector',backgroundColor:'#f5f6f8',show:false,webPreferences:{preload:join(root,'desktop/preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true,allowRunningInsecureContent:false,devTools:!app.isPackaged}});
     window.webContents.setWindowOpenHandler(()=>({action:'deny'}));window.webContents.on('will-navigate',e=>e.preventDefault());window.webContents.on('will-attach-webview',e=>e.preventDefault());

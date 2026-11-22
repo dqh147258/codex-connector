@@ -130,3 +130,6 @@ codex-connector events --server default --session-id SESSION_ID --cursor RETURNE
 - `assistant.final` 给出可见最终消息，`turn.completed` 给出该 turn 的终态，`local.action_required` 只提示在原生界面处理。不能从别人的消息、最新 turn 或类似文本推断自己的发送完成；核对 workId、turnId 及 `session.delivery`。仅本机独占绑定时可能看到原生客户端产生的事件，其 workId 为 null。事件不会输出工具日志、私密推理或审批细节；过长/敏感文本有截断或 withheld 标记。
 - 若 `gap` 非空，断线、保留窗口或归属判断留下了观察缺口。使用精确的 history/delivery 仅对可核实部分补查，不能承诺离线期间完整回放。命令状态 `completed` 不等于模型完成；`uncertain` 或启动错误不等于消息未送达。保留原请求 ID 和原始参数核对，绝不换 ID 重发。
 - `LOCAL_SCOPE_DENIED`：检查该身份的授权，不切换操作者 token。`SERVER_SELECTION_REQUIRED`：从可见列表明确选择。`LOCAL_BINDING_REQUIRED`：确认同一身份在该 server 成功绑定了该会话。原生批准/输入请求只在原 Codex 界面处理，Agent 不可自行回答。若沙箱禁止环回，报告限制，不向公网暴露 API，也不关掉沙箱。
+
+
+A cancelled local subscription frees its active slot immediately. It retains no cursor key or event bodies. Resume that stream deliberately without the old cursor; a stale cursor cannot open a replacement stream. A `session.create` receipt marked `uncertain` means the native session might exist even though the connector could not verify its creation or bind it safely. Inspect the intended native server before acting; repeating the same request ID returns the existing receipt and a new ID does not bypass the recovery hold.

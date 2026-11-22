@@ -6,8 +6,9 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
 import { parseConfig } from '../src/config.js';
-import { DesktopSettings, importConfigPreview } from '../desktop/settings.js';
+import { DesktopConfigDrafts, DesktopSettings, importConfigPreview } from '../desktop/settings.js';
 import { DesktopConnection } from '../desktop/connection.js';
+import { configuredServers } from '../src/servers.js';
 import type { Config } from '../src/types.js';
 const { JSDOM } = createRequire(import.meta.url)('jsdom');
 const copy=<T>(value:T):T=>JSON.parse(JSON.stringify(value));
@@ -44,12 +45,13 @@ function nativeSaveHarness(config:Config){
   assert.ok(start>0&&end>start);
   let shuttingDown=false,saves=0,confirmations:{title:string;message:string}[]=[],duringConfirm:()=>void=()=>{},cancel=false;
   const connection=new DesktopConnection({snapshot:()=>({state:'stopped',owned:false}),stop:async()=>({state:'stopped',owned:false})},()=>({state:'starting',owned:true}),()=>shuttingDown);
-  const handler=runInNewContext('('+source.slice(start,end)+')',{
-    connection,
+  const draftConfig=new DesktopConfigDrafts(),{configDraftId}=draftConfig.snapshot(config);
+  const mainHandler=runInNewContext('('+source.slice(start,end)+')',{
+    connection,draftConfig,configuredServers,
     settings:{readConfig:()=>copy(config),prepareConfig:()=>()=>{saves++;}},snapshot:()=>({}),
     confirm:async(title:string,message:string)=>{confirmations.push({title,message});duringConfirm();if(cancel)throw Error('CANCELLED');}
-  }) as (value:Config)=>Promise<unknown>;
-  return{handler,get saves(){return saves;},confirmations,quitDuringConfirm:()=>{duringConfirm=()=>{shuttingDown=true;};},cancel:()=>{cancel=true;}};
+  }) as (value:{config:Config;configDraftId:string})=>Promise<unknown>;
+  return{handler:(config:Config)=>mainHandler({config,configDraftId}),get saves(){return saves;},confirmations,quitDuringConfirm:()=>{duringConfirm=()=>{shuttingDown=true;};},cancel:()=>{cancel=true;}};
 }
 test('native save requires explicit risk confirmation only when widening file access',async()=>{
   const f=fixture();try{

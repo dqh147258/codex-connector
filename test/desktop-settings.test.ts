@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,readFileSync,writeFileSync,existsSync,rmSync,mkdirSync,symlinkSync,statSync,linkSync,realpathSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {DesktopSettings,SettingsError,importConfigPreview,inspectLock,recoverStaleLock,type SecretCipher} from '../desktop/settings.js';
+import {configuredServers} from '../src/servers.js';
+import {DesktopConfigDrafts,DesktopSettings,SettingsError,importConfigPreview,inspectLock,recoverStaleLock,type SecretCipher} from '../desktop/settings.js';
 const tokens={appToken:'xapp-dummy-test-value',botToken:'xoxb-dummy-test-value'};
 function fixture(cipher?:SecretCipher){const dir=realpathSync(mkdtempSync(join(tmpdir(),'desktop-settings-')));const fake:SecretCipher={isEncryptionAvailable:()=>true,encryptString:s=>Buffer.from([...Buffer.from(s)].map(x=>x^0xa5)),decryptString:b=>Buffer.from([...b].map(x=>x^0xa5)).toString()};const settings=new DesktopSettings(dir,cipher||fake);const config=settings.defaultConfig();config.slack={teamId:'TTEAM',inputChannel:'CINPUT',outputChannel:'COUTPUT',allowedHumans:['UHUMAN'],approvalUsers:['UHUMAN'],trustedBots:[{botId:'BBOT',userId:'UDOT',appId:'AAPP'}],dot:{name:'Dot',userId:'UDOT'}};config.projects={repo:dir};config.backend.executable=process.execPath;return{dir,settings,config,cleanup:()=>rmSync(dir,{recursive:true,force:true})};}
 test('desktop defaults have no pin, no broad project root, no autoconnect, save config and runtime token privately',()=>{const f=fixture();try{assert.equal(f.settings.defaultConfig().backend.expectedVersion,undefined);assert.equal(f.settings.defaultConfig().projects.project,'');assert.deepEqual(f.settings.readPreferences(),{autoConnect:false,closeToTray:true});f.settings.saveConfig(f.config);f.settings.initRuntimeFiles();const token=readFileSync(join(f.dir,'api.token'),'utf8');assert.match(token,/^[a-f0-9]{64}$/);f.settings.initRuntimeFiles();assert.equal(readFileSync(join(f.dir,'api.token'),'utf8'),token);assert.deepEqual(f.settings.readConfig(),f.config);if(process.platform!=='win32')assert.equal(statSync(join(f.dir,'config.json')).mode&0o777,0o600);assert.equal(existsSync(join(f.dir,'state.json')),false);}finally{f.cleanup();}});
@@ -21,3 +22,37 @@ test('hardlinked import and oversized selected files are rejected without saving
 
 test('prepared config is validated and immutable but not persisted until commit',()=>{const f=fixture();try{f.settings.saveConfig(f.config);const next=structuredClone(f.config);next.port=17382;const commit=f.settings.prepareConfig(next);next.port=17383;assert.equal(f.settings.readConfig().port,17381);commit();assert.equal(f.settings.readConfig().port,17382);assert.throws(()=>f.settings.prepareConfig({...f.config,port:-1}),/INVALID_CONFIGURATION/);assert.equal(f.settings.readConfig().port,17382);}finally{f.cleanup();}});
 test('prepared credentials validate and encrypt before interruption, only commit persists',()=>{const f=fixture();try{f.settings.saveCredentials(tokens);const commit=f.settings.prepareCredentials({botToken:'xoxb-replacement-dummy'});assert.deepEqual(f.settings.getCredentials(),tokens);commit();assert.equal(f.settings.getCredentials()?.appToken,tokens.appToken);assert.equal(f.settings.getCredentials()?.botToken,'xoxb-replacement-dummy');assert.throws(()=>f.settings.prepareCredentials({botToken:'bad'}),/INVALID_CREDENTIALS/);}finally{f.cleanup();}});
+
+test('desktop round-trips CLI local-only registry and authorization without exposing hashes in renderer drafts',()=>{
+  const f=fixture(),drafts=new DesktopConfigDrafts(),hash='a'.repeat(64),codexHome=join(f.dir,'mock-home');
+  try{
+    const raw={...f.config,backend:undefined,slack:undefined,backends:{A:{executable:process.execPath,codexHome,aliases:['first']},B:{executable:process.execPath,socketPath:join(f.dir,'b.sock')}},defaultServerId:'A',
+      local:{enabled:true,agents:[{id:'robot',tokenHash:hash,servers:['A'],projects:['repo'],commands:['session.list','server.list']}]}};
+    f.settings.saveConfig(raw);f.settings.initRuntimeFiles();assert.equal(existsSync(join(f.dir,'api.token')),true);
+    const current=f.settings.readConfig(),view=drafts.snapshot(current);
+    assert.equal(current.slack.enabled,false);assert.equal(Object.hasOwn(view.config,'backend'),false);
+    assert.equal(JSON.stringify(view).includes(hash),false);
+    const next={...view.config,local:{enabled:false,agents:[]},port:17382,backend:{executable:'/unsafe'},backends:{},defaultServerId:'Z'};
+    const {config,imported}=drafts.propose({config:next,configDraftId:view.configDraftId},current);
+    assert.equal(imported,false);f.settings.saveConfig(config);
+    const reloaded=f.settings.readConfig();assert.equal(reloaded.port,17382);assert.equal(reloaded.defaultServerId,'A');assert.deepEqual([...configuredServers(reloaded)], [...configuredServers(current)]);
+    assert.deepEqual(reloaded.local,raw.local);
+    assert.throws(()=>drafts.propose({config:next,configDraftId:view.configDraftId},reloaded),/CONFIG_CHANGED_ON_DISK/);
+    const original=join(f.dir,'original.json');const otherHash='b'.repeat(64);
+    writeFileSync(original,JSON.stringify({...raw,slack:{...f.config.slack,servers:['B']},local:{enabled:false,agents:[{...raw.local.agents[0],tokenHash:otherHash}]}}));
+    const preview=drafts.import(importConfigPreview(original),reloaded);
+    assert.equal(JSON.stringify(preview).includes(otherHash),false);
+    const proposed=drafts.propose({config:preview.config,configDraftId:preview.configDraftId},reloaded);
+    assert.equal(proposed.imported,true);assert.deepEqual(proposed.config.slack.servers,['B']);
+    assert.equal(proposed.config.local?.agents?.[0]?.tokenHash,otherHash);
+    assert.throws(()=>f.settings.saveConfig({...raw,local:{...raw.local,agents:[{...raw.local.agents[0],token:'xoxb-do-not-copy'}]}}));
+    assert.throws(()=>f.settings.saveConfig({...raw,backends:{...raw.backends,extra:{executable:'/bin/sh',secret:'plaintext-forbidden'}}}));
+  }finally{f.cleanup();}
+});
+test('Slack-only settings validate using shared schema and do not create a local operator token',()=>{
+  const f=fixture();try{
+    f.settings.saveConfig({...f.config,local:{enabled:false},slack:{...f.config.slack,servers:['default']}});
+    f.settings.initRuntimeFiles();assert.equal(existsSync(join(f.dir,'api.token')),false);
+    assert.equal(f.settings.readConfig().local?.enabled,false);
+  }finally{f.cleanup();}
+});

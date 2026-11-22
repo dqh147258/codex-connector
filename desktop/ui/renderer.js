@@ -4,7 +4,7 @@
   const $ = id => document.getElementById(id);
   const clone = value => JSON.parse(JSON.stringify(value));
   const busy = new Set();
-  let snapshot = null, editingConfig = null, originalProject = null, originalDot = null;
+  let snapshot = null, editingConfig = null, configDraftId = null, originalProject = null, originalDot = null;
   let dirty = false, revision = 0, snapshotEpoch = 0, polling = false, preferencesBusy = false;
   let lockEligible = false, disposed = false;
   const tokenFields = [$('app-token'), $('bot-token')];
@@ -48,10 +48,24 @@
     window.scrollTo?.(0, 0);
   }
   function markDirty() { dirty = true; revision++; text('dirty-label', '有修改尚未保存'); }
-  function populate(config) {
+  const mode = config => config?.slack?.enabled === false ? '仅本机' : config?.local?.enabled === false ? '仅 Slack' : '本机 + Slack';
+  function populate(config, draftId = null) {
     if (!config) return;
-    editingConfig = clone(config);
-    const slack = config.slack || {}, backend = config.backend || {};
+    editingConfig = clone(config); configDraftId = draftId;
+    const slack = config.slack || {}, registered = config.backends && Object.keys(config.backends);
+    const selected = registered && (config.defaultServerId || (registered.includes('default') ? 'default' : registered.length === 1 ? registered[0] : ''));
+    const backend = registered ? config.backends[selected] || {} : config.backend || {};
+    const localOnly = slack.enabled === false;
+    $('slack-identity-section').hidden = localOnly; $('slack-credentials-section').hidden = localOnly;
+    for (const input of $('slack-identity-section').querySelectorAll('input,button')) input.disabled = localOnly;
+    const dotInputs=['dot-user-id','dot-bot-id','dot-app-id'];
+    for (const id of dotInputs) $(id).required = !localOnly && ((slack.trustedBots || []).length > 0 || !slack.dot?.name);
+    $('runtime-mode-note').hidden = false;
+    text('runtime-mode-note', `配置模式：${mode(config)}。需要切换模式、编辑代理授权或修改多目标注册表时，请在本机编辑 config.json，或导入更新后的配置。`);
+    $('registry-note').hidden = !registered;
+    if (registered) text('registry-note', `已注册 ${registered.length} 个 Codex 目标：${registered.join('、')}。${selected ? '默认目标：'+selected+'。' : '未设置默认目标；请通过 CLI 明确选择。'} 当前表单保存时保留所有目标和别名。`);
+    for (const id of ['codex-path','browse-codex-button','probe-codex-button','auto-start-daemon','expected-version','socket-path']) $(id).disabled = !!registered;
+    $('codex-path').required = !registered;
     originalProject = Object.keys(config.projects || {})[0] || '';
     originalDot = slack.dot?.userId || slack.trustedBots?.[0]?.userId || '';
     const bot = slack.trustedBots?.find(b => b.userId === originalDot) || slack.trustedBots?.[0] || {};
@@ -82,10 +96,17 @@
     const c = clone(editingConfig || snapshot?.config || {});
     c.version = 2; c.instanceId = $('instance-id').value.trim(); c.port = Number($('port').value);
     c.slack = c.slack || {};
-    Object.assign(c.slack, { teamId: $('team-id').value.trim(), inputChannel: $('input-channel').value.trim(), outputChannel: $('output-channel').value.trim(), allowedHumans: ids($('allowed-humans').value), approvalUsers: ids($('approval-users').value) });
-    const userId = $('dot-user-id').value.trim();
-    c.slack.dot = { name: $('dot-name').value.trim(), userId };
-    c.slack.trustedBots = [...(c.slack.trustedBots || []).filter(b => b.userId !== originalDot), { userId, botId: $('dot-bot-id').value.trim(), appId: $('dot-app-id').value.trim() }];
+    if(c.slack.enabled !== false){
+      Object.assign(c.slack, { teamId: $('team-id').value.trim(), inputChannel: $('input-channel').value.trim(), outputChannel: $('output-channel').value.trim(), allowedHumans: ids($('allowed-humans').value), approvalUsers: ids($('approval-users').value) });
+      const userId = $('dot-user-id').value.trim();
+      const botId=$('dot-bot-id').value.trim(), appId=$('dot-app-id').value.trim();
+      const pinDot = userId && (c.slack.dot?.userId || userId !== originalDot);
+      c.slack.dot = { name: $('dot-name').value.trim(), ...(pinDot ? {userId} : {}) };
+      if(botId||appId) {
+        if(!userId||!botId||!appId) throw new Error('可信 bot 的用户、Bot 和 App ID 必须完整填写。');
+        c.slack.trustedBots = [...(c.slack.trustedBots || []).filter(b => b.userId !== originalDot), { userId, botId, appId }];
+      }
+    }
     const alias = $('project-alias').value.trim(), projectPath = $('project-path').value.trim();
     const allowAbsolutePaths = $('allow-absolute-paths').checked;
     if (Boolean(alias) !== Boolean(projectPath)) throw new Error('项目别名和目录必须同时填写；启用绝对路径读取后才可同时留空。');
@@ -98,10 +119,12 @@
     c.screenPolicy = { enabled: $('allow-screen-capture').checked };
     c.filePolicy = { allowAbsolutePaths };
     c.sessionPolicy = { allowAllSharedSessions: $('allow-all-sessions').checked };
-    c.backend = { ...(c.backend || {}), executable: $('codex-path').value.trim(), autoStartDaemon: $('auto-start-daemon').checked };
-    const version = $('expected-version').value.trim(), socketPath = $('socket-path').value.trim();
-    if (version) c.backend.expectedVersion = version; else delete c.backend.expectedVersion;
-    if (socketPath) c.backend.socketPath = socketPath; else delete c.backend.socketPath;
+    if (!c.backends) {
+      c.backend = { ...(c.backend || {}), executable: $('codex-path').value.trim(), autoStartDaemon: $('auto-start-daemon').checked };
+      const version = $('expected-version').value.trim(), socketPath = $('socket-path').value.trim();
+      if (version) c.backend.expectedVersion = version; else delete c.backend.expectedVersion;
+      if (socketPath) c.backend.socketPath = socketPath; else delete c.backend.socketPath;
+    } else delete c.backend;
     c.approvalTimeoutSec = c.approvalTimeoutSec || 300;
     return c;
   }
@@ -124,32 +147,40 @@
     const runtime = s.runtime || {}, backend = runtime.backend || {}, credentials = s.credentials || {};
     const state = runtime.state || 'stopped', running = state === 'running', transitioning = state === 'starting' || state === 'stopping';
     const settingsSaving = busy.has('save-config') || busy.has('tokens') || s.settingsBusy === true;
+    const localOnly = s.config?.slack?.enabled === false, slackOnly = s.config?.local?.enabled === false;
     const connected = backend.connected === true;
+    const onlineTargets=(runtime.servers||[]).filter(x=>x.connected).length;
+    const configured=s.config?.backends?Object.keys(s.config.backends):[];
+    const noDefault=running&&configured.length>1&&!configured.includes('default')&&!s.config.defaultServerId;
+    const someOnline=noDefault&&onlineTargets>0;
+    text('overview-title', localOnly?'连接你的本机 Codex':slackOnly?'通过 Slack 连接 Codex':'连接你的 Codex 与 Slack');
+    text('overview-mode', localOnly?'仅本机：通过 CLI 或 MCP 协作，不连接 Slack。':slackOnly?'仅 Slack：本机 API 关闭，桌面不能读取后端在线状态。':'双入口：本机 CLI/MCP 与 Slack 独立连接。');
+    text('connection-endpoint',localOnly?'本机 CLI / MCP':slackOnly?'Slack thread':'本机 CLI / MCP · Slack thread');
     const tone = connected ? 'good' : state === 'failed' ? 'error' : running || transitioning ? 'warning' : 'neutral';
     $('connection-badge').className = `badge ${tone}`;
-    text('connection-badge', connected ? '共享 Codex 已连接' : running ? '本地已启动 · Codex 待连接' : runtimeNames[state] || state);
+    text('connection-badge', connected ? '共享 Codex 已连接' : running ? slackOnly ? '仅 Slack 模式 · 状态待核实' : noDefault ? someOnline ? `${onlineTargets} 个目标在线 · 未指定默认目标` : '运行中 · 未指定默认目标' : '本地已启动 · Codex 待连接' : runtimeNames[state] || state);
     text('connection-title', connected ? '连接已就绪，开始协作吧' : running ? '服务在运行，继续检查 Codex' : state === 'failed' ? '连接尚未完成，一起检查原因' : transitioning ? '正在安全地处理连接' : '准备好，让工作接上话');
-    text('connection-description', connected ? '下一步：在测试频道发送 help，选择并绑定一个明确的 Codex 会话。不要把已连接当作所有会话都可接管。' : running ? '本地服务启动不等于共享会话连接成功。下方诊断会显示当前版本、失败原因和可采取的下一步。' : '先完成本机配置。连接器不会替你关闭 Codex 沙箱，也不会自动批准操作。');
+    text('connection-description', connected ? localOnly ? '可用 CLI 或 MCP 明确选择并绑定一个 Codex 会话。请先在测试会话验证，不会自动接管其他会话。' : '请选择并绑定一个明确的 Codex 会话。不要把已连接当作所有会话都可接管。' : slackOnly && running ? '本机 API 未开启。请用 Slack 指令核对目标和连接状态；桌面不会借此启用本机入口。' : noDefault ? '没有默认目标。请通过 CLI 明确选择要访问的目标，避免串用会话。' : running ? '本地服务启动不等于共享会话连接成功。下方诊断会显示当前版本、失败原因和可采取的下一步。' : '先完成本机配置。连接器不会替你关闭 Codex 沙箱，也不会自动批准操作。');
     $('start-button').disabled = transitioning || running || settingsSaving || busy.has('start') || busy.has('stop');
     $('stop-button').disabled = busy.has('stop') || (!settingsSaving && (state === 'stopping' || !runtime.owned));
     $('settings-stop-button').disabled = $('stop-button').disabled;
     text('local-status', runtimeNames[state] || state); dot('local-dot', running ? 'good' : state === 'failed' ? 'error' : transitioning ? 'warning' : '');
     text('local-detail', runtime.owned ? '由本应用管理；停止不会关闭共享 Codex daemon。' : '仅管理本应用启动的连接，不会接管其他进程。');
     const tokensReady = credentials.appToken && credentials.botToken;
-    text('slack-status', tokensReady ? '两种令牌已保存' : '等待配置令牌'); dot('slack-dot', tokensReady ? 'good' : '');
-    text('slack-detail', tokensReady ? '凭据保存不代表授权有效，可在向导中测试。' : '需要独立的 App Token 和 Bot Token。');
-    text('codex-status', connected ? '共享连接已建立' : running || transitioning ? '等待共享连接' : '尚未连接'); dot('codex-dot', connected ? 'good' : running ? 'warning' : '');
-    text('codex-detail', backend.version ? `已探测版本 ${backend.version}` : '连接默认共享会话，不创建替代会话。');
+    text('slack-status', localOnly ? '未启用 Slack' : runtime.slackConnected ? 'Slack 已连接' : tokensReady ? '两种令牌已保存' : '等待配置令牌'); dot('slack-dot', !localOnly && runtime.slackConnected ? 'good' : '');
+    text('slack-detail', localOnly ? '此模式不读取或使用 Slack 令牌。' : tokensReady ? '凭据保存不代表授权有效，可在向导中测试。' : '需要独立的 App Token 和 Bot Token。');
+    text('codex-status', connected ? '共享连接已建立' : slackOnly && running ? '桌面未探测' : noDefault ? `${onlineTargets} 个已配置目标在线` : running || transitioning ? '等待共享连接' : '尚未连接'); dot('codex-dot', connected ? 'good' : running ? 'warning' : '');
+    text('codex-detail', backend.version ? `已探测 CLI 版本 ${backend.version}` : '只连接已配置的共享服务，不创建替代会话。');
     text('diagnostic-version', backend.version || '尚未探测'); text('diagnostic-pin', backend.expectedVersion || '默认不限制版本号');
     const failure = backend.lastFailure || runtime.lastError || '';
     text('diagnostic-error', failure || '无');
     const daemon = backend.daemonStart || {};
     text('diagnostic-daemon', daemon.enabled ? daemon.result || (daemon.attempted ? '已经尝试' : '等待启动') : '自动启动已关闭');
-    text('diagnostic-guidance', failureHelp[failure] || (failure ? '先检查设置中的具体参数和 Codex 能力。不要发送令牌或完整配置；错误代码通常已经足够排查。' : connected ? '共享连接已建立。首次只选一个测试会话，验证 thread、回复与人工审批，然后再投入日常使用。' : running ? '如果共享连接持续未建立，请到设置向导检查 Codex 路径与能力，不要把共享目录改成宽松权限。' : '先点击「设置向导」，完成身份与项目选择，再启动连接。'));
+    text('diagnostic-guidance', failureHelp[failure] || (failure ? '先检查设置中的具体参数和 Codex 能力。不要发送令牌或完整配置；错误代码通常已经足够排查。' : connected ? localOnly ? '共享连接已建立。先用一个测试会话验证本机命令和回复。' : '共享连接已建立。首次只选一个测试会话，验证 thread、回复与人工审批，然后再投入日常使用。' : slackOnly && running ? '仅 Slack 模式没有本机 API。请从 Slack 验证服务器连接。' : running ? '如果共享连接持续未建立，请到设置向导检查 Codex 路径与能力，不要把共享目录改成宽松权限。' : '先点击「设置向导」，完成身份与项目选择，再启动连接。'));
     $('secure-storage-warning').hidden = credentials.secureStorage !== false;
     $('save-tokens-button').disabled = credentials.secureStorage === false || settingsSaving;
     $('save-config-button').disabled = settingsSaving;
-    $('test-slack-button').disabled = !tokensReady || busy.has('slack-test');
+    $('test-slack-button').disabled = localOnly || !tokensReady || busy.has('slack-test');
     text('tokens-status', `App Token：${credentials.appToken ? '已保存' : '未保存'} · Bot Token：${credentials.botToken ? '已保存' : '未保存'}`);
     const login = s.login || {};
     if (!busy.has('login')) $('login-startup').checked = login.enabled === true;
@@ -168,7 +199,7 @@
       const next = await invoke('snapshot');
       if (epoch !== snapshotEpoch || disposed) return;
       snapshot = next;
-      if (forceForm || !editingConfig || (!dirty && JSON.stringify(editingConfig) !== JSON.stringify(next.config))) populate(next.config);
+      if (forceForm || !editingConfig || (!dirty && (JSON.stringify(editingConfig) !== JSON.stringify(next.config) || configDraftId !== (next.configDraftId ?? null)))) populate(next.config, next.configDraftId);
       renderState(next);
     } catch (error) { if (showError || !snapshot) notice(errorMessage(error), 'error'); }
     finally { polling = false; }
@@ -227,11 +258,11 @@
     task('save-config', ['save-config-button'], async () => {
       const versionAtSave = revision, config = formConfig();
       let result;
-      try { result = await invoke('saveConfig', config); } catch (error) { snapshotEpoch++; await refresh(); throw error; }
+      try { result = await invoke('saveConfig', configDraftId ? { config, configDraftId } : config); } catch (error) { snapshotEpoch++; await refresh(); throw error; }
       snapshotEpoch++;
       const changedAfterSubmit = revision !== versionAtSave;
       if (!changedAfterSubmit) {
-        dirty = false; populate(result?.config || config); $('import-notice').hidden = true;
+        dirty = false; populate(result?.config || config, result?.configDraftId || configDraftId); $('import-notice').hidden = true;
         text('dirty-label', '配置已保存');
       }
       if (result?.runtime) {
@@ -287,7 +318,7 @@
     if (!await confirmDiscard()) return;
     const result = await invoke('choosePath', { kind: 'import' });
     if (!result?.config) return;
-    populate(result.config); markDirty(); $('import-notice').hidden = false; go('setup'); notice('已载入配置预览；检查后保存才会应用，原文件保持不变。');
+    populate(result.config, result.configDraftId); markDirty(); $('import-notice').hidden = false; go('setup'); notice('已载入配置预览；检查后保存才会应用，原文件保持不变。');
   }));
   $('browse-codex-button').addEventListener('click', () => task('browse-codex', ['browse-codex-button'], async () => { const result = await invoke('choosePath', { kind: 'executable' }); if (result?.path) { $('codex-path').value = result.path; markDirty(); } }));
   $('allow-absolute-paths').addEventListener('change', updateProjectRequirements);

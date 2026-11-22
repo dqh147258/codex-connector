@@ -28,13 +28,25 @@ interface EventStore { readonly state: Readonly<EventState>; transaction<T>(fn:(
 // One boolean on the existing work record, no additional unbounded index.
 type EventWork = Work & { localEventMixedInput?:true };
 const mixed=(w:Work)=>(w as EventWork).localEventMixedInput===true;
-type Bound = Session & {localOwners?:string[]};
+// Pauses are small owner flags on the existing session, not journal slots. They
+// preserve unwatch across restart without retaining payloads or old signing keys.
+type Bound = Session & {localEventPausedOwners?:string[]};
 const MAX_STREAMS=100, MAX_EVENTS=100, MAX_BYTES=256*1024, MAX_SEEN=512, MAX_WAITERS=100;
 const positive = (x:unknown, min:number,max:number) => Number.isSafeInteger(x)&&Number(x)>=min&&Number(x)<=max;
 const hashId=(x:unknown):x is string=>typeof x==='string'&&/^[a-f0-9]{64}$/.test(x);
 const validScope=(s:LocalEventScope)=>!!s && [s.principal,s.threadId,s.sessionId].every(deliveryId) && typeof s.project==='string' && /^[a-zA-Z0-9_-]{1,64}$/.test(s.project);
 const exact=(v:object,keys:string)=>!!v&&Object.keys(v).sort().join(',')===keys;
 const owners=(s:Bound)=>Array.isArray(s.localOwners)&&s.localOwners.every(deliveryId)?s.localOwners:[];
+const paused=(s:Bound,principal:string)=>s.localEventPausedOwners?.includes(principal)===true;
+function pause(s:Bound,principal:string) {
+  if(!paused(s,principal))(s.localEventPausedOwners??=[]).push(principal);
+}
+function unpause(s:Bound,principal:string) {
+  if(!paused(s,principal))return;
+  const keep=s.localEventPausedOwners!.filter(owner=>owner!==principal);
+  if(keep.length)s.localEventPausedOwners=keep;
+  else delete s.localEventPausedOwners;
+}
 const key=(s:LocalEventScope)=>JSON.stringify([s.principal,s.project,s.sessionId,s.threadId]);
 const fail=(code:string):never=>{throw Object.assign(Error(code),{code});};
 const bytes=(v:unknown)=>Buffer.byteLength(JSON.stringify(v));
@@ -139,11 +151,27 @@ export class LocalEvents {
     const state=store.state;checkJournal(state.localEventJournal,serverId);
     for(const w of state.work as EventWork[])if(w.localEventMixedInput!==undefined&&
       (w.localEventMixedInput!==true||w.source.kind!=='local'||!w.messageDelivery?.turnId))fail('INVALID_LOCAL_EVENT_STATE');
+    for(const session of state.sessions as Bound[]) {
+      const value=session.localEventPausedOwners;
+      if(value!==undefined&&(!Array.isArray(value)||value.length>owners(session).length||
+        new Set(value).size!==value.length||value.some(owner=>!owners(session).includes(owner))))fail('INVALID_LOCAL_EVENT_STATE');
+    }
+    // v1 journals used disabled rows to suppress automatic capture. Migrate
+    // them to owner flags while keeping unrelated active IDs/cursors intact.
+    if(state.localEventJournal?.streams.some(r=>!r.enabled))this.store.transaction(d=>{
+      const j=d.localEventJournal!;
+      for(const r of j.streams)if(!r.enabled){
+        const session=bound(d,r.scope);
+        if(session)pause(session,r.scope.principal);
+      }
+      j.streams=j.streams.filter(r=>r.enabled);
+    });
     // A process restart itself is a potential gap, even without a clean disconnect.
     this.markDisconnected();
   }
   private checked(s:EventState,scope:LocalEventScope) {
-    if(!validScope(scope)||!bound(s,scope))fail('LOCAL_EVENT_SCOPE_UNAVAILABLE');
+    const session=validScope(scope)&&bound(s,scope);
+    return session||fail('LOCAL_EVENT_SCOPE_UNAVAILABLE');
   }
   private row(s:EventState,scope:LocalEventScope,create=false):Stream|undefined{
     const j=s.localEventJournal;
@@ -157,15 +185,22 @@ export class LocalEvents {
   private gap(r:Stream,reason:Reason,recovered=false){
     if(r.gap!==reason||r.recovered!==recovered){r.gap=reason;r.recovered=recovered;r.generation++;}
   }
-  subscribe(scope:LocalEventScope){
+  subscribe(scope:LocalEventScope,cursor?:string){
     const s=this.store.state;this.checked(s,scope);
-    let r=this.row(s,scope);
-    if(!r?.enabled)r=this.store.transaction(d=>{
-      this.checked(d,scope);const stream=this.row(d,scope,true)!;
-      if(!stream.enabled)Object.assign(stream,newStream(scope));
-      return stream;
+    const r=this.row(s,scope);
+    if(cursor!==undefined){
+      // A continuation is not an explicit new subscription. In particular,
+      // a delayed poll carrying an old cursor cannot undo unwatch or consume capacity.
+      if(!r?.enabled)return fail('INVALID_LOCAL_EVENT_CURSOR');
+      decode(r,this.serverId,cursor);
+      return {subscriptionId:r.id,cursor};
+    }
+    const stream=r??this.store.transaction(d=>{
+      const session=this.checked(d,scope),fresh=this.row(d,scope,true)!;
+      unpause(session,scope.principal);
+      return fresh;
     });
-    return {subscriptionId:r.id,cursor:encode(r,this.serverId,0,0)};
+    return {subscriptionId:stream.id,cursor:encode(stream,this.serverId,0,0)};
   }
   /** Internal listing for reconnect. The external caller filters by current grants. */
   list(principal?:string){
@@ -174,10 +209,15 @@ export class LocalEvents {
       .map(r=>({...r.scope,subscriptionId:r.id}));
   }
   cancel(scope:LocalEventScope,subscriptionId:string){
-    this.store.transaction(s=>{this.checked(s,scope);const r=this.row(s,scope);
+    this.store.transaction(s=>{
+      const session=this.checked(s,scope),r=this.row(s,scope);
       if(!r||r.id!==subscriptionId)return fail('LOCAL_EVENT_SUBSCRIPTION_UNAVAILABLE');
-      r.enabled=false;r.records=[];r.seen=[];
-    });this.wake(subscriptionId);
+      pause(session,scope.principal);
+      const journal=s.localEventJournal!;
+      journal.streams=journal.streams.filter(stream=>stream!==r);
+    });
+    this.recoveredIn.delete(subscriptionId);
+    this.wake(subscriptionId);
     return {subscriptionId,enabled:false};
   }
   markDisconnected(){
@@ -233,12 +273,14 @@ export class LocalEvents {
     for(const s of snapshot.sessions as Bound[])if(s.threadId===threadId)
       for(const principal of owners(s)) {
         const scope={principal,project:s.project,sessionId:s.id,threadId:s.threadId};
-        if(validScope(scope)&&receipt(snapshot,scope,value.turnId)!==undefined)candidates.push(scope);
+        if(!paused(s,principal)&&validScope(scope)&&receipt(snapshot,scope,value.turnId)!==undefined)candidates.push(scope);
       }
     if(!candidates.length)return;
     const ids=this.store.transaction(state=>{
       const changed:string[]=[];
       for(const scope of candidates) {
+        const session=bound(state,scope);
+        if(!session||paused(session,scope.principal))continue;
         const workId=receipt(state,scope,value.turnId);if(workId===undefined)continue;
         // Exhausting local stream capacity must never interrupt Slack's handling
         // of the same notification. Explicit subscriptions still report the cap.
@@ -252,7 +294,7 @@ export class LocalEvents {
   /** Captured output is re-authorized at read time as bindings/receipts can
    * change after observation, especially a previously exclusive native turn. */
   private page(scope:LocalEventScope,subscriptionId:string,cursor:string|undefined,limit:number) {
-    const s=this.store.state;this.checked(s,scope);
+    const s=this.store.state,session=this.checked(s,scope);
     const r=this.row(s,scope);if(!r?.enabled||r.id!==subscriptionId)return fail('LOCAL_EVENT_SUBSCRIPTION_UNAVAILABLE');
     const c=decode(r,this.serverId,cursor),first=r.records[0]?.seq??r.seq+1;
     const dropped=c.n<first-1;
@@ -263,7 +305,12 @@ export class LocalEvents {
       if(events.length===limit)break;
       last=entry.seq;
       const current=receipt(s,scope,entry.event.turnId);
-      if(current===undefined || entry.event.workId!==null&&current!==entry.event.workId){ambiguous=true;continue;}
+      // A formerly exclusive native observation was not proved by a receipt
+      // when collected. A later receipt must not retroactively publish it into
+      // a now-shared binding. Preserve it only while that exclusivity holds.
+      if(current===undefined||(entry.event.workId===null?!exclusive(s,session,scope.principal):current!==entry.event.workId)){
+        ambiguous=true;continue;
+      }
       events.push(entry.event);
     }
     const gap:LocalEventPage['gap']=dropped?{reason:'journal_retention',historyRecovered:false}:ambiguous?{reason:'ownership_uncertain',historyRecovered:false}:
@@ -286,14 +333,16 @@ export class LocalEvents {
   }
   /** Bounded, read-only recovery; no resume, queue mutation, steer, retry of
    * interrupted work, or fallback to raw logs. Caller verifies current scope. */
-  recover(scope:LocalEventScope):Promise<void>{
-    const sub=this.subscribe(scope),epoch=this.backend.epoch;
-    const stamp=this.stamp(scope,this.store.state,epoch);
-    const token=JSON.stringify([sub.subscriptionId,epoch]);
-    const cached=this.recoveredIn.get(sub.subscriptionId);
+  recover(scope:LocalEventScope,subscriptionId?:string):Promise<void>{
+    const state=this.store.state;this.checked(state,scope);
+    const stream=this.row(state,scope),epoch=this.backend.epoch;
+    if(!stream?.enabled||(subscriptionId!==undefined&&stream.id!==subscriptionId))return Promise.resolve();
+    const stamp=this.stamp(scope,state,epoch);
+    const token=JSON.stringify([stream.id,epoch]);
+    const cached=this.recoveredIn.get(stream.id);
     if(this.backend.connected&&cached?.stamp===stamp&&Date.now()<cached.until)return Promise.resolve();
     const job=this.jobs.get(token);if(job)return job;
-    const op=this.recoverOne(scope,sub.subscriptionId,epoch).finally(()=>this.jobs.delete(token));
+    const op=this.recoverOne(scope,stream.id,epoch).finally(()=>this.jobs.delete(token));
     this.jobs.set(token,op);return op;
   }
   private async recoverOne(scope:LocalEventScope,id:string,epoch:string) {

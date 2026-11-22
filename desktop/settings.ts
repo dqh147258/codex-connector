@@ -19,13 +19,19 @@ function keys(value: unknown, allowed: readonly string[], required: readonly str
 }
 function safeConfig(raw: unknown): Config {
   try { if (JSON.stringify(raw).length > MAX_FILE) fail('SETTINGS_TOO_LARGE'); } catch { return fail('INVALID_SETTINGS'); }
-  keys(raw, ['version','instanceId','port','slack','projects','sessionPolicy','filePolicy','screenPolicy','backend','approvalTimeoutSec'], ['version','instanceId','port','slack','projects','backend','approvalTimeoutSec']);
-  keys(raw.slack, ['teamId','inputChannel','outputChannel','allowedHumans','approvalUsers','trustedBots','dot'], ['teamId','inputChannel','outputChannel','allowedHumans','approvalUsers','trustedBots','dot']);
-  keys(raw.slack.dot, ['name','userId'], ['name']);
-  if (!Array.isArray(raw.slack.trustedBots) || raw.slack.trustedBots.length > 100) fail('INVALID_SETTINGS');
-  for (const bot of raw.slack.trustedBots as unknown[]) keys(bot, ['botId','userId','appId'], ['botId','userId','appId']);
-  keys(raw.backend, ['executable','socketPath','expectedVersion','autoStartDaemon'], ['executable']);
-  if (raw.backend.expectedVersion !== undefined && (typeof raw.backend.expectedVersion !== 'string' || raw.backend.expectedVersion.length > 120)) fail('INVALID_SETTINGS');
+  keys(raw, ['version','instanceId','port','slack','projects','sessionPolicy','filePolicy','screenPolicy','backend','backends','defaultServerId','local','approvalTimeoutSec'], ['version','instanceId','port','projects','approvalTimeoutSec']);
+  if(raw.slack!==undefined){
+    keys(raw.slack,['enabled','servers','teamId','inputChannel','outputChannel','allowedHumans','approvalUsers','trustedBots','dot']);
+    if(raw.slack.dot!==undefined)keys(raw.slack.dot,['name','userId'],['name']);
+    if(raw.slack.trustedBots!==undefined){
+      if(!Array.isArray(raw.slack.trustedBots)||raw.slack.trustedBots.length>100)fail('INVALID_SETTINGS');
+      for(const bot of raw.slack.trustedBots as unknown[])keys(bot,['botId','userId','appId'],['botId','userId','appId']);
+    }
+  }
+  if(raw.backend!==undefined)keys(raw.backend,['executable','socketPath','codexHome','expectedVersion','autoStartDaemon','aliases'],['executable']);
+  if(raw.backends!==undefined)record(raw.backends);
+  // Runtime registry, grants and transport semantics use the same validator as
+  // the CLI. This wrapper preserves Electron's stricter size/secret boundary.
   if (raw.screenPolicy !== undefined) keys(raw.screenPolicy, ['enabled'], ['enabled']);
   if (raw.filePolicy !== undefined) keys(raw.filePolicy, ['allowAbsolutePaths'], ['allowAbsolutePaths']);
   if (raw.sessionPolicy !== undefined) keys(raw.sessionPolicy, ['allowAllSharedSessions'], ['allowAllSharedSessions']);
@@ -133,12 +139,63 @@ export class DesktopSettings {
     }catch{return fail('CREDENTIAL_READ_FAILED');}
   }
   initRuntimeFiles():void {
-    if(!existsSync(join(this.homeDir,'config.json')))fail('CONFIGURATION_REQUIRED');this.readConfig();
+    if(!existsSync(join(this.homeDir,'config.json')))fail('CONFIGURATION_REQUIRED');
+    if(this.readConfig().local?.enabled===false)return;
     const path=join(this.homeDir,'api.token');
     if(existsSync(path)){if(!/^[a-f0-9]{64}$/.test(boundedRead(path,1024).toString().trim()))fail('LOCAL_TOKEN_INVALID');return;}
     const fd=openSync(path,'wx',0o600);try{writeFileSync(fd,randomBytes(32).toString('hex'));fsyncSync(fd);}finally{closeSync(fd);}
   }
 }
+/** Renderer only receives an opaque draft handle and non-secret fields.
+ * Ordinary forms cannot mint/rebind agent grants or edit explicit server targets;
+ * an operator-selected import can carry them without exposing token hashes.
+ */
+export class DesktopConfigDrafts {
+  private current?:{id:string;serialized:string};
+  private imported?:{id:string;basis:string;advanced:Config};
+  private serialized(c:Config){return JSON.stringify(c);}
+  private view(c:Config,id:string){
+    const config=JSON.parse(this.serialized(c)) as Config;
+    if(config.local)delete config.local.agents;
+    return {config,configDraftId:id};
+  }
+  snapshot(c:Config){
+    const serialized=this.serialized(c);
+    if(this.current?.serialized!==serialized)this.current={id:randomUUID(),serialized};
+    return this.view(c,this.current.id);
+  }
+  import(c:Config, current:Config){
+    this.imported={id:randomUUID(),basis:this.serialized(current),advanced:c};
+    return this.view(c,this.imported.id);
+  }
+  propose(value:unknown,current:Config):{config:Config;imported:boolean}{
+    keys(value,['config','configDraftId'],['config','configDraftId']);
+    record(value.config);
+    const source=this.imported?.id===value.configDraftId?this.imported:undefined;
+    const basis=this.serialized(current);
+    if(source?source.basis!==basis:!this.current||this.current.id!==value.configDraftId||this.current.serialized!==basis)fail('CONFIG_CHANGED_ON_DISK');
+    const original=source?.advanced??current;
+    const raw=structuredClone(value.config);
+    // Hidden controls are authoritative in the main process, not renderer.
+    if(original.local!==undefined)raw.local=original.local;else delete raw.local;
+    if(original.backends!==undefined){raw.backends=original.backends;delete raw.backend;}
+    else {
+      delete raw.backends;record(raw.backend);
+      delete raw.backend.codexHome;delete raw.backend.aliases;
+      if(original.backend.codexHome!==undefined)raw.backend.codexHome=original.backend.codexHome;
+      if(original.backend.aliases!==undefined)raw.backend.aliases=original.backend.aliases;
+    }
+    if(original.defaultServerId!==undefined)raw.defaultServerId=original.defaultServerId;else delete raw.defaultServerId;
+    if(original.slack.enabled===false)raw.slack=original.slack;
+    else{
+      record(raw.slack);delete raw.slack.servers;
+      if(original.slack.servers!==undefined)raw.slack.servers=original.slack.servers;
+      if(original.slack.enabled!==undefined)raw.slack.enabled=original.slack.enabled;else delete raw.slack.enabled;
+    }
+    return {config:safeConfig(raw),imported:!!source};
+  }
+}
+
 export type PidState='alive'|'dead'|'unknown';
 export type PidProbe=(pid:number)=>PidState;
 const probePid:PidProbe=pid=>{try{process.kill(pid,0);return'alive';}catch(e){return (e as NodeJS.ErrnoException).code==='ESRCH'?'dead':'unknown';}};

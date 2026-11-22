@@ -166,3 +166,37 @@ test('a delayed pre-save poll cannot restore stale config or runtime after a suc
     assert.equal(f.calls.filter(c => c.name === 'saveConfig').at(-1)?.arg.slack.teamId, 'TSAVED');
   } finally { f.close(); }
 });
+
+test('local-only registry preview can save without Slack tokens, ID fields or a fabricated backend',async()=>{
+  const state:any=initial();state.configDraftId='native-draft';delete state.config.backend;
+  state.config.backends={A:{executable:'/fixture/a',codexHome:'/mock/home-a'},B:{executable:'/fixture/b',aliases:['other'],socketPath:'/mock/b.sock'}};
+  state.config.local={enabled:true};state.config.slack={enabled:false};state.credentials={};
+  state.runtime={state:'running',owned:true,servers:[{serverId:'A',connected:true},{serverId:'B',connected:false}]};
+  const f=fixture({saveConfig:v=>({...state,config:v.config})},state);
+  try{
+    await settle();assert.equal(f.$('slack-credentials-section').hidden,true);assert.equal(f.$('team-id').disabled,true);
+    assert.equal(f.$('codex-path').disabled,true);assert.match(f.$('registry-note').textContent,/未设置默认目标/);
+    assert.match(f.$('connection-badge').textContent,/1 个目标在线/);assert.equal(f.$('overview-title').textContent,'连接你的本机 Codex');
+    f.input('port','17382'); assert.equal(f.$('config-form').checkValidity(),true);
+    f.$('config-form').dispatchEvent(new f.w.Event('submit',{bubbles:true,cancelable:true}));await settle();
+    const arg=f.calls.find(c=>c.name==='saveConfig')?.arg;assert.equal(arg.configDraftId,'native-draft');assert.equal(arg.config.port,17382);
+    assert.deepEqual(arg.config.backends,state.config.backends);assert.equal(Object.hasOwn(arg.config,'backend'),false);assert.deepEqual(arg.config.slack,{enabled:false});
+  }finally{f.close();}
+});
+test('Slack-only overview reports that the silent local API remains disabled',async()=>{
+  const state:any=initial();state.config.local={enabled:false};state.runtime={state:'running',owned:true};
+  const f=fixture({},state);try{
+    await settle();assert.match(f.$('connection-badge').textContent,/仅 Slack 模式/);
+    assert.match(f.$('overview-mode').textContent,/本机 API 关闭/);
+    assert.equal(f.$('slack-credentials-section').hidden,false);
+  }finally{f.close();}
+});
+
+test('unrelated Desktop edits do not pin an unpinned CLI dot to its first trusted bot',async()=>{
+  const state:any=initial();delete state.config.slack.dot.userId;
+  const f=fixture({},state);try{
+    await settle();f.input('port','17382');f.$('config-form').dispatchEvent(new f.w.Event('submit',{bubbles:true,cancelable:true}));await settle();
+    const saved=f.calls.find(c=>c.name==='saveConfig')?.arg;assert.deepEqual(saved.slack.dot,{name:'My dot'});
+    assert.deepEqual(saved.slack.trustedBots,state.config.slack.trustedBots);
+  }finally{f.close();}
+});

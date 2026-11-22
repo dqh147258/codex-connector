@@ -151,7 +151,7 @@ test('mixed native-turn user inputs in recovered history deny ownership even acr
   const e=(id:string)=>({turnId:'collision',item:{type:'userMessage',id:'input-'+id,clientId:id}});
   backend.rpc=async(method,p)=>method==='thread/turns/list'?{data:[terminal('collision').turn],nextCursor:null}:
     p.cursor?{data:[e('c')],nextCursor:null}:{data:[item('collision','not authorized'),e('a')],nextCursor:'second'};
-  await events.recover(A);const r=await events.poll(A,events.subscribe(A));assert.equal(r.events.length,0);
+  const a=events.subscribe(A);await events.recover(A);const r=await events.poll(A,a);assert.equal(r.events.length,0);
   assert.equal(r.gap?.reason,'ownership_uncertain');assert.ok(!JSON.stringify(store.state).includes('not authorized'));
   assert.equal(store.state.work[0]!.messageDelivery!.execution,'completed');assert.equal(store.state.work[0]!.messageDelivery!.correlationConflict,undefined);
 });
@@ -174,4 +174,86 @@ test('mixed or missing clientId suppresses local event content independently of 
   assert.equal(r.events.length,0);assert.equal(r.gap?.reason,'ownership_uncertain');assert.ok(!JSON.stringify(store.state).includes('after ambiguous input'));
   const d=store.state.work[0]!.messageDelivery!;
   assert.equal(d.start,'accepted');assert.equal(d.execution,'completed');assert.equal(d.correlationConflict,undefined);
+});
+function many(count:number):{state:State;scopes:LocalEventScope[]} {
+  const state=fresh(true),template=state.sessions[0]!;
+  const scopes=Array.from({length:count},(_,i)=>({...A,sessionId:'scope-'+i,threadId:'native-'+i}));
+  state.sessions=scopes.map(({sessionId,threadId})=>({...template,id:sessionId,threadId}));
+  return {state,scopes};
+}
+test('cancelling 100 unique streams releases capacity across restart; delayed cursors and automatic notifications do not revive a stream',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'local-event-cancel-'));let store=new Store(dir);const backend=new FakeBackend();backend.connected=true;
+  const {state,scopes}=many(101),scope=scopes[0]!,later=scopes[100]!;
+  try{
+    store.transaction(s=>Object.assign(s,state));let events=new LocalEvents(store,backend,'server');
+    const old=scopes.slice(0,100).map(x=>events.subscribe(x));
+    assert.throws(()=>events.subscribe(later),/STREAM_LIMIT/);
+    for(const [i,x] of scopes.slice(0,100).entries())events.cancel(x,old[i]!.subscriptionId);
+    store.close();store=new Store(dir);events=new LocalEvents(store,backend,'server');
+    assert.deepEqual(events.list(),[]);
+    const expired=old[0]!;
+    assert.throws(()=>events.subscribe(scope,expired.cursor),/INVALID_LOCAL_EVENT_CURSOR/);
+    events.observe('item/completed',{...item('ignored','ignored while paused'),threadId:scope.threadId},backend.epoch);
+    await events.recover(scope);
+    assert.equal(backend.calls.length,0);assert.deepEqual(events.list(),[]);
+    assert.ok(!JSON.stringify(store.state).includes('ignored while paused'));
+    const last=events.subscribe(later);assert.equal(events.list().length,1);assert.equal((await events.poll(later,last)).events.length,0);
+    const current=events.subscribe(scope);
+    assert.notEqual(current.subscriptionId,expired.subscriptionId);
+    assert.notEqual(current.cursor,expired.cursor);
+    assert.throws(()=>events.subscribe(scope,expired.cursor),/INVALID_LOCAL_EVENT_CURSOR/);
+    await assert.rejects(events.poll(scope,{subscriptionId:current.subscriptionId,cursor:expired.cursor}),/INVALID_LOCAL_EVENT_CURSOR/);
+    assert.throws(()=>events.cancel(scope,expired.subscriptionId),/LOCAL_EVENT_SUBSCRIPTION_UNAVAILABLE/);
+    events.observe('item/completed',{...item('fresh','fresh notification'),threadId:scope.threadId},backend.epoch);
+    assert.equal((await events.poll(scope,current)).events.length,1);
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('migrates previously cancelled v1 rows without invalidating the untouched active stream or reactivating paused observation',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'local-event-paused-migration-'));let store=new Store(dir);const backend=new FakeBackend();backend.connected=true;
+  const {state,scopes}=many(101),cancelled=scopes[0]!,active=scopes[99]!,later=scopes[100]!;
+  try{
+    store.transaction(s=>Object.assign(s,state));let events=new LocalEvents(store,backend,'server');
+    const initial=scopes.slice(0,100).map(s=>events.subscribe(s));
+    events.observe('item/completed',{...item('kept','kept event'),threadId:active.threadId},backend.epoch);
+    const kept=await events.poll(active,initial[99]!);assert.equal(kept.events.length,1);
+    // Write the old representation of unwatch, including the version-1 keys.
+    store.transaction(s=>{
+      const j=(s as State & {localEventJournal:{streams:{enabled:boolean;records:unknown[];seen:string[]}[]}}).localEventJournal;
+      for(const r of j.streams.slice(0,99)){r.enabled=false;r.records=[];r.seen=[];}
+    });
+    store.close();store=new Store(dir);events=new LocalEvents(store,backend,'server');
+    assert.deepEqual(events.list().map(s=>s.subscriptionId),[initial[99]!.subscriptionId]);
+    const oldPage=await events.poll(active,initial[99]!);assert.equal(oldPage.events[0]!.id,kept.events[0]!.id);
+    assert.equal((await events.poll(active,{subscriptionId:initial[99]!.subscriptionId,cursor:kept.nextCursor})).events.length,0);
+    events.observe('item/completed',{...item('ignored','never backfill'),threadId:cancelled.threadId},backend.epoch);
+    assert.throws(()=>events.subscribe(cancelled,initial[0]!.cursor),/INVALID_LOCAL_EVENT_CURSOR/);
+    assert.equal(events.list().length,1);
+    assert.ok(events.subscribe(later).subscriptionId);
+    assert.ok(!JSON.stringify(store.state).includes(initial[0]!.subscriptionId));
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('unwatch prevents already-running recovery from publishing into the replacement stream',async()=>{
+  const {backend,events}=setup(true),old=events.subscribe(A);
+  let deliver!: (v:unknown)=>void,started!:()=>void;
+  const ready=new Promise<void>(r=>{started=r;});
+  backend.rpc=async method=>method==='thread/turns/list'?{data:[terminal('pending').turn],nextCursor:null}:
+    new Promise(r=>{deliver=r;started();});
+  const recovery=events.recover(A,old.subscriptionId);await ready;
+  events.cancel(A,old.subscriptionId);
+  const fresh=events.subscribe(A);
+  deliver({data:[item('pending','earlier stream in flight')],nextCursor:null});
+  await recovery;
+  assert.equal((await events.poll(A,fresh)).events.length,0);
+  assert.equal((await events.poll(A,fresh)).gap,null);
+  await assert.rejects(events.poll(A,old),/LOCAL_EVENT_SUBSCRIPTION_UNAVAILABLE/);
+});
+test('an old exclusive native event cannot be retroactively published after sharing even if a receipt appears later',async()=>{
+  const {backend,store,events}=setup(true),sub=events.subscribe(A);
+  events.observe('item/completed',item('old-turn','exclusive observation'),backend.epoch);
+  assert.equal((await events.poll(A,sub)).events[0]!.workId,null);
+  store.transaction(s=>{s.sessions[0]!.channel='COUT';s.work.push(work('late-receipt',A.principal,'old-turn'),work('proper',A.principal,'new-turn'));});
+  events.observe('item/completed',item('new-turn','proved on shared session'),backend.epoch);
+  const page=await events.poll(A,sub);
+  assert.equal(page.gap?.reason,'ownership_uncertain');
+  assert.deepEqual(page.events.map(e=>e.workId),['proper']);
 });

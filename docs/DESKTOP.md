@@ -81,3 +81,12 @@ Draft PR 的同仓限定路径触发两个标准 macOS runner（arm64/x64），�
 `self-address-v2` 对已认证 bot 支持自身 `<@USER_ID>`、`<@USER_ID|显示名>` 和 `&lt;@USER_ID&gt;` 三种开头地址。ID 必须等于 auth.test 返回的 Connector 自身 user ID；显示名不授予权限。只替换完整地址 token，随后要求一个空格、LF 或 CRLF 以及严格 envelope。额外说明、其他 ID、重复 @ 或 block 正文不一致仍拒绝。人类消息只保留原 canonical 地址支持，查询到的审批证据不做这种转换。
 
 可用无 @ 的 `capabilities` 检查 `slackTransport.revision` 和 `connectorUserId`；错误只含固定阶段，不回显原始消息。此变更有合成回归测试，实际 Socket Mode 传输仍需安装后验收。绝对路径读取开关仍仅能由操作者在本地确认，未添加 Slack 开启命令。
+
+
+### 使用 CLI 配置与多目标
+
+桌面和 CLI 使用相同的配置规则。桌面仍使用应用专属的私有状态目录；CLI 默认目录不会被自动接管。可以在「设置向导」导入有效的 CLI `config.json`，先预览，再确认保存。导入不改原文件、不复制会话状态或 Slack 令牌。希望 CLI 使用同一已保存的桌面配置时，由操作者明确传入对应的 `--home`；不要同时启动两个实例。
+
+- 仅本机配置不要求 Slack 身份或令牌。本机 + Slack 模式下 Slack 未核实时，本机仍可用。仅 Slack 时本地 API 不监听，因此桌面不能从本机显示后端的在线状态或读取会话。
+- 当前向导可以编辑传统单目标的部分设置。显式多目标的 Home / socket / 别名、默认 ID、模式、Slack 目标权限和本机 Agent 授权以配置文件为准，普通保存会保留，否则应编辑文件或重新导入。Agent 凭据摘要不传给界面；它们不是 Slack 令牌，不应从任何界面复制明文凭据。
+- 多目标无默认时，桌面不猜某个目标去读会话；使用 CLI 显式选择。配置在编辑期间被 CLI 修改时，桌面拒绝旧表单覆盖。

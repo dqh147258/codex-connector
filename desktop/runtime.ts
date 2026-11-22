@@ -5,31 +5,33 @@ import { readFileSync, existsSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import type { Config } from '../src/types.js';
 import { commandRequest } from '../src/client.js';
-import { codexLaunch } from '../src/codex.js';
+import { defaultServer } from '../src/servers.js';
+import { codexLaunch, proxyEnvironment } from '../src/codex.js';
 import { sessionListParams } from './ipc-policy.js';
 const exec = promisify(execFile);
-export type RuntimeSnapshot={state:'stopped'|'starting'|'running'|'stopping'|'failed';owned:boolean;backend?:Record<string,unknown>;lastError?:string};
-export function desktopChildEnvironment(home:string,tokens:{appToken:string;botToken:string},base:NodeJS.ProcessEnv=process.env):NodeJS.ProcessEnv{
-  const env={...base};for(const key of ['NODE_OPTIONS','NODE_PATH','ELECTRON_NO_ASAR','ELECTRON_ENABLE_LOGGING','CONNECTOR_TOKEN','CONNECTOR_HOME','SLACK_APP_TOKEN','SLACK_BOT_TOKEN'])delete env[key];
-  return {...env,ELECTRON_RUN_AS_NODE:'1',CONNECTOR_DESKTOP_CHILD:'1',CONNECTOR_HOME:home,SLACK_APP_TOKEN:tokens.appToken,SLACK_BOT_TOKEN:tokens.botToken};
+export type RuntimeSnapshot={state:'stopped'|'starting'|'running'|'stopping'|'failed';owned:boolean;backend?:Record<string,unknown>;lastError?:string;slackConnected?:boolean;servers?:{serverId:string;connected:boolean}[]};
+export function desktopChildEnvironment(home:string,tokens:{appToken:string;botToken:string}|undefined,base:NodeJS.ProcessEnv=process.env):NodeJS.ProcessEnv{
+  const env=proxyEnvironment({executable:process.execPath},base);
+  for(const key of Object.keys(env))if(/^(?:NODE_OPTIONS|NODE_PATH|ELECTRON_NO_ASAR|ELECTRON_ENABLE_LOGGING)$/i.test(key))delete env[key];
+  return {...env,ELECTRON_RUN_AS_NODE:'1',CONNECTOR_DESKTOP_CHILD:'1',CONNECTOR_HOME:home,...(tokens?{SLACK_APP_TOKEN:tokens.appToken,SLACK_BOT_TOKEN:tokens.botToken}:{})};
 }
 export class DesktopRuntime {
-  private child?:ChildProcess;private state:RuntimeSnapshot['state']='stopped';private lastError?:string;private backend?:Record<string,unknown>;private stopping?:Promise<RuntimeSnapshot>;private config?:Config;
+  private child?:ChildProcess;private state:RuntimeSnapshot['state']='stopped';private lastError?:string;private backend?:Record<string,unknown>;private stopping?:Promise<RuntimeSnapshot>;private config?:Config;private status?:Pick<RuntimeSnapshot,'slackConnected'|'servers'>;
   constructor(private home:string,private cliPath:string,private executable=process.execPath,private spawnChild:typeof spawn=spawn,private stopTimeout=45000,private screens?:ScreenPort){}
-  snapshot():RuntimeSnapshot{return{state:this.state,owned:!!this.child,backend:this.backend,lastError:this.lastError};}
-  start(config:Config,tokens:{appToken:string;botToken:string}){
+  snapshot():RuntimeSnapshot{return{state:this.state,owned:!!this.child,backend:this.backend,lastError:this.lastError,...this.status};}
+  start(config:Config,tokens?:{appToken:string;botToken:string}){
     if(this.child||this.stopping)throw Error('ALREADY_RUNNING');
     if(existsSync(join(this.home,'daemon.lock')))throw Error('LOCK_EXISTS');
-    this.config=structuredClone(config);this.state='starting';this.backend=undefined;this.lastError=undefined;
+    this.config=structuredClone(config);this.state='starting';this.backend=undefined;this.status=undefined;this.lastError=undefined;
     let child:ChildProcess;
-    try{child=this.spawnChild(this.executable,[this.cliPath,'start','--home',this.home],{env:desktopChildEnvironment(this.home,tokens),shell:false,windowsHide:true,stdio:['ignore','pipe','pipe','ipc']});}
+    try{child=this.spawnChild(this.executable,[this.cliPath,'start','--home',this.home],{env:desktopChildEnvironment(this.home,config.slack?.enabled===false?undefined:tokens),shell:false,windowsHide:true,stdio:['ignore','pipe','pipe','ipc']});}
     catch{this.state='failed';this.lastError='SERVER_START_FAILED';throw Error('SERVER_START_FAILED');}
     this.child=child;
     // Never forward stdout/stderr: upstream diagnostics can contain private data.
     child.stdout?.on('data',()=>{});child.stderr?.on('data',()=>{});
     child.on('message',(m:any)=>{if(this.child!==child)return;if(m?.type==='connector:screens'){void this.screenRequest(child,m);return;}if(m?.type==='connector:ready'&&this.state==='starting')this.state='running';if(m?.type==='connector:stopping')this.state='stopping';if(m?.type==='connector:failure'&&['LOCK_EXISTS','CONFIGURATION_INVALID','LOCAL_PORT_IN_USE','WORKSPACE_MISMATCH','SLACK_AUTH_FAILED','SERVER_START_FAILED'].includes(m.code)){this.lastError=m.code;this.state='failed';}});
     child.on('error',()=>{if(this.child===child){this.lastError='SERVER_START_FAILED';this.state='failed';}});
-    child.on('close',(code)=>{if(this.child!==child)return;this.child=undefined;this.backend=undefined;const requested=this.state==='stopping';this.state=requested||code===0?'stopped':'failed';if(this.state==='failed'&&!this.lastError)this.lastError='SERVER_EXITED';});
+    child.on('close',(code)=>{if(this.child!==child)return;this.child=undefined;this.backend=undefined;this.status=undefined;const requested=this.state==='stopping';this.state=requested||code===0?'stopped':'failed';if(this.state==='failed'&&!this.lastError)this.lastError='SERVER_EXITED';});
     return this.snapshot();
   }
   private screenRequestBusy=false;
@@ -53,18 +55,25 @@ export class DesktopRuntime {
     finally{if(timer)clearTimeout(timer);this.screenRequestBusy=false;}
   }
   async refresh(){
-    if(this.state!=='running'||!this.child||!this.config)return this.snapshot();
+    if(this.state!=='running'||!this.child||!this.config||this.config.local?.enabled===false)return this.snapshot();
     const child=this.child;
     try{const token=readFileSync(join(this.home,'api.token'),'utf8').trim();const result=await commandRequest(this.config.port,token,{action:'status'}) as any;
       if(this.child!==child||this.state!=='running')return this.snapshot();
-      const c=result?.result?.capabilities;if(!c||typeof c.connected!=='boolean')throw Error();
-      this.backend={connected:c.connected,version:c.version,expectedVersion:c.expectedVersion,lastFailure:c.lastFailure,daemonStart:c.daemonStart,unsupportedMethods:c.unsupportedMethods};
-    }catch{if(this.child===child)this.lastError='STATUS_UNAVAILABLE';}
+      const status=result?.result,c=status?.capabilities;
+      if(!status||(!c&&!Array.isArray(status.servers))||(c&&typeof c.connected!=='boolean'))throw Error();
+      this.backend=c?{connected:c.connected,version:c.version,expectedVersion:c.expectedVersion,lastFailure:c.lastFailure,daemonStart:c.daemonStart,unsupportedMethods:c.unsupportedMethods}:undefined;
+      if(this.lastError==='STATUS_UNAVAILABLE')this.lastError=undefined;
+      this.status={slackConnected:status.slackConnected===true,servers:Array.isArray(status.servers)?
+        status.servers.slice(0,32).filter((row:any)=>row&&typeof row.serverId==='string'&&/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(row.serverId)&&typeof row.connected==='boolean')
+          .map((row:any)=>({serverId:row.serverId,connected:row.connected})):undefined};
+    }catch{if(this.child===child){this.lastError='STATUS_UNAVAILABLE';this.backend=undefined;this.status=undefined;}}
     return this.snapshot();
   }
   async listSessions(value:unknown):Promise<{sessions:Record<string,unknown>[];nextCursor:string|null;scope?:unknown}>{
     const params=sessionListParams(value);
     if(this.state!=='running'||!this.child||!this.config)throw Error('SESSION_SERVER_NOT_RUNNING');
+    if(this.config.local?.enabled===false)throw Error('LOCAL_DISABLED');
+    if(this.config.backends!==undefined&&!defaultServer(this.config))throw Error('SERVER_SELECTION_REQUIRED');
     const child=this.child;
     let response:any;
     try{
@@ -96,7 +105,7 @@ export class DesktopRuntime {
 }
 export async function probeCodex(executable:string,run=exec){
   if(typeof executable!=='string'||!isAbsolute(executable)||executable.length>4096||/\.(cmd|bat)$/i.test(executable))throw Error('INVALID_EXECUTABLE');
-  const env={...process.env,ELECTRON_RUN_AS_NODE:'1'};for(const k of ['SLACK_APP_TOKEN','SLACK_BOT_TOKEN','CONNECTOR_TOKEN','NODE_OPTIONS','NODE_PATH'])delete (env as NodeJS.ProcessEnv)[k];
+  const env=proxyEnvironment({executable});env.ELECTRON_RUN_AS_NODE='1';delete env.NODE_OPTIONS;delete env.NODE_PATH;
   async function invoke(args:string[]){const c=codexLaunch(executable,args);return run(c.file,c.args,{env,timeout:10000,maxBuffer:65536,shell:false,windowsHide:true});}
   let version:string|null=null;
   try{const r=await invoke(['--version']);const match=String(r.stdout).trim().match(/^(?:codex(?:-cli)?\s+)?(\d+\.\d+\.\d+(?:[-+.][a-zA-Z0-9.]+)?)$/);version=match?.[1]??null;}catch{return{version:null,proxySupported:false,daemonStartSupported:false,error:'CODEX_VERSION_UNAVAILABLE'};}

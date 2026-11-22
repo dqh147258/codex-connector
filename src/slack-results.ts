@@ -4,6 +4,7 @@ import { COMMANDS } from './protocol.js';
 import { formatRpcDiagnostic } from './rpc-diagnostics.js';
 import type { Config, ResultSnapshot, Source, State, Work } from './types.js';
 
+export const SLACK_SCOPE_VERSION=1;
 export const RESULT_TTL_MS=15*60*1000;
 export const RESULT_PAGE_SIZE=1600;
 export const RESULT_MAX_CHARS=250000;
@@ -18,7 +19,7 @@ export function resultSensitive(value:unknown):boolean {
 export function storeResult(state:State,work:Work,result:unknown,config:Config,now=Date.now()):ResultSnapshot|undefined{
   const text=typeof result==='string'?result:JSON.stringify(result,null,2);
   if(typeof text!=='string'||text.length>RESULT_MAX_CHARS||containsSensitiveContent(text)||resultSensitive(result))return;
-  const snapshot:ResultSnapshot={id:randomUUID(),command:work.request.command,source:work.source,createdAt:now,expiresAt:now+RESULT_TTL_MS,policy:resultPolicy(config),text};
+  const snapshot:ResultSnapshot={scopeVersion:SLACK_SCOPE_VERSION,id:randomUUID(),command:work.request.command,source:work.source,createdAt:now,expiresAt:now+RESULT_TTL_MS,policy:resultPolicy(config),text};
   const data=result as any;if(['session.list','result.next'].includes(work.request.command)&&Array.isArray(data?.sessions)&&data.nextCursor)snapshot.nextQuery={view:data.view,limit:Math.min(data.pageLimitPerSource,10),cursor:data.nextCursor,...(data.project?{project:data.project}:{})};
   if(['session.messages','result.next'].includes(work.request.command)&&data?.kind==='session.messages'&&data.nextCursor){snapshot.nextCommand='session.messages';snapshot.nextQuery={threadId:data.threadId,role:data.role,order:data.order,limit:data.limit,maxChars:data.maxChars,cursor:data.nextCursor};}
   if(['session.search','result.next'].includes(work.request.command)&&data?.kind==='session.search'&&data.nextCursor){snapshot.nextCommand='session.search';snapshot.nextQuery={terms:data.terms,mode:data.mode,role:data.role,sessionLimit:data.sessionLimit,limit:data.limit,maxChars:data.maxChars,cursor:data.nextCursor};}

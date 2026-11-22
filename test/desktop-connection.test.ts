@@ -109,7 +109,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { DesktopSettings } from '../desktop/settings.js';
+import { DesktopConfigDrafts, DesktopSettings } from '../desktop/settings.js';
 import { DesktopRuntime } from '../desktop/runtime.js';
 function integratedFixture() {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'desktop-reconnect-')));
@@ -195,14 +195,15 @@ test('production reconnect uses replacement encrypted credentials and preserves 
   } finally { f.close(); }
 });
 
+import { configuredServers } from '../src/servers.js';
 import { runInNewContext } from 'node:vm';
 test('main snapshot reads saved settings after asynchronous runtime refresh, not before', async () => {
   const source = readFileSync('desktop/main.ts', 'utf8'), begin = source.indexOf('async function snapshot()'), end = source.indexOf('\nasync function confirm(', begin);
   assert.ok(begin >= 0 && end > begin);
   const gate = deferred<RuntimeSnapshot>();
-  let config = { instanceId: 'old', backend: { executable: '/fixture/codex' } }, tokens = false;
+  let config = { instanceId: 'old', slack: {}, backend: { executable: '/fixture/codex' } }, tokens = false;
   const snapshot = runInNewContext(`(${source.slice(begin, end)})`, {
-    runtime: { refresh: () => gate.promise }, settings: { readConfig: () => structuredClone(config), readPreferences: () => ({}), credentialStatus: () => ({ appToken: tokens, botToken: tokens, secureStorageAvailable: true }) },
+    draftConfig: new DesktopConfigDrafts(),runtime: { refresh: () => gate.promise }, settings: { readConfig: () => structuredClone(config), readPreferences: () => ({}), credentialStatus: () => ({ appToken: tokens, botToken: tokens, secureStorageAvailable: true }) },
     connection: { settingsBusy: false }, login: () => ({}), process: { platform: 'darwin' }, app: { isPackaged: false }
   }) as () => Promise<any>;
   const pending = snapshot(); config = { ...config, instanceId: 'new' }; tokens = true;
@@ -219,9 +220,10 @@ test('a post-save snapshot read failure does not reject an already persisted con
     const saveStart = source.indexOf('saveConfig:') + 'saveConfig:'.length;
     const saveEnd = source.indexOf(',\n  saveCredentials:', saveStart);
     const runtime = { refresh: async () => f.runtime.snapshot(), snapshot: () => f.runtime.snapshot() };
-    const snapshot = runInNewContext('(' + source.slice(snapshotStart, snapshotEnd) + ')', { runtime, settings: f.settings, connection: f.connection });
-    const save = runInNewContext('(' + source.slice(saveStart, saveEnd) + ')', { runtime, settings: f.settings, connection: f.connection, snapshot }) as (value: unknown) => Promise<any>;
-    const pending = save({ ...f.config, port: 17382 });
+    const draftConfig=new DesktopConfigDrafts(),draft=draftConfig.snapshot(f.settings.readConfig());
+    const snapshot = runInNewContext('(' + source.slice(snapshotStart, snapshotEnd) + ')', { runtime, settings: f.settings, connection: f.connection,draftConfig });
+    const save = runInNewContext('(' + source.slice(saveStart, saveEnd) + ')', { runtime, settings: f.settings, connection: f.connection, snapshot,draftConfig,configuredServers }) as (value: unknown) => Promise<any>;
+    const pending = save({ config:{...draft.config,port:17382},configDraftId:draft.configDraftId });
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(f.runtime.snapshot().state, 'stopping');
     f.children[0]!.close();
