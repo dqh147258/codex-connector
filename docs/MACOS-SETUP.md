@@ -1,6 +1,6 @@
 # macOS 配置与验收：Codex Connector 0.2 预发布版
 
-适用源码：以对应预发布附件 `RELEASE-INFO.json` 的 `sourceCommit` 为准。这是待你实机验收的预发布实现，不代表真实 macOS、Slack 或共享会话审批回放已全部通过。下面的安装、App 授权和启动操作均由你在本机审查后执行；不要把任何 token 发给 dot。
+适用源码：以对应预发布附件 `RELEASE-INFO.json` 的 `sourceCommit` 为准。这是待你实机验收的预发布实现，不代表真实 macOS、Slack 或共享会话有界观测已全部通过。下面的安装、App 授权和启动操作均由你在本机审查后执行；不要把任何 token 发给 dot。
 
 ## 1. 准备程序
 
@@ -72,7 +72,7 @@ SLACK_BOT_TOKEN=xoxb-替换为自己的令牌
 | `instanceId` | 例如 `carl-mac`，后续命令的 `target` 必须一致 |
 | `slack.teamId` | 目标工作区真实 `T…` ID |
 | `slack.inputChannel` / `outputChannel` | 刚选择的真实频道 `C…` 或 `G…` ID；不是频道名称/链接/DM ID |
-| `slack.allowedHumans` / `approvalUsers` | Carl 的真实 `U…` ID，审批用户必须也在 allowedHumans 中 |
+| `slack.allowedHumans` / `approvalUsers` | Carl 的真实 `U…` ID；兼容字段 approvalUsers 必须也在 allowedHumans 中，不授予原生决定权限 |
 | `slack.dot.name` | dot 的实际显示名；不是新建的 Codex Connector 名称 |
 | `slack.dot.userId` | dot 的稳定 `U…` ID，建议始终填写，避免重名 |
 | `slack.trustedBots` | **dot** 的 `botId: B…`、`userId: U…`、`appId: A…`；三者都必须匹配，不是新建 connector 的 ID |
@@ -150,13 +150,11 @@ node dist/src/cli.js envelope --name session.list --params '{"limit":20}'
 
 将每次 `envelope` 的三行输出作为一条消息发到**输入频道**；前后不加解释、代码围栏、@ 或任何其他字符。Carl 的白名单账号可先测，再让 dot 用同格式测；每次新动作使用新 ID。确认返回的 `connected`、失败原因、会话分页和可管理限制，不能只看到 “online” 就认定接管成功。
 
-验收顺序：help → capabilities → list → **明确挑选一个测试会话 attach** → 输出新 thread 正确 @dot → 再做该测试会话的发送/中断/人工审批。不要批量绑定生产会话。`session.list` 默认列出共享可见会话，不等于所有条目可管理；独立 `--no-daemon` 等例外不会被静默接管。
+验收顺序：help → capabilities → list → **明确挑选一个测试会话 attach** → 输出新 thread 正确 @dot → 再验收该测试会话的发送/中断和固定状态提示。原生审批留在原 Codex 界面。不要批量绑定生产会话。`session.list` 默认列出共享可见会话，不等于所有条目可管理；独立 `--no-daemon` 等例外不会被静默接管。
 
-### 人工审批必须这样做
+### 原生互动留在 Codex
 
-优先由 Carl **亲自回复该会话输出 thread**，完整使用 connector 给出的决定模板及 requestId/epoch/sessionId/turnId；不要只写“同意”，也不要在 DM 同意后让 dot 自称获准。
-
-另一条路径是 dot 携带 `humanMessageTs` 转交同 thread 的完整人类决定，connector 独立回读核验。当前 Slack [conversations.replies 文档](https://docs.slack.dev/reference/methods/conversations.replies/) 列出 bot token 的 `channels:history/groups:history`，但不能据此宣称你的工作区实测已通过；实际频道成员关系、授权、消息可见性或接口错误仍可能阻止回读。遇到 `NEED_VERIFIABLE_HUMAN_DECISION`，请 Carl 直接回原 thread；不要追加用户 token 或放宽审批白名单绕过。
+Slack 不转发原生会话正文、命令、文件差异或审批/输入提示的原文。即使已经绑定，也只能收到与原 Slack 操作关联的固定安全提示；看到 `LOCAL_ACTION_REQUIRED` 时，请返回原 Codex 界面查看并处理。不要在 Slack 回传决定模板，也不需要额外的 token 来回读“审批证明”。
 
 ## 6. 前台通过后，再考虑登录自启动
 

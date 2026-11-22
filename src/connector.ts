@@ -7,7 +7,7 @@ import { RecentSessions, RecentError } from './session-recent.js';
 import { deliveryId, deliveryStatus, deliveryView, observeMessage, observeTurn, terminalExecution, type MessageDelivery } from './session-delivery.js';
 import { recordActivity } from './session-activity.js';
 import { SessionSearch } from './session-search.js';
-import { SessionContent, SessionContentError, type ContentView } from './session-content.js';
+import { SessionContent, SessionContentError } from './session-content.js';
 import { SessionSubscriptions, SubscriptionError, type Subscription } from './subscriptions.js';
 import { Store } from './store.js';
 import { compactResult, storeResult, readResult, nextResultQuery, nextResultCommand, resultPolicy, resultSensitive, SLACK_SCOPE_VERSION } from './slack-results.js';
@@ -23,13 +23,24 @@ const decisionCommands=new Set(['approval.respond','input.respond']);
 const boundCommands=new Set(['session.delivery','session.info','session.history','session.send','session.steer','session.queue','session.interrupt','session.reply']);
 function short(value:unknown,max=20000){const text=typeof value==='string'?value:JSON.stringify(value,null,2);return text.length>max?text.slice(0,max)+'\n[truncated; request a smaller page]':text;}
 export interface RuntimeContext {
-  id:string; slackReady():boolean; servers(source:Source):unknown; principal(id:string):LocalPrincipal|undefined;
+  id:string; protectedHomes?:readonly string[]; unknownHome?:boolean; slackReady():boolean; servers(source:Source):unknown; principal(id:string):LocalPrincipal|undefined;
   route(serverId:unknown,command:string):'accept'|'other'|'reject'; defaultRoute:boolean;
 }
 const stable=(v:unknown):string=>JSON.stringify(v,(_,x)=>x&&typeof x==='object'&&!Array.isArray(x)?Object.fromEntries(Object.entries(x).sort(([a],[b])=>a<b?-1:a>b?1:0)):x);
-type HistoryRef=Extract<SlackTurnProof,{kind:'history'}>['turns'][number];
-interface OutputEvidence { history:Map<string,HistoryRef>; proof?:SlackTurnProof }
-const MAX_HISTORY_PROOF_TURNS=20;
+interface OutputEvidence { proof?:SlackTurnProof }
+const nativeContentCommands=new Set(['session.history','session.messages','session.overview','session.search']);
+const nativeNotice={
+  'progress':'Codex reported progress. Open the original Codex UI to read the output.',
+  'final':'A Codex answer is ready. Open the original Codex UI to read it.',
+  'completed':'The Codex turn completed.',
+  'failed':'The Codex turn failed. Inspect the original Codex UI.',
+  'interrupted':'The Codex turn was interrupted.',
+  'error':'Codex reported an execution error. Inspect the original Codex UI.',
+  'decision':'LOCAL_ACTION_REQUIRED: open the original Codex UI for this request.'
+} as const;
+type NativeNotice=keyof typeof nativeNotice;
+const safeThreadStatus=(value:unknown)=>typeof value==='string'&&['active','idle','notLoaded','systemError','unknown'].includes(value)?value:'unknown';
+const safeTurnStatus=(value:unknown)=>typeof value==='string'&&['inProgress','completed','failed','interrupted'].includes(value)?value:'unknown';
 const localTools=new Set(['server.list','session.list','session.attach','session.create','session.history','session.info','session.send','session.queue','session.interrupt','session.steer','session.delivery']);
 export class Connector {
   private running=new Map<string,Promise<void>>();private delivering?:Promise<void>;private closing=false;private lastPost=0;
@@ -55,7 +66,7 @@ export class Connector {
           if(s.results)s.results=s.results.filter(r=>this.scopeMatches(r,s));
         });
     }
-    this.files=new ReadonlyFiles(config.projects,{},config.filePolicy?.allowAbsolutePaths===true);
+    this.files=new ReadonlyFiles(config.projects,{},config.filePolicy?.allowAbsolutePaths===true,runtime?.protectedHomes);
     this.recent=new RecentSessions(backend,()=>this.store.state.activity||[],t=>this.threadSummary(t));
     const authorizeContent=(thread:any)=>{const cwd=this.canonicalCwd(thread?.cwd);if(!cwd||(!this.config.sessionPolicy?.allowAllSharedSessions&&!this.projectFor(cwd)))throw new ConnectorError('SESSION_SCOPE_NOT_ALLOWED');return this.threadSummary({...thread,cwd});};
     this.content=new SessionContent(backend,authorizeContent);
@@ -92,7 +103,7 @@ export class Connector {
     }catch{/* Server remains usable for help/files/status. No independent fallback. */}
     this.pump();this.flush();
   }
-  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],screenCapture:{enabled:this.config.screenPolicy?.enabled===true,desktopAvailable:!!this.screens,commands:['screen.list','screen.capture'],oneShot:true,unredacted:true,slackThreadOnly:true,maxDisplays:8,maxImageDimension:2560},fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:'direct configured humans or verified same-thread human envelope; bots alone cannot approve',sessionDelivery:{command:'session.delivery',correlation:'queue start turn ID or userMessage.clientId',automaticRetry:false,completion:'matched terminal turn only'},sessionRecent:{command:'session.recent',defaultLimit:5,maxLimit:20,globalTopN:false,observation:'Producer lifecycle timestamps only; no content or automatic subscriptions'},sessionSearch:{command:'session.search',defaultSessionLimit:10,maxSessionLimit:20,roles:['all','user','assistant'],modes:['and','or'],recentBy:'backend updated_at, not execution activity',matching:'case-insensitive literal terms within one message',readOnly:true,continuation:'result.next'},sessionContent:{overview:'session.overview',messages:'session.messages',batchMax:5,readOnly:true,semanticSummary:false},subscriptions:{commands:['session.subscribe','session.unsubscribe','session.subscriptions'],loadedOnly:true,localCancellationOnly:true},slackOutput:{mode:'compact',sessionDefaultView:'loaded',maxRowsPerSource:10,resultDetail:'result.page',nextPage:'result.next'},serviceManagement:'local template generation only'};}
+  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],screenCapture:{enabled:this.config.screenPolicy?.enabled===true,desktopAvailable:!!this.screens,commands:['screen.list','screen.capture'],oneShot:true,unredacted:true,slackThreadOnly:true,maxDisplays:8,maxImageDimension:2560},fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:this.runtime?'Original Codex UI only. Known exact-request timeout may refuse/cancel; no Slack approvals.':'direct configured humans or verified same-thread human envelope; bots alone cannot approve',sessionDelivery:{command:'session.delivery',correlation:'queue start turn ID or userMessage.clientId',automaticRetry:false,completion:'matched terminal turn only'},sessionRecent:{command:'session.recent',defaultLimit:5,maxLimit:20,globalTopN:false,observation:'Producer lifecycle timestamps only; no content or automatic subscriptions'},sessionSearch:{command:'session.search',defaultSessionLimit:10,maxSessionLimit:20,roles:['all','user','assistant'],modes:['and','or'],recentBy:'backend updated_at, not execution activity',matching:'case-insensitive literal terms within one message',readOnly:true,continuation:'result.next'},sessionContent:{overview:'session.overview',messages:'session.messages',slackNativeText:this.runtime===undefined,batchMax:5,readOnly:true,semanticSummary:false},subscriptions:{commands:['session.subscribe','session.unsubscribe','session.subscriptions'],loadedOnly:true,localCancellationOnly:true},slackOutput:{mode:'compact',sessionDefaultView:'loaded',maxRowsPerSource:10,resultDetail:'result.page',nextPage:'result.next'},serviceManagement:'local template generation only'};}
   private authorizeEvent(body:any):Source|undefined{
     const e=body?.event,s=this.config.slack;
     if(body?.team_id!==s.teamId||typeof body.event_id!=='string'||!e||e.type!=='message'||!['',undefined,'bot_message'].includes(e.subtype)||typeof e.text!=='string'||typeof e.user!=='string'||typeof e.ts!=='string'||!this.validTimestamp(e.ts)||(e.thread_ts!==undefined&&!this.validTimestamp(e.thread_ts)))return;
@@ -154,17 +165,17 @@ export class Connector {
       const w=this.store.state.work.find(w=>w.status==='queued'&&this.key(w)===key&&(!this.runtime||w.source.kind==='local'||this.runtime.slackReady()));if(!w)return;
       this.store.transaction(s=>{s.work.find(x=>x.id===w.id)!.status='executing';});
       try{
-        const evidence:OutputEvidence={history:new Map()}, initialPolicy=this.visibilityPolicy();
+        const evidence:OutputEvidence={}, initialPolicy=this.visibilityPolicy();
         this.reauthorize(w);let result=await this.execute(w,evidence);
         if(w.source.kind!=='local'&&COMMANDS[w.request.command].permission==='read'){
           this.reauthorize(w);
           if(initialPolicy!==this.visibilityPolicy())throw new ConnectorError('SESSION_SCOPE_CHANGED');
         }
-        const proof=evidence.proof??(evidence.history.size?{kind:'history' as const,turns:[...evidence.history.values()]}:undefined);
+        const proof=evidence.proof;
         this.store.transaction(s=>{const done=s.work.find(x=>x.id===w.id)!;done.status='completed';if(done.messageDelivery&&['session.send','session.queue'].includes(w.request.command))result=deliveryView(done);if(this.runtime&&w.source.kind==='local'){const str=JSON.stringify(result??null);done.localResult=Buffer.byteLength(str)>256*1024?{truncated:true,note:'Result exceeds 256 KiB. Request a smaller page.'}:containsSensitiveContent(str)||resultSensitive(result)?{withheld:true}:result;}const snapshot=w.source.kind!=='local'&&w.request.command!=='result.page'?storeResult(s,w,result,this.config,Date.now(),this.stampVisibility(s,proof)):undefined;done.resultRef={sessionId:this.outputSession(w,result),threadId:typeof result?.threadId==='string'?result.threadId:undefined,turnId:typeof result?.turnId==='string'?result.turnId:typeof result?.turn?.id==='string'?result.turn.id:undefined,resultId:snapshot?.id};const text=w.source.kind==='local'?`[request ${w.request.id}; work ${w.id}] ${short(result,w.request.command.startsWith('files.')||['session.list','session.recent','session.history','session.search'].includes(w.request.command)||result?.kind==='session.search'?500000:20000)}`:compactResult(w,result,snapshot);this.output(s,text+this.bindingNote(w,result),this.outputSession(w,result),w.source,proof);});
       }catch(e){
         const code=codeOf(e),uncertain=code==='SCREEN_UPLOAD_UNCERTAIN'||code==='RPC_OUTCOME_UNCERTAIN'&&COMMANDS[w.request.command].permission!=='read';
-        const reason=uncertain?(code==='SCREEN_UPLOAD_UNCERTAIN'?': inspect the Slack thread for partial or completed uploads; no automatic retry.':': inspect backend state; operation will not be replayed.'):code==='SCREEN_RESTART_REQUIRED'||code==='SCREEN_TIMEOUT'?': quit and reopen the desktop app before a new explicit capture request.':code==='SCREEN_PERMISSION_DENIED'?': grant Screen Recording permission in local OS settings, then restart the desktop app.':code==='SCREEN_UPLOAD_REJECTED'?': check Slack files:write scope, channel membership and rate limits; no automatic retry.':'';
+        const reason=uncertain?(code==='SCREEN_UPLOAD_UNCERTAIN'?': inspect the Slack thread for partial or completed uploads; no automatic retry.':': inspect backend state; operation will not be replayed.'):code==='SCREEN_RESTART_REQUIRED'||code==='SCREEN_TIMEOUT'?': quit and reopen the desktop app before a new explicit capture request.':code==='SCREEN_PERMISSION_DENIED'?': grant Screen Recording permission in local OS settings, then restart the desktop app.':code==='SCREEN_UPLOAD_REJECTED'?': check Slack files:write scope, channel membership and rate limits; no automatic retry.':code==='NATIVE_CONTENT_LOCAL_ONLY'?': open the original Codex UI or use authorized local history; native text is not forwarded to Slack.':code==='LOCAL_ACTION_REQUIRED'?': open the original Codex UI; no decision was sent.':'';
         this.store.transaction(s=>{const current=s.work.find(x=>x.id===w.id)!;current.status=uncertain?'uncertain':'failed';current.error=code;this.output(s,`[${w.id}] ${code}${reason}${current.messageDelivery?` Message evidence: ${deliveryView(current).deliveryStatus}; admission=${current.messageDelivery.admission}; start=${current.messageDelivery.start}; execution=${current.messageDelivery.execution}.${current.messageDelivery.admissionError?` Admission request: ${current.messageDelivery.admissionError} (${formatRpcDiagnostic(current.messageDelivery.admissionDiagnostic)}).`:""}${current.messageDelivery.startError?` Start request: ${current.messageDelivery.startError} (${formatRpcDiagnostic(current.messageDelivery.startDiagnostic)}).`:""} Check session.delivery {"sessionId":"${current.request.params.sessionId}","workId":"${current.id}"}. Do not resend.`:''}`,typeof w.request.params.sessionId==='string'?w.request.params.sessionId:undefined,w.source);});
         if(uncertain)return;
       }finally{this.flush();}
@@ -237,7 +248,7 @@ export class Connector {
   private scopeMatches(row:{scopeVersion?:number;visibility?:SlackVisibilityScope},state:Readonly<State>){
     if(!this.runtime)return true;
     const v=row.visibility,current=state.slackVisibility;
-    return row.scopeVersion===SLACK_SCOPE_VERSION&&!!v&&!!current&&deliveryId(current.generation)&&v.generation===current.generation&&v.policy===current.policy&&v.policy===this.visibilityPolicy();
+    return row.scopeVersion===SLACK_SCOPE_VERSION&&!!v&&(!v.proof||v.proof.kind==='live')&&!!current&&deliveryId(current.generation)&&v.generation===current.generation&&v.policy===current.policy&&v.policy===this.visibilityPolicy();
   }
   private output(state:State,text:string,sessionId?:string,source?:Source,proof?:SlackTurnProof){
     if(this.runtime&&(source?.kind==='local'||!this.runtime.slackReady()))return;
@@ -285,6 +296,11 @@ export class Connector {
   private checkProject(thread:any,alias:string){if(!this.validCwd(thread?.cwd)||!this.within(this.project(alias),thread.cwd))throw new ConnectorError('THREAD_PROJECT_MISMATCH');}
   private async metadata(s:Session){const r=await this.backend.rpc('thread/read',{threadId:s.threadId,includeTurns:false});this.checkSessionThread(r.thread,s);return r.thread;}
   private threadSummary(t:any){const project=this.validCwd(t.cwd)?this.projectFor(t.cwd):undefined,allowed=this.validCwd(t.cwd)&&(Boolean(project)||this.config.sessionPolicy?.allowAllSharedSessions===true);return{id:t.id,name:typeof t.name==='string'?t.name.slice(0,200):null,cwd:typeof t.cwd==='string'?t.cwd.slice(0,1024):null,project:project||null,manageable:allowed&&t.canAcceptDirectInput===true,reason:!allowed?'SESSION_SCOPE_NOT_ALLOWED':t.canAcceptDirectInput===false?'DIRECT_INPUT_UNAVAILABLE':t.canAcceptDirectInput!==true?'ATTACH_TO_CHECK_CAPABILITY':null,canAcceptDirectInput:t.canAcceptDirectInput??null,status:{type:t.status?.type||'unknown'},model:typeof t.model==='string'?t.model.slice(0,100):null,reasoningEffort:t.reasoningEffort??null,source:typeof t.source==='string'?t.source:'structured-source',connectorSessionId:this.store.state.sessions.find(s=>s.threadId===t.id)?.id||null};}
+  private safeSlackMetadata(raw:any){
+    return {name:null,cwd:null,model:null,reasoningEffort:null,source:'shared',
+      canAcceptDirectInput:typeof raw?.canAcceptDirectInput==='boolean'?raw.canAcceptDirectInput:null,
+      status:{type:safeThreadStatus(raw?.status?.type)}};
+  }
   private async direct(s:Session){if(!this.attached.has(s.threadId))throw new ConnectorError('SESSION_NOT_ATTACHED');const t=await this.metadata(s);if(t.canAcceptDirectInput!==true)throw new ConnectorError('DIRECT_INPUT_UNAVAILABLE');return t;}
   private deliveryWork(workId:string){return this.store.state.work.find(w=>w.id===workId)!;}
   private updateDelivery(workId:string,change:(d:MessageDelivery)=>void){this.store.transaction(state=>{const d=state.work.find(w=>w.id===workId)!.messageDelivery!;change(d);if(d.turnId){const cached=this.deliveryTurns.get(`${d.threadId}:${d.turnId}`);if(cached){if(cached.conflict)d.correlationConflict=true;observeTurn(d,cached.threadId,cached.turn,new Date().toISOString());}}});}
@@ -382,92 +398,42 @@ export class Connector {
     this.reauthorize(w);this.session(s.id);
     return{...deliveryView(this.deliveryWork(original.id)),backendConnected:this.backend.connected,coverage,scope:'Persisted evidence plus at most one queue, item and turn page on explicit refresh. Missing evidence remains unknown. No resend, start, resume or steering.'};
   }
-  private needsSlackProof(_threadId:unknown,_state?:Readonly<State>){
-    // Slack-only disables an entry point, not the native Desktop or other
-    // owner clients. An empty per-profile ledger cannot prove old text public.
-    return !!this.runtime;
-  }
-  private nativeItemWitness(item:any){
-    if(!deliveryId(item?.id)||!['userMessage','agentMessage'].includes(item.type))return;
-    return createHash('sha256').update(stable(item)).digest('hex');
-  }
-  private slackView(source:Source,evidence:OutputEvidence):ContentView|undefined{
-    if(!this.runtime||source.kind==='local')return;
-    const key=createHash('sha256').update(stable([this.visibilityPolicy(),this.store.state.slackVisibility?.generation,source.kind,source.userId,source.channel,source.threadTs])).digest('hex');
-    return {key,hideTitle:()=>true,filter:async(threadId,rows,read)=>{
-      const visible=new Set<string>();
-      for(const turnId of new Set(rows.filter(row=>['userMessage','agentMessage'].includes(row.item?.type)).map(row=>row.turnId))){
-        if(!deliveryId(turnId)||!this.slackClaim(threadId,turnId,source))continue;
-        const turnKey=stable([threadId,turnId]);
-        if(evidence.history.size>=MAX_HISTORY_PROOF_TURNS&&!evidence.history.has(turnKey))continue;
-        const proof=await this.verifyHistoryTurn(threadId,turnId,source,read);
-        if(!proof)continue;
-        const previous=evidence.history.get(turnKey);
-        if(previous&&previous.witness!==proof.witness)throw new ConnectorError('SESSION_SCOPE_CHANGED');
-        for(const row of rows.filter(r=>r.turnId===turnId)){
-          const digest=this.nativeItemWitness(row.item);
-          if(digest&&proof.items.get(row.item.id)===digest){
-            evidence.history.set(turnKey,{threadId,turnId,witness:proof.witness});
-            visible.add(stable([turnId,row.item.id,digest]));
-          }
-        }
-      }
-      return rows.filter(row=>{const digest=this.nativeItemWitness(row.item);return digest&&visible.has(stable([row.turnId,row.item.id,digest]));});
-    }};
-  }
-  private async verifyHistoryTurn(threadId:string,turnId:string,source:Source,read:(p:unknown)=>Promise<any>){
-    // Exact per-turn proof catches foreign input that arrived while offline.
-    // Persist only digests, never raw proof RPC data, tool outputs or prompts.
-    const inputs=new Map<string,string|null>(),items=new Map<string,string>(),ids=new Set<string>(),cursors=new Set<string>();
-    let cursor:string|undefined;
-    try{for(let i=0;i<4;i++){
-      const page=await read({threadId,turnId,limit:50,sortDirection:'asc',...(cursor?{cursor}:{})});
-      if(!Array.isArray(page?.data)||page.data.length>50||!(page.nextCursor===null||typeof page.nextCursor==='string'&&page.nextCursor.length>0&&page.nextCursor.length<=512&&!cursors.has(page.nextCursor)))return;
-      for(const row of page.data){
-        if(row?.turnId!==turnId||!deliveryId(row.item?.id)||ids.has(row.item.id)||typeof row.item.type!=='string')return;
-        ids.add(row.item.id);
-        if(row.item.type==='userMessage')inputs.set(row.item.id,deliveryId(row.item.clientId)?row.item.clientId:null);
-        const digest=this.nativeItemWitness(row.item);
-        if(digest)items.set(row.item.id,digest);
-      }
-      if(page.nextCursor===null){
-        if(!this.inputsBelong(threadId,turnId,inputs,source)){
-          const state=this.store.state,base=this.slackClaim(threadId,turnId,source,state);
-          if(base&&[...inputs.values()].includes(base.id)&&[...inputs.values()].some(id=>id===null||!this.matchSlackInput(threadId,turnId,id,base,state))){
-            this.store.transaction(draft=>{for(const w of draft.work)if(w.source.kind!=='local'&&w.messageDelivery?.threadId===threadId&&w.messageDelivery.turnId===turnId)w.slackMixedInput=true;});
-          }
-          return;
-        }
-        const witness=createHash('sha256').update(stable([[...inputs],[...items]])).digest('hex');
-        return{items,witness};
-      }
-      cursor=page.nextCursor as string;cursors.add(cursor);
-    }}catch{/* Unsupported/malformed/lapsed read supplies no evidence. */}
-  }
   private freshSnapshot(id:string,source:Source){
     const state=this.store.state,row=state.results?.find(r=>r.id===id);
     if(!row||row.expiresAt<=Date.now()||!this.samePrincipal(row.source,source)||!this.scopeMatches(row,state))throw new ConnectorError('RESULT_UNAVAILABLE');
     return row;
   }
-  private async searchSessions(w:Work,params:any,evidence:OutputEvidence){
+  private async searchSessions(w:Work,params:any){
     const policy=resultPolicy(this.config),scope=JSON.stringify({kind:w.source.kind,userId:w.source.userId,channel:w.source.channel,threadTs:w.source.threadTs,policy});
-    const result=await this.search.query(params,scope,this.slackView(w.source,evidence));
+    const result=await this.search.query(params,scope);
     this.reauthorize(w);if(resultPolicy(this.config)!==policy)throw new ConnectorError('SESSION_SCOPE_CHANGED');
     return result;
   }
   private async execute(w:Work,evidence:OutputEvidence):Promise<any>{
     const p=w.request.params as any,c=w.request.command;
     if(c==='server.list')return this.runtime?.servers(w.source)??[];
-    if(c==='session.search')return this.searchSessions(w,p,evidence);
-    if(c==='session.overview')return this.content.overview(p.threadIds,p.maxChars,this.slackView(w.source,evidence));
-    if(c==='session.messages')return this.content.messages(p,this.slackView(w.source,evidence));
+    // The shared App Server does not provide an atomic/exclusive provenance
+    // guarantee. A later read cannot make native text safe to send. This gate
+    // applies to both Slack modes and does not affect authorized local history.
+    const slackCommand=!!this.runtime&&w.source.kind!=='local';
+    if(slackCommand&&(nativeContentCommands.has(c)||this.runtime!.unknownHome&&c.startsWith('files.')))throw new ConnectorError('NATIVE_CONTENT_LOCAL_ONLY');
+    if(c==='session.search')return this.searchSessions(w,p);
+    if(c==='session.overview')return this.content.overview(p.threadIds,p.maxChars);
+    if(c==='session.messages')return this.content.messages(p);
     if(c==='session.subscribe'){const sub=await this.subscriptions.create(p.threadId,w.source);this.store.transaction(state=>{for(const o of state.outbox)if(o.status==='queued'&&!o.subscriptionId&&o.notificationThreadId===sub.threadId&&o.channel===sub.owner.channel&&o.threadTs===sub.owner.threadTs){o.status='failed';o.error='SUBSCRIPTION_ROUTE_REPLACED';}});return this.subscriptionSummary(sub);}
     if(c==='session.unsubscribe'){const result=this.subscriptions.cancel(p.subscriptionId,w.source);const sub=this.store.state.subscriptions?.find(s=>s.id===p.subscriptionId);if(sub)this.store.transaction(state=>{for(const o of state.outbox)if(o.status==='queued'&&!o.subscriptionId&&o.notificationThreadId===sub.threadId&&o.channel===sub.owner.channel&&o.threadTs===sub.owner.threadTs){o.status='failed';o.error='SUBSCRIPTION_CANCELLED';}});return result;}
     if(c==='session.subscriptions')return this.subscriptions.list(w.source).map(s=>this.subscriptionSummary(s));
-    if(c==='result.next'){this.freshSnapshot(p.resultId,w.source);let query;try{query=nextResultQuery(this.store.state,p.resultId,w.source,this.config);}catch{throw new ConnectorError('RESULT_UNAVAILABLE');}const command=nextResultCommand(this.store.state,p.resultId,w.source,this.config);return command==='session.search'?this.searchSessions(w,query as any,evidence):command==='session.messages'?this.content.messages(query as any,this.slackView(w.source,evidence)):this.list(query,undefined,undefined,w.source);}
+    if(c==='result.next'){
+      const row=this.freshSnapshot(p.resultId,w.source);
+      if(slackCommand&&(nativeContentCommands.has(row.command)||row.nextCommand&&nativeContentCommands.has(row.nextCommand)))throw new ConnectorError('NATIVE_CONTENT_LOCAL_ONLY');
+      let query;try{query=nextResultQuery(this.store.state,p.resultId,w.source,this.config);}catch{throw new ConnectorError('RESULT_UNAVAILABLE');}
+      const command=nextResultCommand(this.store.state,p.resultId,w.source,this.config);
+      return command==='session.search'?this.searchSessions(w,query as any):command==='session.messages'?this.content.messages(query as any):this.list(query,undefined,undefined,w.source);
+    }
     if(c==='result.page'){
       const row=this.freshSnapshot(p.resultId,w.source);
-      if(this.runtime&&!(await this.proveVisibility(row.visibility?.proof,w.source)))throw new ConnectorError('RESULT_UNAVAILABLE');
+      if(slackCommand&&(nativeContentCommands.has(row.command)||row.nextCommand&&nativeContentCommands.has(row.nextCommand)))throw new ConnectorError('NATIVE_CONTENT_LOCAL_ONLY');
+      if(this.runtime&&row.visibility?.proof&&!this.liveProofAllowed(row.visibility.proof,w.source))throw new ConnectorError('RESULT_UNAVAILABLE');
       this.freshSnapshot(p.resultId,w.source);
       try{
         const page=readResult(this.store.state,p.resultId,p.page,w.source,this.config);
@@ -494,11 +460,19 @@ export class Connector {
     }
     if(c==='files.list')return this.files.list(p.root,p.path,{limit:p.limit});if(c==='files.stat')return this.files.stat(p.root,p.path);
     if(c==='files.read')return this.files.read(p.root,p.path,{offset:p.offset,maxBytes:p.maxBytes});if(c==='files.search')return this.files.search(p.root,p.path,p.query,{limit:p.limit,maxDepth:p.maxDepth});
-    if(c==='approval.list')return this.store.state.pending.filter(r=>r.status==='pending'&&(!p.sessionId||r.sessionId===p.sessionId)&&(!this.needsSlackProof(r.threadId)||!!this.slackTurnSource(r.threadId,r.turnId)&&this.store.state.sessions.some(s=>s.id===r.sessionId&&s.channel===w.source.channel&&s.threadTs===w.source.threadTs))).map(({rpcId,details,...r})=>r);
-    if(decisionCommands.has(c))return this.answer(w);
+    if(c==='approval.list'){
+      const pending=this.store.state.pending.filter(r=>r.status==='pending'&&(!p.sessionId||r.sessionId===p.sessionId));
+      if(slackCommand)return pending.filter(r=>r.slackOwner&&this.samePrincipal(r.slackOwner,w.source)&&this.sameCurrentPending(r))
+        .map(r=>({id:r.id,sessionId:r.sessionId,turnId:r.turnId,kind:r.kind,expiresAt:r.expiresAt,status:'local-action-required'}));
+      return pending.map(({rpcId,details,...r})=>r);
+    }
+    if(decisionCommands.has(c)){
+      if(this.runtime)throw new ConnectorError('LOCAL_ACTION_REQUIRED');
+      return this.answer(w);
+    }
     if(c==='session.recent'){
       const result=await this.recent.query(p.limit);
-      if(w.source.kind!=='local'&&this.runtime)for(const row of [...result.sessions,...result.updatedCandidates])if(this.needsSlackProof(row.threadId))row.name=null;
+      if(slackCommand)for(const row of [...result.sessions,...result.updatedCandidates])Object.assign(row,this.safeSlackMetadata(row),{currentState:safeThreadStatus(row.currentState),activityTurnId:null});
       return result;
     }
     if(c==='session.list'&&this.runtime&&w.source.kind==='local'){
@@ -512,20 +486,18 @@ export class Connector {
     if(c==='session.delivery')return this.messageDelivery(w,s);
     if(c==='session.reply'){if(this.runtime&&(!s.channel||!this.runtime.slackReady()))throw new ConnectorError('SLACK_EXPLICIT_BINDING_UNAVAILABLE');this.store.transaction(state=>this.sessionText(state,p.text,s.id,w.source.kind==='local'&&this.runtime?undefined:w.source));return{sessionId:s.id,queued:true};}
     if(c==='session.info'){
-      const meta=await this.metadata(s),protectedSlack=w.source.kind!=='local'&&this.needsSlackProof(s.threadId);
+      const meta=await this.metadata(s),protectedSlack=slackCommand;
       const turns=await this.backend.rpc('thread/turns/list',{threadId:s.threadId,limit:3,itemsView:'notLoaded',sortDirection:'desc'});
-      return{sessionId:s.id,threadId:s.threadId,outputThread:w.source.kind==='local'&&this.runtime?null:s.threadTs||null,attached:this.attached.has(s.threadId),...this.threadSummary(meta),...(protectedSlack?{name:null}:{}),recentTurns:(turns.data||[]).filter((t:any)=>!protectedSlack||deliveryId(t.id)&&!!this.slackClaim(s.threadId,t.id,w.source)).map((t:any)=>({id:t.id,status:t.status}))};
+      return{sessionId:s.id,threadId:s.threadId,outputThread:w.source.kind==='local'&&this.runtime?null:s.threadTs||null,attached:this.attached.has(s.threadId),...this.threadSummary(meta),...(protectedSlack?this.safeSlackMetadata(meta):{}),recentTurns:(turns.data||[]).filter((t:any)=>!protectedSlack||deliveryId(t.id)&&!!this.slackClaim(s.threadId,t.id,w.source)).map((t:any)=>({id:t.id,status:protectedSlack?safeTurnStatus(t.status):t.status}))};
     }
     if(c==='session.history'){
       await this.metadata(s);
       const principal=this.runtime&&w.source.kind==='local'?this.runtime.principal(w.source.userId):undefined;
       const identity=this.runtime?stable([this.runtime.id,s.id,s.threadId,w.source.kind,w.source.userId,w.source.channel,w.source.threadTs,principal?this.grantFingerprint(principal):null]):'';
-      const view=w.source.kind!=='local'&&this.needsSlackProof(s.threadId)?this.slackView(w.source,evidence):undefined;
-      const scopeKey=identity&&createHash('sha256').update(view?stable([identity,view.key]):identity).digest('hex');
+      const scopeKey=identity&&createHash('sha256').update(identity).digest('hex');
       let cursor=p.cursor;
       if(cursor&&this.runtime){try{const [bound,native]=JSON.parse(Buffer.from(cursor,'base64url').toString());if(bound!==scopeKey||typeof native!=='string'||!native||native.length>1024)throw Error();cursor=native;}catch{throw new ConnectorError('INVALID_CURSOR');}}
-      const r=view?await this.content.boundPage(s.threadId,p.limit||20,cursor,view):await this.backend.rpc('thread/items/list',{threadId:s.threadId,limit:p.limit||20,cursor,sortDirection:'desc'});
-      if(view)await this.metadata(s);
+      const r=await this.backend.rpc('thread/items/list',{threadId:s.threadId,limit:p.limit||20,cursor,sortDirection:'desc'});
       if(!Array.isArray(r?.data)||r.data.length>(p.limit||20)||(r.nextCursor!=null&&(typeof r.nextCursor!=='string'||!r.nextCursor||r.nextCursor===cursor||r.nextCursor.length>1024)))throw new ConnectorError('INVALID_SESSION_PAGE');
       const next=this.runtime&&r.nextCursor?Buffer.from(JSON.stringify([scopeKey,r.nextCursor])).toString('base64url'):r.nextCursor||null;
       // A project-level history grant authorizes discovery, not broadcasting other
@@ -538,9 +510,15 @@ export class Connector {
     if(this.runtime&&s.localOwners?.length&&(s.channel||s.localOwners.length>1)&&['session.interrupt','session.steer'].includes(c)){
       const rows=this.turnEvidence(s,p.turnId);if(!rows.length||!rows.every(row=>this.usableEvidence(row)&&this.samePrincipal(row.source,w.source)))throw new ConnectorError('TURN_OWNER_UNVERIFIED');
     }
-    if(c==='session.interrupt')return this.backend.rpc('turn/interrupt',{threadId:s.threadId,turnId:p.turnId});
+    if(c==='session.interrupt'){
+      const result=await this.backend.rpc('turn/interrupt',{threadId:s.threadId,turnId:p.turnId});
+      return slackCommand?{threadId:s.threadId,turnId:p.turnId,interrupt:'submitted'}:result;
+    }
     const input=[{type:'text',text:p.text}];
-    if(c==='session.steer')return this.backend.rpc('turn/steer',{threadId:s.threadId,expectedTurnId:p.turnId,input,clientUserMessageId:w.id});
+    if(c==='session.steer'){
+      const result=await this.backend.rpc('turn/steer',{threadId:s.threadId,expectedTurnId:p.turnId,input,clientUserMessageId:w.id});
+      return slackCommand?{threadId:s.threadId,turnId:p.turnId,steer:'submitted'}:result;
+    }
     if(c==='session.queue')return this.submitMessage(w,s,p.resume===true);
     if(t.status?.type==='active')throw new ConnectorError('SESSION_BUSY_USE_STEER_OR_QUEUE');
     return this.submitMessage(w,s,true);
@@ -591,7 +569,7 @@ export class Connector {
     if(next&&next.length>2048)throw new ConnectorError('INVALID_SESSION_PAGE');
     const sessions=[...byId.values()].map(row=>{
       const summary=this.threadSummary(row.thread),binding=this.store.state.sessions.find(s=>s.threadId===summary.id&&this.authorizedSession(s));
-      return{...summary,...(source&&source.kind!=='local'&&this.needsSlackProof(summary.id)?{name:null,connectorSessionId:binding?.channel?summary.connectorSessionId:null}:{}),...(scope!==undefined&&!binding?.localOwners?.includes(scope)?{connectorSessionId:null}:{}),...(row.unavailable?{manageable:null,reason:'METADATA_UNAVAILABLE',canAcceptDirectInput:null,status:{type:'unknown'}}:{}),loaded:row.loaded,discoverySources:row.sources,binding:binding&&scope===undefined&&(!source||source.kind==='local'||!!binding.channel)?{channel:binding.channel,threadTs:binding.threadTs}:null};
+      return{...summary,...(this.runtime&&source&&source.kind!=='local'?{...this.safeSlackMetadata(summary),connectorSessionId:binding?.channel?summary.connectorSessionId:null}:{}),...(scope!==undefined&&!binding?.localOwners?.includes(scope)?{connectorSessionId:null}:{}),...(row.unavailable?{manageable:null,reason:'METADATA_UNAVAILABLE',canAcceptDirectInput:null,status:{type:'unknown'}}:{}),loaded:row.loaded,discoverySources:row.sources,binding:binding&&scope===undefined&&(!source||source.kind==='local'||!!binding.channel)?{channel:binding.channel,threadTs:binding.threadTs}:null};
     });
     const sources=view==='all'?'Current shared-daemon loaded IDs plus indexed interactive history (default thread/list sources)':view==='history'?'Indexed interactive history (default thread/list sources)':view==='active'?'Current shared-daemon loaded IDs with freshly read active status':'Current shared-daemon loaded IDs';
     return{sessions,nextCursor:next,project,unresolvedLoadedIds:allowedProjects?[]:unresolvedLoadedIds,pageLimitPerSource:limit,view,returnedCount:sessions.length,scanned:{loaded:loaded.data.length,history:stored.data.length},unknownLoadedCount:unknownLoadedIds.size,hasMore:next!==null,scope:`${sources}; one bounded page per selected source, not a global session count or complete enumeration. Filters may return an empty page with a continuation cursor. Stored-only rows do not prove unloaded status. Metadata failures remain unknown. No resume, content preload, filesystem history scan, or control-policy filtering. Separate CODEX_HOME, standalone --no-daemon and other servers are not guaranteed visible.`};
@@ -641,7 +619,7 @@ export class Connector {
         const id=s.id;this.store.transaction(state=>{const row=state.sessions.find(x=>x.id===id)!;if(source.kind==='local'&&!row.localOwners?.includes(source.userId))(row.localOwners??=[]).push(source.userId);if(destination&&!row.channel){row.channel=destination.channel;row.threadTs=destination.threadTs;}});s=this.session(id);
       }
     }catch(e){if(created)throw new BackendError('RPC_OUTCOME_UNCERTAIN');throw e;}
-    this.attached.add(thread.id);this.flush();return{sessionId:s.id,threadId:thread.id,canAcceptDirectInput:thread.canAcceptDirectInput??null,status:thread.status,outputChannel:this.runtime&&source.kind==='local'&&!destination?null:s.channel,outputThread:this.runtime&&source.kind==='local'&&!destination?null:s.threadTs,observation:{attachCreatesSubscription:false,note:'Control binding only; attach does not subscribe to commentary or partial answers (including ordinary questions). Use session.subscribe in the desired Slack thread, then session.subscriptions to check status. Existing explicit subscriptions and cancellation remain unchanged.',subscribe:{command:'session.subscribe',params:{threadId:thread.id}}}};
+    this.attached.add(thread.id);this.flush();return{sessionId:s.id,threadId:thread.id,canAcceptDirectInput:this.runtime&&source.kind!=='local'?(typeof thread.canAcceptDirectInput==='boolean'?thread.canAcceptDirectInput:null):thread.canAcceptDirectInput??null,status:this.runtime&&source.kind!=='local'?{type:safeThreadStatus(thread.status?.type)}:thread.status,outputChannel:this.runtime&&source.kind==='local'&&!destination?null:s.channel,outputThread:this.runtime&&source.kind==='local'&&!destination?null:s.threadTs,observation:{attachCreatesSubscription:false,note:'Control binding only; attach does not subscribe to commentary or partial answers (including ordinary questions). Use session.subscribe in the desired Slack thread, then session.subscriptions to check status. Existing explicit subscriptions and cancellation remain unchanged.',subscribe:{command:'session.subscribe',params:{threadId:thread.id}}}};
   }
   private async notification(method:string,p:any,epoch:string){
     if(epoch!==this.backend.epoch||!this.backend.connected)return;
@@ -651,7 +629,7 @@ export class Connector {
       this.localEvents.observe(method,p,epoch);
       if(method==='item/started'||method==='item/completed')this.noteSlackInput(p);
       if(!this.runtime!.slackReady()&&method!=='serverRequest/resolved')return;
-      if(method!=='serverRequest/resolved'&&this.needsSlackProof(p.threadId)){
+      if(method!=='serverRequest/resolved'){
         const turnId=p.turnId||p.turn?.id,source=this.slackTurnSource(p.threadId,turnId);
         const session=this.store.state.sessions.find(s=>s.threadId===p.threadId&&this.authorizedSession(s));
         // Keep the exact item evidence needed for a same-bound decision. No
@@ -754,8 +732,7 @@ export class Connector {
       if(draft.results)draft.results=draft.results.filter(r=>{
         if(!bad.some(w=>this.samePrincipal(r.source,w.source)))return true;
         const proof=r.visibility?.proof;
-        return !proof||(proof.kind==='live'?(proof.threadId!==p.threadId||proof.turnId!==p.turnId):
-          !proof.turns.some(t=>t.threadId===p.threadId&&t.turnId===p.turnId));
+        return !proof||proof.threadId!==p.threadId||proof.turnId!==p.turnId;
       });
     });
   }
@@ -769,15 +746,16 @@ export class Connector {
     if(this.store.state.pending.some(r=>r.threadId===threadId&&r.turnId===turnId&&['pending','local-required'].includes(r.status)))
       this.store.transaction(st=>{for(const r of st.pending)if(r.threadId===threadId&&r.turnId===turnId&&['pending','local-required'].includes(r.status))r.status='stale';});
   }
-  private scopedEvent(state:State,s:Session,source:Source,turnId:string,key:string,text:string,automatic=false,preview=true){
+  private scopedEvent(state:State,s:Session,source:Source,turnId:string,key:string,notice:NativeNotice,automatic=false){
+    // Only closed enum values can reach this path; no native strings, not even
+    // truncated fragments of commentary, finals, errors, diff or question text.
     const proof:SlackTurnProof={kind:'live',threadId:s.threadId,turnId,epoch:this.backend.epoch,owner:source};
+    const text=`Session ${s.threadId}; turn ${turnId}. ${nativeNotice[notice]}`;
     const post=(destination:Source,subscriptionId?:string)=>{
       const from=state.outbox.length;
-      if(preview)this.sessionText(state,text,s.id,destination,proof);else this.output(state,text,s.id,destination,proof);
+      this.output(state,text,s.id,destination,proof);
       for(const o of state.outbox.slice(from)){o.notificationThreadId=s.threadId;o.subscriptionId=subscriptionId;}
     };
-    // Preserve the original subscription's policy, cancellation and replay
-    // ledger, but never extend this turn to a different actor or Slack thread.
     const existing=this.subscriptions.hasExplicitDestination(s.threadId,source.channel,source.threadTs);
     if(automatic&&!existing&&!Object.hasOwn(state.seenNotifications,key))post(source);
     this.subscriptions.emit(state,text,s.threadId,key,sub=>this.samePrincipal(sub.owner,source),(_state,_text,sub)=>post(sub.owner,sub.id));
@@ -786,41 +764,32 @@ export class Connector {
   private scopedNotice(method:string,p:any,s:Session,source:Source){
     const turnId=p.turnId||p.turn?.id;
     if(!deliveryId(turnId))return;
-    let key:string|undefined,text:string|undefined,automatic=false;
-    if(method==='item/completed'&&p.item?.type==='agentMessage'&&(!p.item.phase||['commentary','partial_answer','final_answer'].includes(p.item.phase))&&typeof p.item.text==='string'&&deliveryId(p.item.id)){
-      key=`${s.threadId}:${turnId}:${p.item.id}`;
+    let key:string|undefined,notice:NativeNotice|undefined,automatic=false;
+    if(method==='item/completed'&&p.item?.type==='agentMessage'&&(!p.item.phase||['commentary','partial_answer','final_answer'].includes(p.item.phase))&&deliveryId(p.item.id)){
       automatic=!p.item.phase||p.item.phase==='final_answer';
-      text=automatic?p.item.text:`Session ${s.threadId}; turn ${turnId}; ${p.item.phase}\n${p.item.text}`;
+      notice=automatic?'final':'progress';key=stable(['native-notice',s.threadId,turnId,notice]);
     }
     if(method==='turn/completed'&&terminalExecution(p.turn?.status)){
-      key=`turn:${s.threadId}:${turnId}:${p.turn.status}`;text=`Session ${s.threadId}; turn ${turnId}: ${p.turn.status}.`;automatic=p.turn.status!=='completed';
+      notice=p.turn.status as 'completed'|'failed'|'interrupted';automatic=notice!=='completed';
+      key=stable(['native-notice',s.threadId,turnId,notice]);
     }
-    if(method==='error'&&p.willRetry===false){key=`error:${s.threadId}:${turnId}`;text=`Session ${s.threadId}; turn ${turnId}: execution error. Inspect the original local session.`;}
-    if(!key||!text)return;
-    this.store.transaction(st=>this.scopedEvent(st,s,source,turnId,key!,text!,automatic));this.flush();
+    if(method==='error'&&p.willRetry===false){notice='error';key=stable(['native-notice',s.threadId,turnId,notice]);}
+    if(!key||!notice)return;
+    this.store.transaction(st=>this.scopedEvent(st,s,source,turnId,key!,notice!,automatic));this.flush();
   }
   private async serverRequest(r:any){
     if(r.epoch!==this.backend.epoch||!this.backend.connected||!['string','number'].includes(typeof r.id))return;
     this.localEvents?.observeRequest(r);
-    if(this.runtime&&!this.runtime.slackReady())return;
-    const protectedThread=this.needsSlackProof(r.params?.threadId);
-    const origin=protectedThread?this.slackTurnSource(r.params?.threadId,r.params?.turnId):undefined;
-    if(protectedThread&&!origin)return;
+    if(this.runtime){
+      if(this.runtime.slackReady())this.scopedServerRequest(r);
+      return;
+    }
     const previous=this.store.state.pending.find(p=>p.rpcId===r.id&&p.epoch===r.epoch);
-    // Check lifecycle before either route: even the fixed observer notice must not
-    // resurrect a closed request while a destination is catching up after joining.
     if(previous&&(!['pending','local-required'].includes(previous.status)||previous.expiresAt<=Date.now()||
       previous.threadId!==r.params?.threadId||previous.turnId!==(r.params?.turnId||'unavailable')||previous.method!==r.method))return;
     const s=this.store.state.sessions.find(s=>s.threadId===r.params?.threadId&&this.authorizedSession(s));
-    if(origin&&s&&(origin.channel!==s.channel||origin.threadTs!==s.threadTs)){
-      this.store.transaction(st=>this.scopedEvent(st,s,origin,r.params.turnId,`request:${r.epoch}:${r.id}`,'LOCAL_ACTION_REQUIRED: use the original Codex UI for this decision.',true,false));
-      this.flush();return;
-    }
-    const notice=(state:State,text:string)=>{
-      if(origin&&s)this.scopedEvent(state,s,origin,r.params.turnId,`request:${r.epoch}:${r.id}`,text,true,false);
-      else if(s)this.boundNotice(state,text,s,false,`request:${r.epoch}:${r.id}`);
-    };
-    if(!origin)this.store.transaction(state=>this.subscriptions.emit(state,`Session ${r.params?.threadId}; turn ${r.params?.turnId||'unknown'}: local decision/input required. Use the original local Codex UI or its authorized bound approval thread. This observation does not grant approval authority.`,r.params?.threadId,`request:${r.epoch}:${r.id}`,sub=>!s||sub.owner.channel!==s.channel||sub.owner.threadTs!==s.threadTs));this.flush();
+    const notice=(state:State,text:string)=>{if(s)this.boundNotice(state,text,s,false,`request:${r.epoch}:${r.id}`);};
+    this.store.transaction(state=>this.subscriptions.emit(state,`Session ${r.params?.threadId}; turn ${r.params?.turnId||'unknown'}: local decision/input required. Use the original local Codex UI or its authorized bound approval thread. This observation does not grant approval authority.`,r.params?.threadId,`request:${r.epoch}:${r.id}`,sub=>!s||sub.owner.channel!==s.channel||sub.owner.threadTs!==s.threadTs));this.flush();
     if(!s)return;
     if(previous){
       if(previous.threadId===s.threadId&&previous.sessionId===s.id&&['pending','local-required'].includes(previous.status)&&previous.expiresAt>Date.now())this.store.transaction(state=>notice(state,this.requestNotice(previous)));
@@ -840,6 +809,42 @@ export class Connector {
     const safeDetails=local?{notice:'Sensitive, oversized, unsupported, or broader-scope request; inspect locally',itemId:details.itemId}:details;
     const pending:Pending={id:randomUUID(),rpcId:r.id,epoch:r.epoch,sessionId:s.id,threadId:s.threadId,turnId:details.turnId||'unavailable',method:r.method,kind,status:local?'local-required':'pending',details:safeDetails,decisions,expiresAt:Date.now()+this.config.approvalTimeoutSec*1000};
     this.store.transaction(state=>{state.pending.push(pending);notice(state,this.requestNotice(pending));});this.flush();
+  }
+  private scopedServerRequest(r:any){
+    if((typeof r.id==='number'&&!Number.isSafeInteger(r.id))||(typeof r.id==='string'&&!deliveryId(r.id)))return;
+    const details=r.params,threadId=details?.threadId,turnId=details?.turnId;
+    if(!deliveryId(threadId)||!deliveryId(turnId))return;
+    const owner=this.slackTurnSource(threadId,turnId),state=this.store.state;
+    const s=state.sessions.find(x=>x.threadId===threadId&&this.authorizedSession(x));
+    if(!owner||!s)return;
+    const known=new Map<string,Pending['kind']>([['item/commandExecution/requestApproval','command'],['item/fileChange/requestApproval','file'],['item/tool/requestUserInput','input'],['item/permissions/requestApproval','unsupported'],['mcpServer/elicitation/request','unsupported']]);
+    const kind=known.get(r.method);
+    if(!kind)return;
+    const key=stable(['native-request',r.epoch,r.id]);
+    const previous=state.pending.find(p=>p.rpcId===r.id&&p.epoch===r.epoch);
+    if(previous&&(!['pending','local-required'].includes(previous.status)||previous.expiresAt<=Date.now()||
+      previous.sessionId!==s.id||previous.threadId!==threadId||previous.turnId!==turnId||previous.method!==r.method||
+      !previous.slackOwner||!this.samePrincipal(previous.slackOwner,owner)))return;
+    this.store.transaction(draft=>{
+      // Persist exact native request identity but never its free-form body.
+      // Different origins can receive their fixed notice, not time out a
+      // request for a session bound to another Slack conversation.
+      if(!previous&&owner.channel===s.channel&&owner.threadTs===s.threadTs){
+        const file=this.items.get(stable([threadId,turnId,details.itemId]));
+        const mayDecline=details.availableDecisions===undefined||Array.isArray(details.availableDecisions)&&details.availableDecisions.includes('decline');
+        const eligible=kind==='command'?mayDecline&&typeof details.command==='string'&&!!details.command.trim()&&
+          (!details.kind||details.kind==='command')&&!!this.canonicalCwd(details.cwd)&&this.canonicalCwd(details.cwd)===this.canonicalCwd(s.cwd||this.config.projects[s.project]!):
+          kind==='file'?mayDecline&&!details.grantRoot&&deliveryId(details.itemId)&&Array.isArray(file?.changes)&&file.changes.length>0:
+          kind==='input'?Array.isArray(details.questions)&&details.questions.length>0&&details.questions.every((q:any)=>deliveryId(q?.id)&&!q.isSecret):false;
+        const pending:Pending={id:randomUUID(),rpcId:r.id,epoch:r.epoch,sessionId:s.id,threadId,turnId,method:r.method,kind,
+          status:eligible?'pending':'local-required',details:{notice:'Open the original Codex UI.'},
+          decisions:kind==='command'||kind==='file'?mayDecline?['decline']:[]:[],slackOwner:owner,
+          expiresAt:Date.now()+this.config.approvalTimeoutSec*1000};
+        draft.pending.push(pending);
+      }
+      this.scopedEvent(draft,s,owner,turnId,key,'decision',true);
+    });
+    this.flush();
   }
   private requestNotice(p:Pending){return p.status==='local-required'?`LOCAL_ACTION_REQUIRED: ${p.method}\nrequestId=${p.id}; sensitive, unsupported, or broader-scope request. No approval was granted. Use the original local Codex UI.`:this.prompt(p);}
   private prompt(p:Pending){
@@ -864,7 +869,6 @@ export class Connector {
   private async answer(w:Work){
     const p=w.request.params as any;let pending=this.store.state.pending.find(r=>r.id===p.requestId);
     if(!pending||pending.status!=='pending'||pending.epoch!==this.backend.epoch||p.epoch!==pending.epoch||p.sessionId!==pending.sessionId||p.turnId!==pending.turnId||pending.expiresAt<=Date.now())throw new ConnectorError('STALE_OR_MISROUTED_REQUEST');
-    if(this.needsSlackProof(pending.threadId)&&!this.slackTurnSource(pending.threadId,pending.turnId))throw new ConnectorError('LOCAL_ACTION_REQUIRED');
     await this.verifiedHuman(w,pending);
     let result:any;
     if(w.request.command==='approval.respond'){
@@ -877,7 +881,7 @@ export class Connector {
     }
     // Recheck after async proof fetch; a reconnect/resolution may have invalidated it.
     pending=this.store.state.pending.find(r=>r.id===p.requestId)!;
-    if(pending.status!=='pending'||pending.epoch!==this.backend.epoch||pending.expiresAt<=Date.now()||this.needsSlackProof(pending.threadId)&&!this.slackTurnSource(pending.threadId,pending.turnId))throw new ConnectorError('STALE_OR_MISROUTED_REQUEST');
+    if(pending.status!=='pending'||pending.epoch!==this.backend.epoch||pending.expiresAt<=Date.now())throw new ConnectorError('STALE_OR_MISROUTED_REQUEST');
     this.store.transaction(s=>{s.pending.find(r=>r.id===pending!.id)!.status='responding';});
     try{await this.backend.respond(pending.rpcId,result);}catch{throw new BackendError('RPC_OUTCOME_UNCERTAIN');}
     return{requestId:pending.id,status:'submitted; awaiting server resolution notification'};
@@ -885,11 +889,89 @@ export class Connector {
   private disconnected(epoch:string){
     this.localEvents?.markDisconnected();this.attached.clear();this.items.clear();this.slackInputs.clear();this.deliveryTurns.clear();this.store.transaction(s=>{for(const w of s.work)if(w.messageDelivery)w.messageDelivery.observationGap=true;for(const p of s.pending)if(p.epoch===epoch&&['pending','responding'].includes(p.status))p.status='stale';});
   }
+  private sameCurrentPending(original:Pending){
+    if(!this.runtime?.slackReady()||this.closing||!this.backend.connected||this.backend.epoch!==original.epoch||!original.slackOwner)return;
+    const state=this.store.state,current=state.pending.find(p=>p.id===original.id);
+    if(!current||current.status!=='pending'||current.rpcId!==original.rpcId||current.threadId!==original.threadId||
+      current.turnId!==original.turnId||current.epoch!==original.epoch||current.sessionId!==original.sessionId||
+      current.method!==original.method||current.kind!==original.kind||current.expiresAt!==original.expiresAt||
+      !current.slackOwner||!this.samePrincipal(original.slackOwner,current.slackOwner))return;
+    const s=state.sessions.find(s=>s.id===current.sessionId&&s.threadId===current.threadId&&this.authorizedSession(s));
+    const owner=this.slackTurnSource(current.threadId,current.turnId);
+    if(!s||!owner||!this.samePrincipal(owner,current.slackOwner)||s.channel!==owner.channel||s.threadTs!==owner.threadTs)return;
+    if((current.kind==='command'||current.kind==='file')&&!current.decisions.includes('decline')||current.kind==='unsupported')return;
+    return s;
+  }
+  private async proveDeadline(original:Pending){
+    const s=this.sameCurrentPending(original);
+    if(!s)return false;
+    const epoch=this.backend.epoch,deadline=Date.now()+6000;
+    let bytes=0;
+    const read=async(method:string,params:unknown)=>{
+      if(!this.sameCurrentPending(original)||epoch!==this.backend.epoch||Date.now()>=deadline)throw new ConnectorError('SLACK_DEADLINE_UNVERIFIED');
+      let timer:ReturnType<typeof setTimeout>|undefined;
+      try{
+        const result=await Promise.race([this.backend.rpc(method,params),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new ConnectorError('SLACK_DEADLINE_UNVERIFIED')),Math.min(2000,deadline-Date.now()));})]);
+        bytes+=Buffer.byteLength(JSON.stringify(result)??'');
+        if(bytes>2*1024*1024||!this.sameCurrentPending(original))throw new ConnectorError('SLACK_DEADLINE_UNVERIFIED');
+        return result;
+      }finally{if(timer)clearTimeout(timer);}
+    };
+    try{
+      // Verify destination first and exact turn inputs last. No content from
+      // these RPCs is rendered or retained. This is an exact-target timeout,
+      // not authorization to publish text or act on a different/native turn.
+      const metadata=await read('thread/read',{threadId:original.threadId,includeTurns:false});
+      this.checkSessionThread(metadata?.thread,s);
+      const inputs=new Map<string,string>(),seen=new Set<string>(),clients=new Set<string>(),cursors=new Set<string>();
+      let cursor:string|undefined;
+      for(let n=0;n<4;n++){
+        const page=await read('thread/items/list',{threadId:original.threadId,turnId:original.turnId,limit:50,sortDirection:'asc',...(cursor?{cursor}:{})});
+        if(!Array.isArray(page?.data)||page.data.length>50||!(page.nextCursor===null||typeof page.nextCursor==='string'&&page.nextCursor.length>0&&page.nextCursor.length<=512&&!cursors.has(page.nextCursor)))return false;
+        for(const row of page.data){
+          if(row?.turnId!==original.turnId||!deliveryId(row.item?.id)||seen.has(row.item.id)||typeof row.item.type!=='string')return false;
+          seen.add(row.item.id);
+          if(row.item.type==='userMessage'){
+            const id=row.item.clientId,content=row.item.content;
+            if(!deliveryId(id)||clients.has(id)||!Array.isArray(content)||content.length!==1||
+              content[0]?.type!=='text'||typeof content[0].text!=='string')return false;
+            const work=this.store.state.work.find(w=>w.id===id);
+            // clientId is only a correlation key; another native client can
+            // edit a queued message without changing that key.
+            if(!work||work.request.params.text!==content[0].text)return false;
+            clients.add(id);inputs.set(row.item.id,id);
+          }
+        }
+        if(page.nextCursor===null)return this.inputsBelong(original.threadId,original.turnId,inputs,original.slackOwner!)&&!!this.sameCurrentPending(original);
+        cursor=page.nextCursor as string;cursors.add(cursor);
+      }
+    }catch{/* Missing exact proof: no native action. */}
+    return false;
+  }
+  private async expireScoped(p:Pending){
+    const verified=p.status==='pending'&&await this.proveDeadline(p);
+    // No await between current identity/epoch check and invoking the exact
+    // refusal/interrupt. Mark expired before the call so a crash cannot replay.
+    const allowed=verified&&!!this.sameCurrentPending(p);
+    const claimed=this.store.transaction(s=>{
+      const current=s.pending.find(x=>x.id===p.id);
+      if(!current||!['pending','local-required'].includes(current.status)||current.expiresAt>Date.now()||current.epoch!==p.epoch||current.rpcId!==p.rpcId)return false;
+      current.status='expired';current.deadlineOutcome=allowed?'outcome-uncertain':'not-attempted';return true;
+    });
+    if(!claimed||!allowed)return;
+    try{
+      if(p.kind==='command'||p.kind==='file')await this.backend.respond(p.rpcId,{decision:'decline'});
+      else await this.backend.rpc('turn/interrupt',{threadId:p.threadId,turnId:p.turnId});
+      this.store.transaction(s=>{const current=s.pending.find(x=>x.id===p.id);if(current?.status==='expired')current.deadlineOutcome=p.kind==='input'?'interrupt-submitted':'decline-submitted';});
+    }catch{/* Connection/ack uncertain. Leave the recorded attempt; never retry. */}
+  }
   async expire(){
     if(this.store.state.results?.some(r=>r.expiresAt<=Date.now()))this.store.transaction(s=>{s.results=(s.results||[]).filter(r=>r.expiresAt>Date.now());});
-    for(const p of this.store.state.pending.filter(p=>p.status==='pending'&&p.expiresAt<=Date.now())){
-      this.store.transaction(s=>{s.pending.find(x=>x.id===p.id)!.status='expired';const session=s.sessions.find(x=>x.id===p.sessionId);if(session&&!this.needsSlackProof(p.threadId,s))this.boundNotice(s,`Request ${p.id} expired; no approval granted.`,session);});
-      if(this.backend.connected&&p.epoch===this.backend.epoch&&!this.needsSlackProof(p.threadId)){try{if(p.kind==='command'||p.kind==='file')await this.backend.respond(p.rpcId,{decision:'decline'});else if(p.kind==='input')await this.backend.rpc('turn/interrupt',{threadId:p.threadId,turnId:p.turnId});}catch{/* never replay stale callbacks */}}
+    for(const p of this.store.state.pending.filter(p=>['pending','local-required'].includes(p.status)&&p.expiresAt<=Date.now())){
+      if(this.runtime){await this.expireScoped(p);continue;}
+      if(p.status!=='pending')continue;
+      this.store.transaction(s=>{s.pending.find(x=>x.id===p.id)!.status='expired';const session=s.sessions.find(x=>x.id===p.sessionId);if(session)this.boundNotice(s,`Request ${p.id} expired; no approval granted.`,session);});
+      if(this.backend.connected&&p.epoch===this.backend.epoch){try{if(p.kind==='command'||p.kind==='file')await this.backend.respond(p.rpcId,{decision:'decline'});else if(p.kind==='input')await this.backend.rpc('turn/interrupt',{threadId:p.threadId,turnId:p.turnId});}catch{/* never replay stale callbacks */}}
     }
     this.flush();
   }
@@ -898,57 +980,15 @@ export class Connector {
   private nextDelivery(){
     const state=this.store.state;return state.outbox.find((o,index)=>o.status==='queued'&&o.nextAttemptAt<=Date.now()&&(!o.subscriptionId||!this.subscriptions.deliveryWaiting(o.subscriptionId))&&!state.outbox.slice(0,index).some(earlier=>this.deliveryLane(earlier,state)===this.deliveryLane(o,state)&&!['sent','failed'].includes(earlier.status)));
   }
-  private liveProofAllowed(proof:Extract<SlackTurnProof,{kind:'live'}>,source:Source){
-    if(proof.epoch!==this.backend.epoch||!this.backend.connected||!this.samePrincipal(source,proof.owner))return false;
+  private liveProofAllowed(proof:SlackTurnProof,source:Source){
+    if(proof.kind!=='live'||proof.epoch!==this.backend.epoch||!this.backend.connected||!this.samePrincipal(source,proof.owner))return false;
     const owner=this.slackTurnSource(proof.threadId,proof.turnId);
     return !!owner&&this.samePrincipal(owner,source);
   }
-  private async proveVisibility(proof:SlackTurnProof|undefined,source:Source){
-    if(!proof)return true;
-    try{
-      this.subscriptionActor(source);
-      const epoch=this.backend.epoch,deadline=Date.now()+12000;
-      let bytes=0,calls=0;
-      const read=async(method:'thread/read'|'thread/items/list',params:unknown)=>{
-        if(!this.backend.connected||epoch!==this.backend.epoch||++calls>120||deadline<=Date.now())throw new ConnectorError('SLACK_CONTENT_PROOF_UNAVAILABLE');
-        let timer:ReturnType<typeof setTimeout>|undefined;
-        try{
-          const response=await Promise.race([this.backend.rpc(method,params),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new ConnectorError('SLACK_CONTENT_PROOF_UNAVAILABLE')),Math.min(4000,deadline-Date.now()));})]);
-          bytes+=Buffer.byteLength(JSON.stringify(response));
-          if(bytes>4*1024*1024||!this.backend.connected||epoch!==this.backend.epoch)throw new ConnectorError('SLACK_CONTENT_PROOF_UNAVAILABLE');
-          return response;
-        }finally{if(timer)clearTimeout(timer);}
-      };
-      const verifyThread=async(threadId:string)=>{
-        const s=this.store.state.sessions.find(s=>s.threadId===threadId&&!!s.channel&&this.authorizedSession(s));
-        if(!s)throw new ConnectorError('SLACK_CONTENT_PROOF_UNAVAILABLE');
-        const r=await read('thread/read',{threadId,includeTurns:false});
-        this.checkSessionThread(r.thread,s);
-      };
-      if(proof.kind==='live'){
-        if(!this.liveProofAllowed(proof,source))return false;
-        await verifyThread(proof.threadId);
-        return this.liveProofAllowed(proof,source);
-      }
-      if(proof.kind!=='history'||!Array.isArray(proof.turns)||!proof.turns.length||proof.turns.length>MAX_HISTORY_PROOF_TURNS)return false;
-      const threads=new Set<string>(),seen=new Set<string>();
-      for(const ref of proof.turns){
-        if(!deliveryId(ref?.threadId)||!deliveryId(ref?.turnId)||!/^[a-f0-9]{64}$/.test(ref.witness))return false;
-        const key=stable([ref.threadId,ref.turnId]);
-        if(seen.has(key)||!this.slackClaim(ref.threadId,ref.turnId,source))return false;
-        seen.add(key);
-        if(!threads.has(ref.threadId)){threads.add(ref.threadId);await verifyThread(ref.threadId);}
-        const current=await this.verifyHistoryTurn(ref.threadId,ref.turnId,source,params=>read('thread/items/list',params));
-        if(!current||current.witness!==ref.witness)return false;
-      }
-      for(const threadId of threads)await verifyThread(threadId);
-      const state=this.store.state;
-      return epoch===this.backend.epoch&&this.backend.connected&&proof.turns.every(ref=>!!this.slackClaim(ref.threadId,ref.turnId,source,state));
-    }catch{return false;}
+  private validFixedNotice(text:string,proof:SlackTurnProof){
+    const prefix=`Session ${proof.threadId}; turn ${proof.turnId}. `;
+    return (Object.values(nativeNotice) as string[]).some(notice=>text===prefix+notice);
   }
-  /** Shared gate for the initial queue, delayed sends and manual recovery.
-   * The async witness below runs after pacing so it cannot authorize a stale
-   * copy of the row while an administrator revokes the route or adds input. */
   private deliveryTarget(o:Delivery,state:Readonly<State>){
     if(!this.scopeMatches(o,state)||o.root||!this.validChannel(o.channel)||containsSensitiveContent(o.text))return;
     const session=o.sessionId?state.sessions.find(s=>s.id===o.sessionId):undefined;
@@ -963,8 +1003,7 @@ export class Connector {
     }else if(!session||session.channel!==o.channel||session.threadTs!==threadTs)return;
     const proof=o.visibility?.proof;
     if(proof&&!o.origin)return;
-    if(proof?.kind==='live'&&!this.liveProofAllowed(proof,o.origin!))return;
-    if(proof?.kind==='history'&&(!Array.isArray(proof.turns)||!proof.turns.every(t=>!!this.slackClaim(t.threadId,t.turnId,o.origin,state))))return;
+    if(proof&&(!this.liveProofAllowed(proof,o.origin!)||!this.validFixedNotice(o.text,proof)))return;
     return{threadTs};
   }
   private refuseDelivery(id:string){
@@ -980,15 +1019,6 @@ export class Connector {
       if(!current||current.status!=='queued')continue;
       if(current.subscriptionId&&this.subscriptions.deliveryWaiting(current.subscriptionId))continue;
       if(!this.deliveryTarget(current,state)){this.refuseDelivery(next.id);continue;}
-      const attempt=stable(current);
-      if(current.visibility?.proof&&!(await this.proveVisibility(current.visibility.proof,current.origin!))){
-        if(!this.closing&&(!this.runtime||this.runtime.slackReady()))this.refuseDelivery(next.id);
-        continue;
-      }
-      if(this.closing||this.runtime&&!this.runtime.slackReady())return;
-      state=this.store.state;current=state.outbox.find(o=>o.id===next.id);
-      if(!current||current.status!=='queued'||stable(current)!==attempt)continue;
-      if(current.subscriptionId&&this.subscriptions.deliveryWaiting(current.subscriptionId))continue;
       const destination=this.deliveryTarget(current,state),dot=state.dot;
       if(!destination||!dot){this.refuseDelivery(next.id);continue;}
       // No await between these final current checks and invoking the adapter.

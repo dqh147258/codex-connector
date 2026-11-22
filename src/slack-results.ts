@@ -4,7 +4,7 @@ import { COMMANDS } from './protocol.js';
 import { formatRpcDiagnostic } from './rpc-diagnostics.js';
 import type { Config, ResultSnapshot, SlackVisibilityScope, Source, State, Work } from './types.js';
 
-export const SLACK_SCOPE_VERSION=2;
+export const SLACK_SCOPE_VERSION=3;
 export const RESULT_TTL_MS=15*60*1000;
 export const RESULT_PAGE_SIZE=1600;
 export const RESULT_MAX_CHARS=250000;

@@ -46,55 +46,15 @@ CODEX_CONNECTOR_COMMAND_BEGIN
 CODEX_CONNECTOR_COMMAND_END
 ```
 
-Use `result.page` if needed to inspect errors, activity source and coverage. This command has no `result.next` continuation. Select a few exact Codex thread IDs from the result for overview below, then read messages or subscribe only as requested. Do not use a backend update timestamp, receipt time, or connector control handle as proof of execution or as the Codex thread ID.
+Use `result.page` if needed to inspect errors, activity source and coverage. This command has no `result.next` continuation. Select only exact Codex thread IDs from safe metadata. Ask the operator to confirm the session in the original Codex UI if no single candidate is clear. Do not use a backend update timestamp, receipt time, or connector control handle as proof of execution or as the Codex thread ID.
 
-## Select a few candidates, then read one exact thread
+## Conversation text is local only
 
-After recent/list discovery, use 1–5 distinct **Codex thread IDs**, not connector session handles. Read the overview's per-thread errors, scan coverage and message phase/text status before inferring the task. These are excerpts from available persisted items, not semantic summaries or a current-task guarantee.
-
-```text
-CODEX_CONNECTOR_COMMAND_BEGIN
-{"v":1,"id":"dot-overview-0001","target":"my-computer","command":"session.overview","params":{"threadIds":["thread-demo","thread-other"],"maxChars":500}}
-CODEX_CONNECTOR_COMMAND_END
-```
-
-Read one selected thread without attaching. Default descending order shows the latest available items first; use ascending only when earlier context is needed. `limit` counts backend items before visible-role filtering, so a zero-message page can still continue.
-
-```text
-CODEX_CONNECTOR_COMMAND_BEGIN
-{"v":1,"id":"dot-messages-0001","target":"my-computer","command":"session.messages","params":{"threadId":"thread-demo","role":"all","order":"desc","limit":10,"maxChars":1000}}
-CODEX_CONNECTOR_COMMAND_END
-```
-
-Continue with the returned `result.next` handle, or a real opaque `cursor` with the same threadId/role/order. Use `result.page` to expand already-returned excerpts; it does not fetch additional historical messages or remove per-message truncation. If observation is requested, subscribe to the exact identified thread only after confirming it is currently loaded. Content reading and subscribing do not grant control or approval authority.
-
-## Search text across recently updated sessions
-
-Search default 10 allowed indexed, nonarchived interactive sessions by backend update order, not execution activity. Terms are literal case-insensitive substrings within one message. There is no regex or embedded AND/OR query language. Each separate term is an array entry.
-
-Require both terms in one user message:
-
-```text
-CODEX_CONNECTOR_COMMAND_BEGIN
-{"v":1,"id":"dot-search-user-0001","target":"my-computer","command":"session.search","params":{"terms":["Slack","审批"],"mode":"and","role":"user","sessionLimit":10,"limit":20,"maxChars":1000}}
-CODEX_CONNECTOR_COMMAND_END
-```
-
-Find either term in visible assistant messages:
-
-```text
-CODEX_CONNECTOR_COMMAND_BEGIN
-{"v":1,"id":"dot-search-assistant-0001","target":"my-computer","command":"session.search","params":{"terms":["结论","建议"],"mode":"or","role":"assistant","sessionLimit":10}}
-CODEX_CONNECTOR_COMMAND_END
-```
-
-Omit `role` (or use `all`) to search both roles. Terms must contain 1–10 strings, at most 200 UTF-16 code units each and 1000 combined before trimming, with nonempty trimmed values and no control characters. Sensitive-looking terms are rejected. Defaults: mode and, role all, sessionLimit 10 (max 20), limit 20 matching rows (max 50), maxChars 1000 (range 100–2000). Tools, reasoning, hidden/system content and secret-like messages are not searched/exported. This returns matching messages with session metadata, not model-generated conclusions.
-
-Read coverage and failures before describing the result; zero rows can still have a continuation, and no continuation does not prove all sessions were searched. Matching precedes excerpt truncation; the excerpt centers on the first matching term, while other AND terms may be outside it. Use only the returned `result.next` in this same actor/channel/thread to continue unchanged scope. `result.page` shows already-returned detail; it cannot recover truncated text or missing history. Later pages are fresh reads. Do not decode/manufacture cursors or broaden scope by attaching/reading session files.
+The shared backend cannot atomically prove ownership of free-form output. Slack never returns native conversation bodies, excerpts, search matches or generated titles in either mode. `NATIVE_CONTENT_LOCAL_ONLY` is not an empty-history result. Use the original Codex UI, or separately authorized local history/events; do not route that text back through Slack.
 
 ## Read result details versus fetch the next query page
 
-These require a real result handle issued to this same actor/channel/thread. `page` is one-based. `result.next` is valid only when a session-list, session-messages or session-search result advertises a next query page. It preserves the saved query scope; it does not repeat a control operation.
+These require a real result handle issued to this same actor/channel/thread. `page` is one-based. `result.next` is valid only when a supported safe metadata result advertises a next query page. It preserves the saved query scope; it does not repeat a control operation.
 
 ```text
 CODEX_CONNECTOR_COMMAND_BEGIN
@@ -110,7 +70,7 @@ CODEX_CONNECTOR_COMMAND_END
 
 ## Observe a loaded thread, inspect subscriptions, cancel observation
 
-Use the exact shared Codex thread ID for subscribe; use the returned subscription ID for unsubscribe. Cancellation does not stop Codex. Keep the same authenticated sender and origin thread.
+Use the exact shared Codex thread ID for subscribe; use the returned subscription ID for unsubscribe. Cancellation does not stop Codex. Keep the same authenticated sender and origin thread. Observation sends at most fixed notices tied to the original Slack operation; it does not send model output or approval text.
 
 ```text
 CODEX_CONNECTOR_COMMAND_BEGIN
@@ -168,24 +128,9 @@ CODEX_CONNECTOR_COMMAND_BEGIN
 CODEX_CONNECTOR_COMMAND_END
 ```
 
-## Human decision relay, never self-approval
+## Native interaction
 
-Do **not** send the following until the configured human has actually posted the matching complete, unedited decision envelope in the bound thread. Copy correlation fields from the live request, copy their decision/answers exactly, and set `humanMessageTs` to that real human message. The human's direct template has the same decision params **without** the proof locator; their request ID may differ. The timestamp itself is not authority.
-
-```text
-CODEX_CONNECTOR_COMMAND_BEGIN
-{"v":1,"id":"dot-decision-relay-0001","target":"my-computer","command":"approval.respond","params":{"requestId":"request-demo","epoch":"epoch-demo","sessionId":"session-demo","turnId":"turn-demo","decision":"decline","humanMessageTs":"1700000000.000002"}}
-CODEX_CONNECTOR_COMMAND_END
-```
-
-```text
-CODEX_CONNECTOR_COMMAND_BEGIN
-{"v":1,"id":"dot-input-relay-0001","target":"my-computer","command":"input.respond","params":{"requestId":"request-demo","epoch":"epoch-demo","sessionId":"session-demo","turnId":"turn-demo","answers":{"question1":["Option A"]},"humanMessageTs":"1700000000.000003"}}
-CODEX_CONNECTOR_COMMAND_END
-```
-
-The question ID and option above are examples; use only the actual prompt's IDs and allowed options. `NEED_VERIFIABLE_HUMAN_DECISION` requires the human to use the original bound thread or local UI, not weaker proof. `STALE_OR_MISROUTED_REQUEST` requires a current exact request, not rewriting old IDs. No observation subscription, mention, user quote or help output confers approval authority.
-
+Only the original Codex UI can answer approvals or input requests. Do not send `approval.respond`, `input.respond`, canned proof, or a copied prompt to Slack. A fixed `LOCAL_ACTION_REQUIRED` notice does not supply a decision template or grant authority. Expiry may decline the exact verified Slack-origin callback or interrupt its exact input turn; it does not approve a request or act on local or unproven work.
 
 ## Message delivery evidence
 

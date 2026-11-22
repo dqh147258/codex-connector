@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { BackendError } from './codex.js';
-import { SessionContent, SessionContentError, type ContentLimits, type ContentView, type VisibleMessage } from './session-content.js';
+import { SessionContent, SessionContentError, type ContentLimits, type VisibleMessage } from './session-content.js';
 import { resultSensitive } from './slack-results.js';
 import type { Backend } from './types.js';
 
@@ -44,8 +44,7 @@ export class SessionSearch extends SessionContent {
     while(this.continuations.size>=20)this.continuations.delete(this.continuations.keys().next().value!);
     const key=randomUUID();this.continuations.set(key,structuredClone(state));return key;
   }
-  async query(input:SearchQuery,scope='local',view?:ContentView) {
-    if(view)scope=JSON.stringify([scope,view.key]);
+  async query(input:SearchQuery,scope='local') {
     const mode=input.mode??'and',role=input.role??'all',sessionLimit=input.sessionLimit??10,limit=input.limit??20,maxChars=input.maxChars??1000;
     if(!Array.isArray(input.terms)||input.terms.length<1||input.terms.length>10||input.terms.some(t=>typeof t!=='string'||!t.trim()||t.length>200||/[\x00-\x1f\x7f]/.test(t))||input.terms.reduce((n,t)=>n+t.length,0)>1000||!['and','or'].includes(mode)||!['all','user','assistant'].includes(role)||!integer(sessionLimit,1,20)||!integer(limit,1,50)||!integer(maxChars,100,2000))fail('INVALID_SEARCH_QUERY');
     const terms=input.terms.map(t=>t.trim());
@@ -71,10 +70,7 @@ export class SessionSearch extends SessionContent {
             const thread=response.data[index];state.discovery.scannedSessions++;
             if(ids.has(thread.id))continue;ids.add(thread.id);
             // Do not read message bodies for candidates outside allowed scope.
-            try {
-              const metadata=this.authorize(thread),hideTitle=view?.hideTitle(thread.id)===true;
-              if(resultSensitive({id:thread.id,name:hideTitle?null:thread.name,cwd:thread.cwd,model:thread.model})||resultSensitive(hideTitle?{...metadata,name:null}:metadata))throw Error();
-            }
+            try {const metadata=this.authorize(thread);if(resultSensitive({id:thread.id,name:thread.name,cwd:thread.cwd,model:thread.model})||resultSensitive(metadata))throw Error();}
             catch {state.discovery.excludedSessions++;continue;}
             state.pending.push({threadId:thread.id,seen:[],pages:0});
             if(state.pending.length===sessionLimit){state.discovery.hasMore=next!==null||index+1<response.data.length;break;}
@@ -98,7 +94,7 @@ export class SessionSearch extends SessionContent {
       }
       const row:typeof sessions[number]={threadId:pending.threadId,pages:0,scannedItems:0,withheldMessages:0,exhausted:false,error:null};sessions.push(row);
       try {
-        const metadata=await this.metadata(pending.threadId,b,view);
+        const metadata=await this.metadata(pending.threadId,b);
         if(pending.cwd!==undefined&&pending.cwd!==metadata.cwd)fail('SESSION_SCOPE_CHANGED');
         pending.cwd=metadata.cwd;visited.set(pending.threadId,{cwd:metadata.cwd,row});
         for(let pageIndex=0;pageIndex<this.searchLimits.maxPages;pageIndex++){
@@ -106,7 +102,7 @@ export class SessionSearch extends SessionContent {
           if(b.calls+visited.size+1>this.searchLimits.maxCalls||Date.now()>=b.deadline){stop='budget';break;}
           // A backend page can never contain more matches than remaining slots.
           // Thus we finish every accepted raw page; no page-tail matches are lost.
-          const page=await this.page(pending.threadId,'desc',pending.cursor,Math.min(this.searchLimits.pageSize,limit-matches.length),b,view);
+          const page=await this.page(pending.threadId,'desc',pending.cursor,Math.min(this.searchLimits.pageSize,limit-matches.length),b);
           if(page.nextCursor&&pending.seen.includes(hash(page.nextCursor)))fail('INVALID_HISTORY_PAGE');
           row.pages++;pending.pages++;row.scannedItems+=page.data.length;scannedItems+=page.data.length;
           for(const entry of page.data){
@@ -142,7 +138,7 @@ export class SessionSearch extends SessionContent {
     // Recheck every scanned session after the entire multi-session read, not
     // merely just after each page. Drop its data if policy/cwd changed meanwhile.
     for(const [threadId,{cwd,row}] of visited){
-      try{const current=await this.metadata(threadId,b,view);if(current.cwd!==cwd)fail('SESSION_SCOPE_CHANGED');row.metadata=current;for(const match of matches)if(match.threadId===threadId)match.metadata=current;}
+      try{const current=await this.metadata(threadId,b);if(current.cwd!==cwd)fail('SESSION_SCOPE_CHANGED');row.metadata=current;for(const match of matches)if(match.threadId===threadId)match.metadata=current;}
       catch(e){if(!row.error)state.failedSessions++;row.error=errorCode(e);row.metadata=undefined;for(let i=matches.length-1;i>=0;i--)if(matches[i]!.threadId===threadId)matches.splice(i,1);const at=nextPending.findIndex(p=>p.threadId===threadId);if(at>=0)nextPending.splice(at,1);}
     }
     if(!this.backend.connected||this.backend.epoch!==b.epoch)fail('CONTENT_BACKEND_CHANGED');
@@ -151,11 +147,10 @@ export class SessionSearch extends SessionContent {
     const selectedTraversalComplete=!nextCursor&&state.failedSessions===0;
     const traversalComplete=selectedTraversalComplete&&state.discovery.selectionComplete&&!state.discovery.error;
     return{kind:'session.search',asOf:startedAt,terms,mode,role,sessionLimit,limit,maxChars,selectedSessionCount:state.selectedCount,matches,returnedCount:matches.length,sessions,nextCursor,hasMore:nextCursor!==null,
-      coverage:{discovery:state.discovery,scannedItems,scannedSessions:sessions.length,pendingSessions:nextPending.length,failedSessions:state.failedSessions,withheldMessages:state.withheldMessages,selectedTraversalComplete,traversalComplete,searchableContentComplete:!view&&traversalComplete&&state.withheldMessages===0,stop:nextCursor?(stop==='end'?'page-budget':stop):state.failedSessions?'errors':state.discovery.error?'discovery-error':!state.discovery.selectionComplete?'discovery-limit':'end',limits:{...this.searchLimits},globalSearch:false},
+      coverage:{discovery:state.discovery,scannedItems,scannedSessions:sessions.length,pendingSessions:nextPending.length,failedSessions:state.failedSessions,withheldMessages:state.withheldMessages,selectedTraversalComplete,traversalComplete,searchableContentComplete:traversalComplete&&state.withheldMessages===0,stop:nextCursor?(stop==='end'?'page-budget':stop):state.failedSessions?'errors':state.discovery.error?'discovery-error':!state.discovery.selectionComplete?'discovery-limit':'end',limits:{...this.searchLimits},globalSearch:false},
       ordering:'Fixed bounded selection from indexed interactive nonarchived history, backend updated_at descending (NOT execution activity); item creation ordinal descending per session. Continuations visit pending sessions in selection order.',
       matching:'Case-insensitive literal substrings, AND/OR within one visible message. No regex, stemming, cross-message conjunction or semantic model summary. Excerpts center the first hit; other matched terms may be outside the excerpt.',
       consistency:'Separate live reads, not an atomic snapshot. Tool/reasoning/system/non-text content excluded; sensitive-looking messages withheld before matching. Empty partial results do not establish no matches.',
-      ...(view?{visibility:'Only content attributed to this Slack origin; unavailable provenance is omitted.'}:{}),
       continuation:nextCursor?{expiresAt:new Date(state.expiresAt).toISOString(),scope:'Same query, authenticated actor/channel/thread, permission policy and backend epoch; process-local, bounded cache may evict early. Use result.next.'}:null};
   }
 }

@@ -19,13 +19,13 @@ export interface Config {
 export interface Source { kind: 'human' | 'bot' | 'local'; userId: string; channel: string; ts: string; threadTs: string; eventId: string }
 export interface Session { localOwners?: string[]; id: string; threadId: string; project: string; cwd?: string; channel: string; threadTs?: string; createdAt: string }
 export interface Work { slackMixedInput?:true; localGrant?: string; localResult?: unknown; messageDelivery?: MessageDelivery; id: string; eventId: string; request: CommandEnvelope; source: Source; status: 'queued'|'executing'|'completed'|'failed'|'uncertain'; createdAt: string; error?: string; resultRef?: {sessionId?:string;threadId?:string;turnId?:string;resultId?:string} }
-export type SlackTurnProof =
-  | {kind:'live'; threadId:string; turnId:string; epoch:string; owner:Source}
-  | {kind:'history'; turns:{threadId:string; turnId:string; witness:string}[]};
+export interface SlackTurnProof { kind:'live'; threadId:string; turnId:string; epoch:string; owner:Source }
 export interface SlackVisibilityScope { policy:string; generation:string; proof?:SlackTurnProof }
 export interface ResultSnapshot { scopeVersion?:number; visibility?:SlackVisibilityScope; id:string; command:string; source:Source; createdAt:number; expiresAt:number; policy:string; text:string; nextQuery?:Record<string,unknown>; nextCommand?:'session.list'|'session.messages'|'session.search' }
 export interface Delivery { scopeVersion?:number; visibility?:SlackVisibilityScope; id: string; origin?: Source; sessionId?: string; channel: string; threadTs?: string; root: boolean; text: string; mention?:boolean; deliveryEvidence?:'slack-api-ack'|'operator-attested'; subscriptionId?:string; notificationThreadId?:string; status: 'queued'|'sending'|'sent'|'uncertain'|'failed'; attempts: number; nextAttemptAt: number; ts?: string; error?: string }
 export interface Pending {
+  slackOwner?: Source;
+  deadlineOutcome?: 'decline-submitted'|'interrupt-submitted'|'not-attempted'|'outcome-uncertain';
   id: string; rpcId: string|number; epoch: string; sessionId: string; threadId: string; turnId: string;
   method: string; kind: 'command'|'file'|'input'|'unsupported'; status: 'pending'|'responding'|'resolved'|'stale'|'expired'|'local-required';
   details: Record<string, any>; expiresAt: number; decisions: string[];

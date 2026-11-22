@@ -12,9 +12,9 @@ CODEX_CONNECTOR_COMMAND_END
 
 The markers are ASCII words (no Slack angle-bracket escaping). Schema source: `src/protocol.ts`. It defines bounded parameters, applied defaults, examples, errors and permissions for generated help. Unknown keys, duplicate JSON keys, claimed actors, prototype keys, extra text, marker injection, unsupported version and wrong target are rejected. Transport identity comes only from Slack event metadata, not JSON.
 
-Authenticated trusted bots may alternatively preserve that exact envelope in one strictly validated section/plain_text block when fallback text is identical or has only CRLF/LF replaced by one space. An explicit plain_text command block must agree even when fallback text is already canonical; extra blocks/fields or conflicting commands reject. Ordinary rich_text display blocks do not supply commands. This narrow transport adapter does not relax the envelope parser and is never used for human decisions or fetched human evidence. See [transport boundaries](DESKTOP.md#slack-传输兼容边界) for the full schema and live-verification limitation.
+Authenticated trusted bots may alternatively preserve that exact envelope in one strictly validated section/plain_text block when fallback text is identical or has only CRLF/LF replaced by one space. An explicit plain_text command block must agree even when fallback text is already canonical; extra blocks/fields or conflicting commands reject. Ordinary rich_text display blocks do not supply commands. This narrow transport adapter does not relax the envelope parser or grant authority over any native decision. See [transport boundaries](DESKTOP.md#slack-传输兼容边界) for the full schema and live-verification limitation.
 
-Events persist before acknowledgement. Command IDs are scoped to an authenticated principal; repeated exact requests execute once, conflicting reuse does not execute. The internal operation ID is separate and used as the backend clientUserMessageId. A bot cannot consume an unrelated human's approval-template ID.
+Events persist before acknowledgement. Command IDs are scoped to an authenticated principal; repeated exact requests execute once, conflicting reuse does not execute. The internal operation ID is separate and used as the backend clientUserMessageId.
 
 ## Shared app-server
 
@@ -26,19 +26,17 @@ Only these method families are reachable through typed command handlers: thread 
 
 Each proxy connection has a unique epoch. Handlers capture both child identity and epoch so delayed events from an old child cannot impersonate a new connection. Malformed/ambiguous responses become uncertainty, never success. Closing the connector only closes its proxy; shared daemon lifetime remains the owner's responsibility.
 
-## Requests and authority
+## Native requests and authority
 
-Pending command/file approvals and nonsecret user questions receive fresh connector request IDs. All replies bind connector ID, epoch, session, turn and the original JSON-RPC callback. Only one reply can transition pending→responding. Server resolution notifications complete it. Disconnect/restart invalidates old callbacks.
+The original Codex UI is the only place to act on native approvals and user-input requests. Neither Slack envelopes (including an authenticated human's) nor Connector local API calls grant authority to answer. Slack receives at most a fixed same-origin interaction notice: no command, diff, prompt, question, options or response template.
 
-Remote approvals require fully displayed bounded scope. Secret/oversized/missing command or diff, unknown requests, stdin-specific approval, grantRoot expansion and secret input remain local-required. No session/global decisions or policy amendments are offered. Timeout declines command/file requests or interrupts the exact user-input turn; unknown unsupported requests are not answered by guessed schemas.
-
-A configured human may answer directly in the bound output thread. A dot may reference the actual human message using `humanMessageTs`; the connector fetches and validates the same-thread unedited human message and exact decision envelope. A quoted statement, actor field, inaccessible DM, or missing permission is not proof. Local owner-token clients cannot submit approval/input decisions.
+Expiry is a backend safety deadline, not remote approval. Only when current evidence still identifies the exact request/epoch/session/turn originating from the original accepted Slack operation, with current scope and routing intact, may Connector decline that exact supported command/file callback or interrupt that exact input turn. A request that is stale, resumed in another epoch, user-resolved, unsupported, foreign, local, or unproven is not answered based on old data. Do not retry a decision or interrupt another turn to resolve uncertainty.
 
 ## Durable delivery
 
 Work inbox and Slack outbox are independent. Connector handler completion and response enqueue commit together. This is not model-turn completion; message delivery has its own evidence fields. A Slack failure never retries the backend action. Each session's outbox preserves order even across rate backoff or uncertain deliveries; unrelated sessions can progress. Transient known rate limits may retry; network/unknown outcomes require local operator recovery. Exactly-once Slack delivery is not claimed.
 
-Discovery exposes all shared-visible metadata with manageability reasons. Session control defaults to configured project roots/subdirectories; a local-only allowAllSharedSessions opt-in can authorize other shared sessions without expanding readonly file roots. Only explicitly bound policy-authorized sessions produce automatic final-answer messages. Tool output/reasoning are excluded, known credential patterns withheld, long responses chunked and paced. Invalid/unbound/revoked mapping errors use the safe configured global destination rather than an old thread timestamp.
+Discovery exposes all shared-visible metadata with manageability reasons. Session control defaults to configured project roots/subdirectories; a local-only allowAllSharedSessions opt-in can authorize other shared sessions without expanding readonly file roots. Slack results omit native free-form content and use safe structured metadata and fixed notices only. Unknown or revoked routes are not given a fallback destination.
 
 ## Tests versus evidence
 
@@ -46,16 +44,16 @@ The automated suite uses fake transports and a pure Node executable fixture. The
 
 ## Reply destination and explicit address
 
-Every accepted Slack command response (including parser errors and ID conflicts) is durably routed to the event's own channel and `thread_ts`, or `ts` when the command itself is top-level. It never posts a channel-top fallback. New Slack session bindings use that origin thread. A command about an existing session returns to its caller while later session messages, approvals and input requests remain on the unchanged binding; the acknowledgement identifies that authorized bound destination.
+Every accepted Slack command response (including parser errors and ID conflicts) is durably routed to the event's own channel and `thread_ts`, or `ts` when the command itself is top-level. It never posts a channel-top fallback. New Slack session bindings use that origin thread. A command about an existing session returns to its caller. That does not authorize subsequent events in another thread: fixed async notices are routed only when there is evidence for the original accepted Slack turn and matching destination. An observer, local binding or newer command cannot acquire the original route.
 
-The optional transport address is one leading `<@CONNECTOR_SELF_USER_ID>` followed by exactly one space, LF or CRLF. The identity comes from Slack auth.test, never command JSON or display names. For already-authenticated trusted bots only, `self-address-v2` additionally accepts `<@SELF_ID|label>` (1–80 label characters, no ASCII control characters or `< > & |`) or the single escaped token `&lt;@SELF_ID&gt;`. It canonicalizes only that complete leading self-address token, independently in fallback and plain_text block, before checking full equality or the existing exact newline-to-space transformation. Separators and all envelope bytes are preserved; no general HTML decoding, trimming, prose extraction or extra mentions. Different bodies, other IDs and extra blocks still reject. Canonical addresses remain available to authorized humans; the additional forms do not. Fetched human approval evidence still requires the original strict envelope, with no mention/block normalization.
+The optional transport address is one leading `<@CONNECTOR_SELF_USER_ID>` followed by exactly one space, LF or CRLF. The identity comes from Slack auth.test, never command JSON or display names. For already-authenticated trusted bots only, `self-address-v2` additionally accepts `<@SELF_ID|label>` (1–80 label characters, no ASCII control characters or `< > & |`) or the single escaped token `&lt;@SELF_ID&gt;`. It canonicalizes only that complete leading self-address token, independently in fallback and plain_text block, before checking full equality or the existing exact newline-to-space transformation. Separators and all envelope bytes are preserved; no general HTML decoding, trimming, prose extraction or extra mentions. Different bodies, other IDs and extra blocks still reject. Canonical addresses remain available to authorized humans; the additional forms do not.
 
 `capabilities.slackTransport` reports the transport revision and auth.test-resolved connector user/bot IDs (public Slack identifiers, not tokens). Rejections report only a fixed transport stage (`address`, `block-shape`, `fallback-mismatch` or `envelope`), never message content. Live Slack read projections have shown labelled/escaped addresses, but are not raw Socket Mode events; these compatibility tests do not establish the live root cause or prove the newly installed path until an authorized probe succeeds.
 
 References: [Slack formatting and escaping](https://docs.slack.dev/messaging/formatting-message-text/) and [Slack legacy label parsing](https://github.com/slackhq/slack-api-docs/blob/master/page_formatting.md).
 
 
-Local/Skill `session.create` and `session.attach` do not require a Slack destination. For an explicitly requested Slack binding, an operator can provide `outputThreadTs` for an existing, readable root in configured `outputChannel`. Scoped agents and MCP cannot choose Slack destinations. This is checked before creating a Codex session; Slack-origin commands cannot override their destination with this parameter. Existing session bindings and bound Skill replies continue to work. Missing/unverified destinations fail closed; unbound local command output is not posted to Slack. On restart, persisted origins are retained. Old pending top-level or destinationless deliveries are marked failed, not silently rerouted. Channel revocation prevents delivery rather than choosing another channel.
+Local/Skill `session.create` and `session.attach` do not require a Slack destination. For an explicitly requested Slack binding, an operator can provide `outputThreadTs` for an existing, readable root in configured `outputChannel`. Scoped agents and MCP cannot choose Slack destinations. This is checked before creating a Codex session; Slack-origin commands cannot override their destination with this parameter. Explicit operator-authored text on an authorized binding remains a separate action and never replays or grants access to native output. Missing/unverified destinations fail closed; unbound local command output is not posted to Slack. On restart, persisted origins are retained. Old pending top-level or destinationless deliveries are marked failed, not silently rerouted. Channel revocation prevents delivery rather than choosing another channel.
 
 ## 文件与会话只读查询
 
@@ -67,19 +65,11 @@ Local/Skill `session.create` and `session.attach` do not require a Slack destina
 
 ### 简洁响应与观察订阅
 
-Slack 默认响应是有界摘要，不再保证直接输出完整 JSON。需要结构化完整内容时使用摘要返回的 `result.page`；分页 session 查询可直接用 `result.next`。原始本地/桌面结构化查询保持兼容，Slack 的 loaded 默认与最大 10 条/来源是显式传输层差异。新增订阅不会增加审批权限。参数及边界见 [SLACK-OUTPUT](SLACK-OUTPUT.md)，完整命令 schema 由 `help` 生成。
-
-`session.overview` 和 `session.messages` 使用发现得到的 Codex threadId，不是控制绑定 sessionId。前者是 1–5 个 ID 的有界摘录，后者是只读可见对话分页。它们不调用 resume。详细边界见 [SESSION-OVERVIEW](SESSION-OVERVIEW.md)，准确字段以生成的 help 为准。
+Slack 的有界摘要可用 `result.page` 查看短期原线程详情，`result.next` 只继续受支持的安全元数据查询。Slack 默认只查 loaded、每来源最多 10 条。见 [SLACK-OUTPUT](SLACK-OUTPUT.md)。即使仅开启 Slack，也无法证明原生轮次不含另一个客户端的输入，因此不会发送任何原生用户或模型正文；绑定、订阅、分页和缓存恢复都不能改变这一边界。旧正文快照、待发消息和不确定投递不作为重播渠道。已经发送到 Slack 的消息不在连接器自动撤回范围内。
 
 `session.recent {"limit":5}`（1–20）是只读元数据查询，返回有界候选中的生命周期时间排名和独立后端更新参考。它不是 `session.list view=active`：已完成且 idle 的会话也可能最近活跃。不自动建立控制绑定或订阅，记录器不把接收/读取时间当活动时间。见 [SESSION-RECENT.md](SESSION-RECENT.md)。
 
-### 可见会话文本搜索
-
-`session.search` 通过只读 `thread/list` 发现按 `updated_at` 降序的 indexed interactive/nonarchived 会话，再对获准会话读取 `thread/items/list`。它不使用执行活动时间排名，不合并 loaded-only 会话，不 attach/resume，也不扫描 rollout/session 文件。用户文本只取 `userMessage` 的 text parts；模型文本只取 `agentMessage.text`，不含工具、reasoning、系统内容或语义总结。
-
-参数为 `terms`（1–10 个字符串，提交值每个最多 200 UTF-16 code unit、总计不超过 1000，去首尾空白后非空，不允许控制字符）、`mode:and|or`（默认 and）、`role:all|user|assistant`（默认 all）、`sessionLimit`（1–20，默认 10）、`limit`（1–50 条命中，默认 20）、`maxChars`（每条摘录 100–2000，默认 1000）与返回的不透明 `cursor`。大小写不敏感的字面子串匹配在**同一条**完整安全可见消息内完成，之后才截断；不支持正则、跨消息 AND 或查询语言。敏感消息被隐藏，不通过匹配结果探测秘密。
-
-结果包含命中消息、对应会话基础信息及覆盖/排除/失败信息；有界读取、无权限或不可用历史不能被解释为全局没有命中。搜索是非原子实时读取，不是稳定历史快照。Slack `result.next` 延续同一搜索，遵守同认证身份、同频道/线程及有限结果保留策略；`result.page` 只展开已有结果，不继续扫描。完整语义见 [SESSION-SEARCH.md](SESSION-SEARCH.md)。
+需要正文时使用原 Codex UI，或已启用且获授权的本机 `session.history` / `events`。本机接口不是 Slack 缓存的替代出口，不要自动把本机结果转贴到 Slack。
 
 ## Server-scoped local clients
 

@@ -2,7 +2,7 @@
 
 `session.recent {"limit":5}` 用于“当前没有 active 会话，但想知道最近在做什么”。limit 默认 5、范围 1–20。现在空闲不等于过去没有活动。
 
-返回的 `sessions` 只按有真实生命周期时间证据的候选排序：`lastActivityAtMs` 降序，同毫秒按精确 `threadId` 升序。每行有标题、cwd、当前读取的状态、时间、`activitySource` 和 `activityEvent`。时间是生产者事件时间，不是 dot 查询时间。选择精确 threadId 后可调用 `session.overview`、`session.messages`，或在需要持续观察时明确 `session.subscribe`。控制操作仍使用独立的 connector sessionId。
+返回的 `sessions` 只按有真实生命周期时间证据的候选排序：`lastActivityAtMs` 降序，同毫秒按精确 `threadId` 升序。每行给出当前读取的安全元数据、状态、时间、`activitySource` 和 `activityEvent`；Slack 不显示原生生成的标题或正文。时间是生产者事件时间，不是 dot 查询时间。选择精确 threadId 后，去原 Codex 界面核对正文；需要观察自己从 Slack 发起的操作时可以明确订阅固定状态通知。控制操作仍使用独立的 connector sessionId。
 
 ## 时间依据
 

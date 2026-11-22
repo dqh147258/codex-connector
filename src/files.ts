@@ -79,7 +79,7 @@ function normalizeError(error: unknown): never {
 export class ReadonlyFiles {
   private readonly roots: Record<string, string>;
   private readonly limits: FileLimits;
-  constructor(roots: Record<string, string>, limits: Partial<FileLimits> = {}, private readonly allowAbsolutePaths = false) {
+  constructor(roots: Record<string, string>, limits: Partial<FileLimits> = {}, private readonly allowAbsolutePaths = false, private readonly privateRoots:readonly string[] = []) {
     this.roots = { ...roots }; this.limits = { ...DEFAULTS, ...limits };
     if (!roots || (!Object.keys(roots).length&&!allowAbsolutePaths)) throw new FileAccessError('ROOT_UNKNOWN');
     for (const [alias, root] of Object.entries(roots)) {
@@ -91,17 +91,19 @@ export class ReadonlyFiles {
     }
   }
   get absolutePathsEnabled(){return this.allowAbsolutePaths;}
+  private checkPrivate(full:string){if(this.privateRoots.some(root=>inside(root,full)))throw forbidden();}
   private async checked(rootAlias: string | undefined, path: string): Promise<{ root: string; full: string; stats: BigIntStats; path: string }> {
     if(rootAlias===undefined){
       if(!this.allowAbsolutePaths)throw new FileAccessError('ABSOLUTE_PATHS_DISABLED');
-      const {full,anchor,components}=absolutePathSyntax(path);let at=anchor,stats=await lstat(anchor,{bigint:true});
+      const {full,anchor,components}=absolutePathSyntax(path);this.checkPrivate(full);let at=anchor,stats=await lstat(anchor,{bigint:true});
       if(!stats.isDirectory()||stats.isSymbolicLink())throw forbidden();
       for(const [index,component]of components.entries()){at=join(at,component);stats=await lstat(at,{bigint:true});if(stats.isSymbolicLink()||(!stats.isDirectory()&&!stats.isFile())||(index<components.length-1&&!stats.isDirectory())||(stats.isFile()&&stats.nlink>1n))throw forbidden();}
-      const canonical=await realpath(full);if(canonical!==full)throw forbidden();
+      const canonical=await realpath(full);this.checkPrivate(canonical);if(canonical!==full)throw forbidden();
       return{root:anchor,full,stats,path:full};
     }
     if (!Object.hasOwn(this.roots, rootAlias)) throw new FileAccessError('ROOT_UNKNOWN');
     const components = parts(path), configured = resolve(this.roots[rootAlias]!);
+    this.checkPrivate(resolve(configured,...components));
     // Walk root ancestors without following an earlier symlink/junction into
     // a protected directory before validating the final root itself.
     const anchor = parse(configured).root; let ancestor = anchor;
@@ -122,6 +124,7 @@ export class ReadonlyFiles {
       if (stats.isFile() && stats.nlink > 1n) throw forbidden();
     }
     const canonical = await realpath(full);
+    this.checkPrivate(canonical);
     if (!inside(root, canonical) || canonical !== full) throw forbidden();
     return { root, full, stats, path: components.join('/') || '.' };
   }

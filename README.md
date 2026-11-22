@@ -1,8 +1,8 @@
 # Codex Connector 0.2：本机 Agent 和 Slack 共用已授权的 Codex server
 
-连接器使用官方 `codex app-server proxy` 接入当前账户已配置的共享 daemon。**不使用 Slack 也能工作**：本机 Agent 通过 CLI、stdio MCP 或 Skill 选择 server、创建或绑定会话并读取回复。Slack 可以单独启用，也可以与本机模式并存；本机操作不会自动转发到 Slack。快速配置与多 server 示例见[本机 Agent 接入](docs/LOCAL-AGENTS.md)。
+连接器使用官方 `codex app-server proxy` 接入当前账户已配置的共享 daemon。**不使用 Slack 也能工作**：本机 Agent 通过 CLI、stdio MCP 或 Skill 选择 server、创建或绑定会话并读取回复。Slack 可以单独启用，也可以与本机模式并存；Slack 只发送安全元数据、命令回执和可归属到原 Slack 线程的固定状态提醒，不转发原生会话正文或审批细节。快速配置与多 server 示例见[本机 Agent 接入](docs/LOCAL-AGENTS.md)。
 
-> **用户上传的本机验证记录报告：已在 macOS 实机验证共享 daemon 的 WebSocket 握手和只读会话发现，Slack 凭据与 dot 身份核验通过。** 真实活动会话的发送、接管和审批回放仍待专项验收，不代表所有会话均可管理。完整证据与验收范围见 [runtime report](docs/RUNTIME-VERIFICATION.md)。
+> **用户上传的本机验证记录报告：已在 macOS 实机验证共享 daemon 的 WebSocket 握手和只读会话发现，Slack 凭据与 dot 身份核验通过。** 真实活动会话的发送、接管和固定提醒仍待专项验收，不代表所有会话均可管理。完整证据与验收范围见 [runtime report](docs/RUNTIME-VERIFICATION.md)。
 
 ## 已实现的边界
 
@@ -11,10 +11,10 @@
 - Node.js 22+ 持续运行服务器，Slack Socket Mode，无公网入口。
 - 仅接受配置的工作区、输入频道、dot 的 **botId + userId + appId**，以及配置的人类 ID；不信任正文里的 `actor` / `approvedBy`。
 - 全消息精确起止标记 + JSON；命令、参数、目标实例、重复 ID 均校验。没有任意 shell / RPC 透传。
-- 输入频道与输出频道分离；dot 可按名称唯一解析，保存稳定 user ID。更改名称选择会重新解析，不会继续偷偷 mention 旧对象。
-- 共享会话发现、绑定、创建、信息/文本历史、发送、显式 steer/queue/interrupt；按能力报告无法管理的例外。
+- 输入频道与输出频道可分离；dot 可按名称唯一解析，保存稳定 user ID。更改名称选择会重新解析，不会继续偷偷 mention 旧对象。
+- 共享会话发现、绑定、创建、发送、显式 steer/queue/interrupt；按能力报告无法管理的例外。授权本机客户端可另查可见历史，Slack 不读原生正文。
 - 只读文件 `list/stat/read/search`：兼容项目别名；可在本地明确启用绝对路径读取，无需项目别名。保留 OS 权限、敏感路径/内容和输出量限制，默认关闭全系统只读。
-- 审批/输入精确绑定 **requestId + epoch + sessionId + turnId**；过期、重启、重复、错线程拒绝；不自动批准。
+- 原生审批和输入必须在原 Codex 界面完成。Slack 只可能收到原线程的固定提醒，不显示原始内容或决策模板。
 - 持久命令 inbox 与独立 outbox；发送失败不会重跑 Codex；同一会话输出保序。
 - Linux / macOS / Windows 的登录/登录前启动**模板生成**，不自动安装、不提权、不保存系统登录密码。
 
@@ -37,8 +37,8 @@ node dist/src/cli.js init --mode local  # 仅本机；配置 Slack 用 init --mo
 以 [`config.example.json`](config.example.json) 为准：
 
 - `instanceId`：给 dot 使用的目标电脑标识。
-- `slack.inputChannel`：接收 dot 指令；`outputChannel`：输出和人类决定的目标频道。bot 必须被邀请进两个频道。
-- `trustedBots`：精确的 dot 元数据 ID；只填可信 bot。`allowedHumans` / `approvalUsers` 填 Carl 的真实 Slack 用户 ID，不是名字。
+- `slack.inputChannel`：接收 dot 指令；`outputChannel`：允许显式绑定的输出频道。bot 必须被邀请进相应频道。
+- `trustedBots`：精确的 dot 元数据 ID；只填可信 bot。`allowedHumans` 填 Carl 的真实 Slack 用户 ID，不是名字。保留 v2 配置字段 `approvalUsers` 且必须是 `allowedHumans` 的子集；此字段不授予从 Slack 决定原生审批的权限。
 - `dot.name`：选择 dot 名称；可同时指定已确认 `dot.userId` 解决重名。输出只 mention 已解析的 ID，不把名称拼成 `@` 文本。
 - `projects`：项目别名→绝对路径。默认这些根目录限制只读文件工具；本地启用 `filePolicy.allowAbsolutePaths` 后可省略文件命令的 `root` 并传原生绝对 `path`（可用 `projects:{}`），详见[只读文件](docs/READONLY-FILES.md)；默认会话控制允许根目录及其子目录，发现操作则列出共享 daemon 全部可见会话并给出限制原因。
 - `sessionPolicy.allowAllSharedSessions`：仅可在本机配置的显式开关，默认 `false`。设为 `true` 后允许绑定同账户共享 daemon 中项目根以外的会话；**不会扩大 files.* 的 roots**，也不覆盖原会话沙箱。Slack 不能更改此开关。
@@ -83,7 +83,7 @@ CODEX_CONNECTOR_COMMAND_BEGIN
 CODEX_CONNECTOR_COMMAND_END
 ```
 
-`id` 长度 8–128；同一真实主体重试必须保留 ID 和相同内容，不同动作使用新 ID。人类与 bot 的 ID 空间隔离，dot 不能先占用审批模板 ID 来阻止 Carl 回答。重复/冲突不重新执行。
+`id` 长度 8–128；同一真实主体重试必须保留 ID 和相同内容，不同动作使用新 ID。人类与 bot 的 ID 空间隔离。重复/冲突不重新执行。
 
 可本地生成准确消息：
 
@@ -96,12 +96,12 @@ node dist/src/cli.js help --command session.create
 
 | 类别 | 命令 |
 |---|---|
-| 说明 | `help`、`capabilities` |
-| 会话 | `session.list/recent/search/overview/messages/info/history/delivery/create/attach/send/steer/queue/interrupt/reply` |
-| 审批/输入 | `approval.list/respond`、`input.respond` |
+| 说明 | `help`、`capabilities`、`server.list` |
+| 会话 | `session.list/recent/info/delivery/create/attach/send/steer/queue/interrupt/reply` |
+| 观察 / 分页 | `session.subscribe/subscriptions/unsubscribe`、`result.page/next` |
 | 文件只读 | `files.list/stat/read/search` |
 
-`session.reply` 不调用模型；本地/Skill 调用向已有绑定 thread 发进度，Slack 调用则回复调用者所在 thread，不修改会话绑定。文件工具没有写入、删除、执行命令能力；服务管理也不在远程命令清单中。
+`session.reply` 是显式的操作者自写回复，不调用模型、不拉取历史、不修改会话绑定。只发送你有权分享的内容，不要用它转贴本应留在 Codex 的原生正文。文件工具没有写入、删除、执行命令能力；服务管理也不在远程命令清单中。
 
 ## 3. 绑定已有默认会话
 
@@ -119,20 +119,13 @@ node dist/src/cli.js help --command session.create
 
 上面只展示 command/params；实际必须放入完整 envelope。`session.info` 提供近期 turn ID/status。`send` 检查输入能力后使用 `thread/queue/add` + `thread/queue/start`，不通过可能隐式 steer 的 `turn/start`。`queue/add` 可能在响应前唤醒并消费消息，因此 `startError` 只能说明启动请求未获确认，不能断言消息仍在队列或没有收到。发送结果分别报告队列接纳、启动请求和关联 turn 的执行状态；用 `session.delivery {sessionId,workId}` 只读核对最新证据。不重复入队也不悄悄改变正在运行的 turn；当前版本缺少 queue API 时明确失败，不回退。已知忙碌时使用带精确 turn ID 的 `steer` 或 queue。完整状态语义、并发限制和验证方式见 [SESSION-DELIVERY.md](docs/SESSION-DELIVERY.md)。Codex 版本/运行时可能拒绝子代理、独立 `--no-daemon`、特殊来源或不能直接输入的会话；会明确显示 `DIRECT_INPUT_UNAVAILABLE` 等错误。
 
-**只有显式绑定且仍符合本机会话控制策略的会话会被转发**，不会自动广播其他会话。历史只输出用户/assistant 文本，不输出工具日志、推理、图片或原始本地文件路径；长文本有界截断并保留分页游标。
+**Slack 不传原生会话正文。** 绑定、订阅、关闭本机 API 或已知发送者都不能证明同一原生会话没有被其他客户端输入过。Slack 的历史正文、概览摘录、正文搜索、旧分页与历史重放均不可用；收到 `NATIVE_CONTENT_LOCAL_ONLY` 表示 Slack 不提供这一功能，不是没有历史。用原 Codex 界面，或在本机入口启用时用授权本机 API 读可见回复。
 
-## 4. Carl → dot → connector 的决定路径
+## 4. 原生审批和输入怎么处理
 
-连接器将适合远程处理的原始请求范围、到期时间和完整回答模板发到该会话输出 thread，mention dot。只支持一次请求的 `accept / decline / cancel`，不支持 `acceptForSession`、execpolicy 修改或全局授权。
+回原 Codex 界面查看完整请求并亲自处理。Slack 的固定提示不包含命令、文件差异、问题、选项或决定模板；Slack 和本机 Connector API 都不接收原生批准或输入答复；`LOCAL_ACTION_REQUIRED` 指向原 Codex 界面。
 
-两条受支持路径：
-
-1. **Carl 直接回同一 thread**：使用模板中的 requestId/epoch/sessionId/turnId，以配置的真实人类账号发送完整决定 envelope。
-2. **dot 转交可验证引用**：Carl 的完整决定 envelope 存在于该允许的输出 thread；dot 发送相同决定参数，加上 `humanMessageTs`。连接器独立获取该时间戳的实际 Slack 消息，核对真实人类 ID、未编辑、同 thread、相同请求/决定，再回应 Codex。正文里写“Carl 已同意”、引用一句话或伪造 `approvedBy` 都不算授权。
-
-若 bot token 无法读取这条消息（Slack 的 `conversations.replies` 在部分 token/频道类型下受限），或决定只存在于不可读 DM，则返回 `NEED_VERIFIABLE_HUMAN_DECISION`。请 Carl 直接回原 thread；**不会为了闭环把 dot 升级为可自行批准的代理**。此路径已有 fake integration 测试，真实工作区权限仍待验证。
-
-输入问题按原始 question ID 和选项校验。密码/secret 问题、隐藏/缺失/过长的命令或 diff、宽根目录授权、未知交互请求转为 `LOCAL_ACTION_REQUIRED`，内容不泄露到 Slack，也不自动猜答案。超时的可处理命令/文件审批拒绝；输入超时中断该精确 turn。重连后旧请求失效，只有新连接实际 replay 的请求才能重新决策。
+到期后，只有连接器能重新确认请求仍属于**原 Slack 线程接纳的同一请求与轮次**、权限和连接都仍有效，且有界读回完整时，才可能拒绝那一条命令/文件回调，或中断需要输入的那一轮。到期记录可在本机查看；验证和执行不是原子操作。身份、范围、轮次或连接变化，原生/本机来源不明，或协议不支持时，不自动响应、中断或重放。不要把没有 Slack 提醒当成没有待处理请求。
 
 ## 5. Codex Skill / 本地 API
 
@@ -154,7 +147,7 @@ API 只监听 `127.0.0.1`，需要私有 token，拒绝浏览器 Origin / 异常
 
 - `status` 查看 capability、绑定、work/outbox/pending 元数据。
 - crash 时 executing→uncertain、sending→uncertain、pending→stale；不自动重放副作用。
-- 审批和只读查询有独立队列，不会被不确定模型动作卡住。
+- 只读查询不会因为等待抉择就开始另一轮操作；原生决定仍在 Codex 界面处理。
 - 网络发送结果不明时 outbox 暂停同会话后续输出，Codex 不重跑；其他会话可继续。
 - 操作者核对实际状态后本地执行：
 
@@ -176,35 +169,27 @@ npm run typecheck
 npm test
 ```
 
-测试使用 fake Slack、采用真实 WebSocket 帧的 fake shared-daemon protocol，包含严格消息边界、身份、重放、文件逃逸、审批错配/过期/敏感范围、断连、不确定状态、outbox、真实 CLI 本地 HTTP 及三系统模板。用户上传的本机记录报告已在 macOS 验证真实 Slack Socket Mode、频道读取和默认共享 daemon 的只读会话发现；Windows、Slack 指令收发/mention、实际活动会话接管和跨客户端审批回放尚未验收。此处本机记录不包含 CI；当前桌面预览另有 macOS arm64/x64 Actions 构建与 mock 测试。
+测试使用 fake Slack、采用真实 WebSocket 帧的 fake shared-daemon protocol，包含严格消息边界、身份、重放、文件逃逸、审批错配/过期/敏感范围、断连、不确定状态、outbox、真实 CLI 本地 HTTP 及三系统模板。用户上传的本机记录报告已在 macOS 验证真实 Slack Socket Mode、频道读取和默认共享 daemon 的只读会话发现；Windows、Slack 指令收发/mention、实际活动会话接管和固定状态提醒仍待实机验收。此处本机记录不包含 CI；当前桌面预览另有 macOS arm64/x64 Actions 构建与 mock 测试。
 
 详细：[实现计划](PLAN.md) · [安全边界](docs/SECURITY.md) · [协议说明](docs/PROTOCOL.md) · [实际能力证据](docs/RUNTIME-VERIFICATION.md)
 
 ### 群聊回复不会刷到频道顶层
 
-命令成功、失败和格式错误都回复发起命令的原 Thread；顶层命令以该消息自身建立回复 Thread。异步 Codex 输出/审批继续留在既有会话绑定，后续从别的 Thread 查询不会偷偷改绑。找不到有效目的 Thread 时拒绝发送，不回退到群聊顶层。
+命令成功、失败和格式错误都回复发起命令的原 Thread；顶层命令以该消息自身建立回复 Thread。异步状态通知只去该操作可核实的原 Slack Thread，不把事件送给其他观察者或本机操作创建的绑定。找不到有效目的 Thread 时拒绝发送，不回退到群聊顶层。
 
 本地新建或绑定默认不发 Slack，无需 `outputThreadTs`。仅操作者明确要求 Slack 绑定时提供已配置输出频道内的根时间戳；Connector 先验证可读取性。MCP 不接受该字段。完整边界见 [协议说明](docs/PROTOCOL.md#reply-destination-and-explicit-address)。
 
 ## 简洁 Slack 输出与关键消息订阅
 
-Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:active` 从当前 loaded 元数据筛选，历史单独用 `view:history`。使用 `result.next` 获取下一页，`result.page` 显式读取短期、同身份同线程的详情，避免自动 JSON 刷屏。`session.subscribe` / `session.unsubscribe` 独立控制关键阶段消息，取消不会停止 Codex。完整边界见 [输出与订阅](docs/SLACK-OUTPUT.md)。
+Slack 默认 `session.list` 只查 loaded、每来源最多 10 条；`view:active` 从当前 loaded 元数据筛选，历史单独用 `view:history`。使用 `result.next` 获取下一页，`result.page` 显式读取短期、同身份同线程的详情，避免自动 JSON 刷屏。`session.subscribe` / `session.unsubscribe` 管理固定状态提醒，取消不会停止 Codex。完整边界见 [输出与订阅](docs/SLACK-OUTPUT.md)。
 
 提供两份可手动安装/阅读的 Skill：[Codex 本地](skills/codex-connector/SKILL.md) 与 [dot Slack 操作](skills/dot-slack-connector/SKILL.md)。没有自动安装到用户电脑或修改 dot 内部指令。
 
-## 选定会话的上下文概览
+## 定位会话与查看内容
 
-先 `session.list`，再用 `session.overview` 对 1–5 个 Codex threadId 获取首条/最近用户消息与最近可见模型消息的有界摘录；定位后用同一 threadId 调 `session.messages` 只读翻页或显式 `session.subscribe`。无需先绑定/恢复会话，不调用额外模型总结。范围、覆盖不足和 ID 区别见 [会话概览接口](docs/SESSION-OVERVIEW.md)。
+Slack 使用 `session.list` 定位有明确 ID 的候选会话，或用 `session.recent {"limit":5}` 根据生产者生命周期时间查看有界候选。当前 idle 也可入选；没有真实活动时间的记录单列为后端更新参考，不等于执行。见 [SESSION-RECENT.md](docs/SESSION-RECENT.md)。有多个候选时请让操作者在原 Codex 界面核对，不靠猜测或搜索原生正文。
 
-### 最近活跃会话
-
-`session.recent {"limit":5}` 根据生产者生命周期时间列出有界候选中的最近活动；当前 idle 也可入选。没有真实活动时间的记录单列为后端更新参考，不混称执行。只查元数据、不自动接管或订阅，也不会把查询/重连算成活跃。随后用精确 Codex threadId 查询概览和对话。完整范围、时间来源和限制见 [SESSION-RECENT.md](docs/SESSION-RECENT.md)。
-
-### 搜索用户输入和模型可见消息
-
-`session.search {"terms":["Slack","审批"],"mode":"and","role":"all","sessionLimit":10}` 在最近更新的已索引、未归档交互会话中搜索。`mode:and` 要求同一条消息包含所有关键词，`or` 命中任一个即可；`role:user` 只搜用户输入，`assistant` 只搜模型可见文字。默认最近 10 个获准会话，每页最多 20 条命中，返回匹配消息和会话基础信息，不搜工具、reasoning 或系统内容，不调用模型提炼结论。
-
-这里“最近”按后端 `updated_at` 排序，不是 `session.recent` 的执行活动时间。匹配先于摘录截断，读取和发现均有界；零命中不代表所有会话都没有。用同身份、同 Slack thread 的 `result.next` 继续可用搜索页，`result.page` 查看本页详情和覆盖缺口。完整参数、范围和例子见 [SESSION-SEARCH.md](docs/SESSION-SEARCH.md)。
+已有授权本机绑定时，可以通过本机 `session.history`、`events` 或对应 MCP 工具读取有界可见历史和最终事件。只读内容不授予查看原生审批细节或作决定的权限，不应再复制进 Slack。详情见[本机 Agent 接入](docs/LOCAL-AGENTS.md)。
 
 ## 远程屏幕截图（默认关闭）
 

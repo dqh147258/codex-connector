@@ -1,6 +1,6 @@
 # 本机 Agent 接入：不需要 Slack
 
-同一台电脑上，只启动一个 Connector daemon。本机 CLI、stdio MCP 和 Skill 通过受保护的环回 API 使用它；它们不会另起一台 Codex server。连接器只连接操作者预先配置的原生共享 daemon，不扫描所有进程或用户目录。这里给出源码安装方式，示例路径和 ID 都需要替换。
+同一台电脑上，只启动一个 Connector daemon。本机 CLI、stdio MCP 和 Skill 通过受保护的环回 API 使用它；它们不会另起一台 Codex server。原生对话正文只在原 Codex 界面和获授权的本机内容接口读取，不会由 Slack 模式、订阅或续页转发。所有原生审批/输入仍只由原 Codex 界面处理。连接器只连接操作者预先配置的原生共享 daemon，不扫描所有进程或用户目录。这里给出源码安装方式，示例路径和 ID 都需要替换。
 
 ## 1. 先启动本机模式
 

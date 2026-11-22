@@ -21,6 +21,8 @@ export class Runtime {
   constructor(readonly config:Config,private dir:string,slack:SlackPort,screens?:ScreenPort,
     makeBackend?:MakeBackend){
     const profiles=configuredServers(config),preferred=defaultServer(config),targets=validateIdentities(profiles);
+    const protectedHomes=[...new Set([...targets.values()].map(t=>t.home).filter((home):home is string=>home!==null))];
+    const unknownHome=[...targets.values()].some(target=>target.home===null);
     this.slackIds=config.slack.servers??(preferred?[preferred]:[]);
     mkdirSync(dir,{recursive:true,mode:0o700});this.lock=openSync(join(dir,'runtime.lock'),'wx',0o600);
     try{
@@ -35,7 +37,7 @@ export class Runtime {
           const requireHome=profiles.size>1||!!profile.codexHome;
           const backend=makeBackend?makeBackend(profile,id):new SharedAppServer(profile,undefined,requireHome?target.home!:undefined);
           this.backends.set(id,backend);
-          const context:RuntimeContext={id,defaultRoute:id===this.slackIds.find(a=>!this.blocked.has(a)),
+          const context:RuntimeContext={id,protectedHomes,unknownHome,defaultRoute:id===this.slackIds.find(a=>!this.blocked.has(a)),
             slackReady:()=>this.slackReady&&this.slackIds.includes(id),
             principal:principal=>this.principal(principal),
             servers:source=>source.kind==='local'?this.servers(this.principal(source.userId)!):this.projectServers(this.slackIds),

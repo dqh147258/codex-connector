@@ -4,10 +4,10 @@
 
 - Real processes: CLI startup in local, Slack-only and dual modes; MCP stdio initialization, tool enumeration, new thread, send, receipt, correlated final + terminal events and unwatch through a real loopback HTTP server. The App Server and Slack in these tests are controlled fixtures, not the user's accounts.
 - Distinct official-proxy-shaped fixture targets, including the same thread/turn IDs on different servers, one disabled/unavailable target, ambient vs explicit Home, collision denial, and explicit expected Home A vs reported Home B failing at initialization before thread requests. Listing known server health never starts a process.
-- v2 migration preview/backups, unknown write recovery, transport grants and project roots, local-only turn not posted to a dual-bound Slack session, exact Slack thread for proven Slack turns, scoped local credentials and result revocation, stable request IDs and single queue submission, native read-only paged reconciliation across reconnect, stale approval isolation and no autoapproval.
+- v2 migration preview/backups, unknown write recovery, transport grants and project roots, native free-form output excluded from Slack, fixed safe notices confined to the exact proved Slack origin under current scope, scoped local credentials and result revocation, stable request IDs and single queue submission, native read-only paged reconciliation across reconnect, stale approval isolation and no autoapproval.
 - Windows diagnostic package: built by `npm run build && python3 scripts/package-owner-probe.py OUTPUT.zip` using the checked-in allowlist, source and generated JS, pure JS ws and its license. Fresh unpack and fixture-only run passed. See [Windows instructions](WINDOWS-CANDIDATE.md) for exactly what it can certify.
 - Windows evidence collected separately by the operator/host, distinct from this cloud run: packaged Desktop 26.1117.4957.0, bundled CLI 0.171.0-alpha.13, earlier official default `app-server daemon version` exited 1 with Windows error 10050. This does not establish the cause, or whether a candidate can reach the Desktop owner. Do not infer a firewall issue, path length issue, or service version. An authenticated real Windows native test and real Slack still require their respective existing, authorized test owner/channel. An offline Windows fixture cannot satisfy either.
-- No Electron page or control has been changed. Existing Desktop regressions are included; a visible Desktop round-trip is **not claimed**. No deployment, PR, or release is part of this candidate.
+- Desktop settings, renderer and IPC fixtures cover configuration round-tripping; the cloud sandbox did not provide a usable native Electron window. A visible desktop round-trip is **not claimed**. No deployment or release was performed by these tests.
 
 ---
 
@@ -72,8 +72,8 @@ Only the configured official shared proxy transport is used. The default-off loc
 
 1. Same-account default daemon/proxy connectivity on native Windows and other untested environments; local macOS connectivity passed as recorded above.
 2. Discovery/attach/send/steer/queue/interrupt against an explicitly authorized real test session.
-3. Approval/user-input replay and resolution with two clients, including version-specific protected-human flows.
-4. Actual Slack command event delivery, output mentions, and human-message-reference fetch permissions; local authentication, dot identity resolution, Socket Mode connection, and channel history access passed.
+3. Fixed native-interaction notice, original UI resolution and scoped expiry with an explicitly authorized test session; remote decision relay is not supported.
+4. Actual Slack command event delivery, output mentions and same-origin fixed notices; local authentication, dot identity resolution, Socket Mode connection, and channel history access passed.
 5. Native Windows/macOS process lifecycle and service startup; Windows S4U limitations may require login startup instead.
 
 No broad claim that “all default sessions are controllable” is made before these gates pass.

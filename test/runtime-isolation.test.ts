@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync,mkdirSync,rmSync,readFileSync,existsSync } from 'node:fs';
+import { mkdtempSync,mkdirSync,rmSync,readFileSync,existsSync,writeFileSync } from 'node:fs';
 import { join } from 'node:path';import { tmpdir } from 'node:os';import { createHash,randomUUID } from 'node:crypto';
 import { FakeBackend,request,event,waitFor } from './helpers.js';
 import { Runtime } from '../src/runtime.js';import { parseConfig } from '../src/config.js';
@@ -13,7 +13,9 @@ function fixture(options={slack:true}){
   slack:options.slack?{servers:['default'],teamId:'T1',inputChannel:'CIN',outputChannel:'COUT',allowedHumans:['UH'],approvalUsers:['UH'],trustedBots:[{botId:'BDOT',userId:'UDOT',appId:'ADOT'}],dot:{name:'dot',userId:'UDOT'}}:{enabled:false}};
  const cfg=parseConfig(raw),posts:any[]=[],native=new Map<string,FakeBackend>();
  const slack:SlackPort={async post(channel,text,opts){posts.push({channel,text,opts});return '91.3';},async resolveDot(){return{userId:'UDOT',name:'dot'};},async threadExists(){return true;},async humanMessage(){return undefined;}};
- const createRuntime=()=>new Runtime(cfg,dir,slack,undefined,(_,id)=>{const f=new FakeBackend();f.threads.set('same-thread',{id:'same-thread',cwd:a,status:{type:'idle'},canAcceptDirectInput:true});f.threads.set('unallowed',{id:'unallowed',cwd:b,status:{type:'idle'},canAcceptDirectInput:true});native.set(id,f);return f;});
+ const createRuntime=()=>{const rt=new Runtime(cfg,dir,slack,undefined,(_,id)=>{const f=new FakeBackend();f.threads.set('same-thread',{id:'same-thread',cwd:a,status:{type:'idle'},canAcceptDirectInput:true});f.threads.set('unallowed',{id:'unallowed',cwd:b,status:{type:'idle'},canAcceptDirectInput:true});native.set(id,f);return f;});
+ for(const core of rt.cores.values())Object.assign(core,{postIntervalMs:0}); // Only omit production pacing in this trusted test adapter.
+ return rt;};
  let runtime=createRuntime();
  const reopen=async(localEnabled:boolean)=>{await runtime.close();cfg.local!.enabled=localEnabled;runtime=createRuntime();await runtime.connectLocal();await runtime.enableSlack('USELF','BSELF');return runtime;};
  const cmd=async(name:string,params:Record<string,unknown>,p=OPERATOR)=>{const admitted=runtime.local(request(name,params),p);await waitFor(()=>runtime.receipt({serverId:admitted.serverId!,workId:admitted.id},p).status!=='executing'&&runtime.receipt({serverId:admitted.serverId!,workId:admitted.id},p).status!=='queued');return runtime.receipt({serverId:admitted.serverId!,workId:admitted.id},p);};
@@ -83,12 +85,12 @@ test('dual-bound Slack events use their proved sending thread, not a spectator, 
   nativeInput(b,'same-thread',turnId,origin.id);
   const m={threadId:'same-thread',turnId,item:{id:'final-abc',type:'agentMessage',phase:'final_answer',text:'origin-only-final'}};
   b.emit('notification','item/completed',m,b.epoch);b.emit('notification','item/completed',m,b.epoch);
-  await waitFor(()=>core.store.state.outbox.some(x=>x.text==='origin-only-final'));
-  assert.deepEqual(core.store.state.outbox.filter(x=>x.text==='origin-only-final').map(x=>x.threadTs),['101.1']);
+  await waitFor(()=>core.store.state.outbox.some(x=>x.text.includes('A Codex answer is ready')));
+  assert.deepEqual(core.store.state.outbox.filter(x=>x.text.includes('A Codex answer is ready')).map(x=>x.threadTs),['101.1']);
   b.emit('request',{epoch:b.epoch,id:64,method:'item/commandExecution/requestApproval',params:{threadId:'same-thread',turnId,command:'secret-ish action'}});
-  await waitFor(()=>core.store.state.outbox.some(x=>x.text.startsWith('LOCAL_ACTION_REQUIRED')));
+  await waitFor(()=>core.store.state.outbox.some(x=>x.text.includes('LOCAL_ACTION_REQUIRED')));
   assert.equal(core.store.state.pending.length,0);assert.equal(core.store.state.outbox.at(-1)!.threadTs,'101.1');
-  assert.ok(!JSON.stringify(core.store.state.outbox).includes('secret-ish action'));assert.equal(b.responses.length,0);
+  assert.ok(!JSON.stringify(core.store.state.outbox).includes('secret-ish action'));assert.ok(!JSON.stringify(core.store.state.outbox).includes('origin-only-final'));assert.equal(b.responses.length,0);
  }finally{await f.cleanup();}
 });
 
@@ -107,161 +109,106 @@ async function slackWork(f:ReturnType<typeof fixture>,command:string,params:any,
 }
 const msg=(turnId:string,id:string,text:string,clientId?:string)=>({turnId,item:clientId?{id,type:'userMessage',clientId,content:[{type:'text',text}]}:{id,type:'agentMessage',text}});
 
-test('Slack histories, search, snapshots and continuations cannot disclose local or unattributed turns, even after attach',async()=>{
- const f=fixture(),r=f.runtime,threadId='same-thread',b=f.native.get('default')!;
- try{
-  await r.connectLocal();await r.enableSlack('USELF','BSELF');
-  const a=await f.cmd('session.attach',{threadId}),sessionId=(a.result as any).sessionId;
-  const privateText='LOCAL-ONLY SENTINEL',unattributed='DESKTOP-ONLY SENTINEL',publicText='SLACK ALLOWED SENTINEL';
-  const add=await f.cmd('session.send',{sessionId,text:privateText});
-  const call=b.rpc.bind(b);
-  let visible:ReturnType<typeof msg>[]=[];
-  b.threads.get(threadId).name=privateText;
-  b.rpc=async(method,params)=>{
-    if(method==='thread/items/list'&&params.threadId===threadId){
-      if(params.turnId)return{data:visible.filter(v=>v.turnId===params.turnId),nextCursor:null};
-      const i=params.cursor?Number(String(params.cursor).slice(5))-1:0;
-      return{data:visible.slice(i,i+1),nextCursor:i+1<visible.length?'page-'+(i+2):null};
-    }
-    if(method==='thread/queue/start')return{turn:{id:'slack-turn',status:'inProgress'}};
-    return call(method,params);
-  };
-  visible=[msg('turn-1','local-user',privateText,add.id),msg('turn-1','local-final',privateText),msg('native-turn','native-final',unattributed)];
-  const direct=await slackWork(f,'session.messages',{threadId});
-  const first=JSON.parse(direct.result!.text);assert.equal(first.returnedCount,0);assert.ok(first.nextCursor);
-  assert.equal(first.metadata.name,null);assert.ok(!direct.result!.text.includes(privateText));
-  const next=await slackWork(f,'result.next',{resultId:direct.result!.id});assert.equal(JSON.parse(next.result!.text).returnedCount,0);
-  const unknown=await slackWork(f,'result.next',{resultId:next.result!.id});assert.equal(JSON.parse(unknown.result!.text).returnedCount,0);
-  await slackWork(f,'result.page',{resultId:direct.result!.id,page:1});
-  const stolen=await slackWork(f,'session.messages',{threadId,cursor:first.nextCursor},'101.1','failed');assert.equal(stolen.work.error,'INVALID_CURSOR');
-  await slackWork(f,'session.attach',{threadId});
-  const history=await slackWork(f,'session.history',{sessionId});assert.deepEqual(JSON.parse(history.result!.text).items,[]);
-  for(const command of ['session.search','session.overview']){
-    const args=command==='session.search'?{terms:['SENTINEL']}:{threadIds:[threadId]};
-    const outcome=await slackWork(f,command,args);assert.ok(!outcome.result!.text.includes(privateText));assert.ok(!outcome.result!.text.includes(unattributed));
-    if(command==='session.search')assert.equal(JSON.parse(outcome.result!.text).returnedCount,0);
-  }
-  const reply=await slackWork(f,'session.send',{sessionId,text:'public request'});
-  visible=[msg('slack-turn','slack-model',publicText),msg('slack-turn','slack-user','public request',reply.work.id)];
-  const own=await slackWork(f,'session.messages',{threadId});assert.equal(JSON.parse(own.result!.text).items[0].excerpt,publicText);
-  const ownBound=await slackWork(f,'session.history',{sessionId});assert.equal(JSON.parse(ownBound.result!.text).items[0].text,publicText);
-  const ownSearch=await slackWork(f,'session.search',{terms:['ALLOWED SENTINEL']});assert.equal(JSON.parse(ownSearch.result!.text).returnedCount,1);
-  const ownNext=await slackWork(f,'result.next',{resultId:own.result!.id});assert.equal(JSON.parse(ownNext.result!.text).items[0].excerpt,'public request');
-  const other=await slackWork(f,'session.messages',{threadId},'101.1');assert.deepEqual(JSON.parse(other.result!.text).items,[]);
-  const cacheReplay=await slackWork(f,'result.page',{resultId:own.result!.id,page:1},'101.1','failed');assert.equal(cacheReplay.work.error,'RESULT_UNAVAILABLE');
-  visible.push(msg('slack-turn','mixed-input','unrelated input','unowned-id'));
-  const mixed=await slackWork(f,'session.messages',{threadId});assert.deepEqual(JSON.parse(mixed.result!.text).items,[]);
-  const oldId=randomUUID();
-  direct.core.store.transaction(d=>d.results!.push({id:oldId,createdAt:Date.now(),expiresAt:Date.now()+60000,policy:own.result!.policy,source:own.result!.source,command:'session.history',text:privateText}));
-  const old=await slackWork(f,'result.page',{resultId:oldId,page:1},'100.1','failed');assert.equal(old.work.error,'RESULT_UNAVAILABLE');
-  assert.ok(!JSON.stringify(direct.core.store.state.outbox).includes(privateText));assert.ok(!JSON.stringify(f.posts).includes(privateText));
-  assert.ok(!JSON.stringify(direct.core.store.state.outbox).includes(unattributed));
- }finally{await f.cleanup();}
-});
-
-test('commentary and visible input prompts stay in the original authorized Slack subscription after local attach',async()=>{
- const f=fixture(),r=f.runtime,b=f.native.get('default')!,threadId='same-thread',turnId='turn-1';
- try{
-  await r.connectLocal();await r.enableSlack('USELF','BSELF');
-  const attach=await slackWork(f,'session.attach',{threadId}),sessionId=attach.work.resultRef!.sessionId;
-  await slackWork(f,'session.subscribe',{threadId});await slackWork(f,'session.subscribe',{threadId},'101.1');
-  const sent=await slackWork(f,'session.send',{sessionId,text:'from slack'});
-  nativeInput(b,threadId,turnId,sent.work.id);
-  assistant(b,threadId,turnId,'comm-1','progress-before');
-  await waitFor(()=>attach.core.store.state.outbox.some(o=>o.text.includes('progress-before')));
-  await f.cmd('session.attach',{threadId});
-  assistant(b,threadId,turnId,'comm-1','progress-before');
-  assistant(b,threadId,turnId,'comm-2','progress-after','partial_answer');
-  b.emit('request',{epoch:b.epoch,id:221,method:'item/tool/requestUserInput',params:{threadId,turnId,questions:[{id:'choice',header:'Decision',question:'visible-question',isSecret:false,options:[{label:'Continue',description:'Continue work'}]}]}});
-  await waitFor(()=>attach.core.store.state.outbox.some(o=>o.text.includes('visible-question')));
-  for(const marker of ['progress-before','progress-after','visible-question']){
-    const rows=attach.core.store.state.outbox.filter(o=>o.text.includes(marker));
-    assert.equal(rows.length,1);assert.equal(rows[0]!.threadTs,'100.1');assert.ok(rows[0]!.subscriptionId);
-  }
-  assert.equal(b.responses.length,0);
-  nativeInput(b,threadId,turnId,undefined,'desktop-steer');
-  assistant(b,threadId,turnId,'mixed-final','MIXED NATIVE OUTPUT','final_answer');
-  await waitFor(()=>attach.core.store.state.work.find(w=>w.id===sent.work.id)?.slackMixedInput===true);
-  assert.ok(!JSON.stringify(attach.core.store.state.outbox).includes('MIXED NATIVE OUTPUT'));
-  assert.equal(attach.core.store.state.results?.some(o=>o.text.includes('from slack')),false);
- }finally{await f.cleanup();}
-});
-
 function persistedRows(f:ReturnType<typeof fixture>,rows:()=>ReturnType<typeof msg>[]){
   const backend=f.native.get('default')!,real=backend.rpc.bind(backend);
   backend.rpc=async (method,params)=>{
-    if(method==='thread/items/list'&&params.threadId==='same-thread')return{data:rows().filter(r=>!params.turnId||r.turnId===params.turnId),nextCursor:null};
+    if(method==='thread/items/list'&&params.threadId==='same-thread'){
+      backend.calls.push({method,params});
+      return{data:rows().filter(r=>!params.turnId||r.turnId===params.turnId),nextCursor:null};
+    }
     return real(method,params);
   };
 }
-async function recordSlackHistory(f:ReturnType<typeof fixture>,text:string){
+async function slackTurn(f:ReturnType<typeof fixture>){
   const control=await slackWork(f,'session.attach',{threadId:'same-thread'});
-  const send=await slackWork(f,'session.send',{sessionId:control.work.resultRef!.sessionId,text:'requested from this Slack thread'});
-  const rows=[msg('turn-1','known-user','requested from this Slack thread',send.work.id),msg('turn-1','known-final',text)];
-  persistedRows(f,()=>rows);
-  const history=await slackWork(f,'session.messages',{threadId:'same-thread'});
-  assert.equal(JSON.parse(history.result!.text).items[1].excerpt,text);
-  return{rows,history};
+  const sessionId=control.work.resultRef!.sessionId!;
+  const send=await slackWork(f,'session.send',{sessionId,text:'requested from this Slack thread'});
+  const b=f.native.get('default')!,threadId='same-thread',turnId='turn-1';
+  nativeInput(b,threadId,turnId,send.work.id);
+  return {b,threadId,turnId,sessionId,send,core:send.core};
 }
-test('Slack-only preserves actually attributed history, never a Desktop turn with no same-origin proof',async()=>{
- const f=fixture(),r=f.runtime,localText='Unverified native messages remain private';
- try{
-  f.cfg.local!.enabled=false;await r.connectLocal();await r.enableSlack('USELF','BSELF');
-  persistedRows(f,()=>[msg('historic','historic-item',localText)]);
-  const unknown=await slackWork(f,'session.messages',{threadId:'same-thread'});
-  assert.deepEqual(JSON.parse(unknown.result!.text).items,[]);
-  const {history}=await recordSlackHistory(f,'Confirmed same-origin Slack-visible text');
-  const detail=await slackWork(f,'result.page',{resultId:history.result!.id,page:1});
-  assert.equal(detail.work.status,'completed');
-  assert.ok(!JSON.stringify(unknown.core.store.state.outbox).includes(localText));
- }finally{await f.cleanup();}
-});
-
-test('persisted Slack snapshots do not cross Slack-only to dual or open again after another mode switch',async()=>{
- const f=fixture();try{
-  f.cfg.local!.enabled=false;await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
-  const allowed='same-origin answer recorded before mode switch',oldWrong='OLD UNATTRIBUTED BODY';
-  const {rows,history}=await recordSlackHistory(f,allowed);
-  const id=history.result!.id,past=history.result!.visibility?.generation;
-  const previousFormat=randomUUID();
-  history.core.store.transaction(s=>s.results!.push({...history.result!,scopeVersion:1,visibility:undefined,id:previousFormat,text:oldWrong}));
-  await f.reopen(true);
-  persistedRows(f,()=>rows);await f.cmd('session.attach',{threadId:'same-thread'});
-  for(const resultId of [id,previousFormat])assert.equal((await slackWork(f,'result.page',{resultId,page:1},'100.1','failed')).work.error,'RESULT_UNAVAILABLE');
-  const fresh=await slackWork(f,'session.messages',{threadId:'same-thread'});
-  assert.notEqual(fresh.result!.visibility?.generation,past);
-  assert.equal(JSON.parse(fresh.result!.text).items[1].excerpt,allowed);
-  await f.reopen(false);persistedRows(f,()=>rows);
-  assert.equal((await slackWork(f,'result.page',{resultId:id,page:1},'100.1','failed')).work.error,'RESULT_UNAVAILABLE');
-  assert.ok(f.posts.every(x=>!x.text.includes(oldWrong)));
- }finally{await f.cleanup();}
-});
-
-test('same-mode restart rechecks a retained snapshot against foreign input received offline',async()=>{
- const f=fixture();try{
-  await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
-  const {rows,history}=await recordSlackHistory(f,'formerly visible exact Slack answer');
-  await f.cmd('session.attach',{threadId:'same-thread'});
-  await f.reopen(true);
-  const sent=f.runtime.core('default').store.state.work.find(w=>w.request.command==='session.send')!;
-  assert.equal(f.runtime.core('default').store.state.results?.find(x=>x.id===history.result!.id)?.visibility?.generation,history.result!.visibility?.generation);
-  persistedRows(f,()=>rows);
-  assert.equal((await slackWork(f,'result.page',{resultId:history.result!.id,page:1})).work.status,'completed');
-  rows.push(msg('turn-1','foreign-desktop','input arrived offline','some-unrelated-client'));
-  persistedRows(f,()=>rows);
-  assert.equal((await slackWork(f,'result.page',{resultId:history.result!.id,page:1},'100.1','failed')).work.error,'RESULT_UNAVAILABLE');
-  assert.equal(f.runtime.core('default').store.state.work.find(w=>w.id===sent.id)?.slackMixedInput,true);
-  rows.pop(); // Even if later omitted, evidence of mixed ownership stays durable.
-  const fresh=await slackWork(f,'session.messages',{threadId:'same-thread'});
-  assert.deepEqual(JSON.parse(fresh.result!.text).items,[]);
-  assert.equal(f.runtime.core('default').store.state.work.find(w=>w.id===history.work.id)?.status,'completed');
- }finally{await f.cleanup();}
-});
+async function reached(predicate:()=>boolean){
+  const deadline=Date.now()+12000;
+  while(!predicate()&&Date.now()<deadline)await new Promise(r=>setTimeout(r,15));
+  assert.ok(predicate());
+}
 const persistedOrigin={kind:'bot' as const,userId:'UDOT',channel:'CIN',ts:'100.1',threadTs:'100.1',eventId:'stored-for-recovery'};
 function seedOutbox(f:ReturnType<typeof fixture>,id:string,text:string,status:'sending'|'uncertain'){
   f.runtime.core('default').store.transaction(s=>s.outbox.push({id,text,channel:persistedOrigin.channel,threadTs:persistedOrigin.threadTs,origin:persistedOrigin,root:false,status,attempts:1,nextAttemptAt:0}));
 }
-test('old sending row becomes uncertain on restart; manual recovery never sends unstamped text',async()=>{
+
+for(const localEnabled of [true,false])test(`shared Runtime local=${localEnabled}: never relay native body at same-epoch drift, but keep authorized fixed progress`,async()=>{
+  const f=fixture();
+  try{
+    f.cfg.local!.enabled=localEnabled;await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
+    const {b,threadId,turnId,sessionId,core,send}=await slackTurn(f);
+    const primary='PRIVATE DESKTOP CONTENT SENTINEL',mixed='MIXED OWNER BODY FRAGMENT',question='SECRET NATIVE QUESTION SENTINEL';
+    b.threads.get(threadId).name=primary;b.threads.get(threadId).status={type:'idle',unapprovedBody:primary};
+    await slackWork(f,'session.subscribe',{threadId});await slackWork(f,'session.subscribe',{threadId},'101.1');
+    const rows=[msg(turnId,'known-input','Slack request',send.work.id),msg(turnId,'text-current',primary)];
+    persistedRows(f,()=>rows);
+    if(localEnabled){
+      await f.cmd('session.attach',{threadId});
+      const local=await f.cmd('session.history',{sessionId});
+      assert.ok(JSON.stringify(local.result).includes(primary));
+    }
+    const before=b.calls.filter(x=>x.method==='thread/items/list').length;
+    for(const [command,args] of [['session.messages',{threadId}],['session.overview',{threadIds:[threadId]}],['session.search',{terms:['SENTINEL']}],['session.history',{sessionId}]] as const){
+      const commandResult=await slackWork(f,command,args,'100.1','failed');
+      assert.equal(commandResult.work.error,'NATIVE_CONTENT_LOCAL_ONLY');assert.equal(commandResult.result,undefined);
+    }
+    assert.equal(b.calls.filter(x=>x.method==='thread/items/list').length,before);
+    // Deliberately do not emit the external user's input notification. In the
+    // previous implementation the adapter saw the mixed body in this epoch.
+    rows.push(msg(turnId,'late-desktop-input','native interleaving', 'other-client'));
+    assistant(b,threadId,turnId,'commentary-secret',mixed,'commentary');
+    assistant(b,threadId,turnId,'partial-secret',mixed,'partial_answer');
+    assistant(b,threadId,turnId,'final-secret',primary,'final_answer');
+    b.emit('request',{epoch:b.epoch,id:203,method:'item/tool/requestUserInput',params:{threadId,turnId,questions:[{id:'choice',question,options:[{label:primary}]}]}});
+    await waitFor(()=>core.store.state.outbox.some(x=>x.text.includes('LOCAL_ACTION_REQUIRED')));
+    const fixed=core.store.state.outbox.filter(x=>x.visibility?.proof?.kind==='live');
+    for(const label of ['reported progress','answer is ready','LOCAL_ACTION_REQUIRED'])assert.equal(fixed.filter(x=>x.text.includes(label)).length,1);
+    assert.ok(fixed.every(x=>x.threadTs==='100.1'&&x.subscriptionId));
+    assert.ok(core.store.state.pending.every(p=>JSON.stringify(p.details)==='{"notice":"Open the original Codex UI."}'));
+    const info=await slackWork(f,'session.info',{sessionId});
+    assert.equal(JSON.parse(info.result!.text).name,null);
+    const meta=await slackWork(f,'session.list',{});
+    assert.equal(JSON.parse(meta.result!.text).sessions.find((x:any)=>x.id===threadId).name,null);
+    const epoch=b.epoch;
+    await reached(()=>f.posts.some(x=>x.text.includes('LOCAL_ACTION_REQUIRED')));
+    assert.equal(b.epoch,epoch);
+    for(const marker of [primary,mixed,question]){
+      assert.ok(!JSON.stringify(core.store.state.outbox).includes(marker));
+      assert.ok(!JSON.stringify(core.store.state.results).includes(marker));
+      assert.ok(!JSON.stringify(f.posts).includes(marker));
+    }
+    assert.equal(b.responses.length,0);
+  }finally{await f.cleanup();}
+});
+
+test('native bodies from old cached results or queued and uncertain sends cannot cross the new policy or mode restart',async()=>{
+ const f=fixture();try{
+  f.cfg.local!.enabled=false;await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
+  const base=await slackWork(f,'help',{command:'server.list'});
+  const id=randomUUID(),priorQueued=randomUUID(),priorUncertain=randomUUID(),text='OLD UNPROVEN NATIVE BODY';
+  base.core.store.transaction(s=>{
+    s.results!.push({...base.result!,scopeVersion:2,id,command:'session.messages',nextCommand:'session.messages',nextQuery:{threadId:'same-thread',cursor:'old'},text});
+    for(const [key,status] of [[priorQueued,'queued'],[priorUncertain,'sending']] as const)s.outbox.push({id:key,scopeVersion:2,visibility:base.result!.visibility,text,origin:persistedOrigin,channel:'CIN',threadTs:'100.1',root:false,status,attempts:0,nextAttemptAt:0});
+  });
+  const r=await f.reopen(true),core=r.core('default');
+  for(const [command,params] of [['result.page',{resultId:id,page:1}],['result.next',{resultId:id}]] as const)
+    assert.equal((await slackWork(f,command,params,'100.1','failed')).work.error,'RESULT_UNAVAILABLE');
+  assert.equal(core.store.state.outbox.find(o=>o.id===priorQueued)?.status,'failed');
+  assert.equal(core.store.state.outbox.find(o=>o.id===priorUncertain)?.status,'uncertain');
+  assert.throws(()=>r.recover('outbox',priorUncertain),/SLACK_DELIVERY_SCOPE_UNVERIFIED/);
+  assert.equal(core.store.state.outbox.find(o=>o.id===priorUncertain)?.status,'failed');
+  await f.reopen(false);
+  assert.equal((await slackWork(f,'result.page',{resultId:id,page:1},'100.1','failed')).work.error,'RESULT_UNAVAILABLE');
+  assert.ok(f.posts.every(x=>!x.text.includes(text)));
+ }finally{await f.cleanup();}
+});
+
+test('old sending row becomes uncertain on restart; manual attestation is not a Slack API acknowledgment',async()=>{
  const f=fixture();try{
   const invalid=randomUUID(),attested=randomUUID(),sentinel='OLD PRIVATE LEGACY OUTBOX';
   await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
@@ -269,7 +216,6 @@ test('old sending row becomes uncertain on restart; manual recovery never sends 
   const r=await f.reopen(true),core=r.core('default');
   assert.equal(core.store.state.outbox.find(o=>o.id===invalid)?.status,'uncertain');
   assert.throws(()=>r.recover('outbox',invalid),/SLACK_DELIVERY_SCOPE_UNVERIFIED/);
-  assert.equal(core.store.state.outbox.find(o=>o.id===invalid)?.status,'failed');
   r.recover('outbox',attested,'321.1');
   assert.equal(core.store.state.outbox.find(o=>o.id===attested)?.deliveryEvidence,'operator-attested');
   await slackWork(f,'help',{command:'server.list'});
@@ -279,23 +225,95 @@ test('old sending row becomes uncertain on restart; manual recovery never sends 
  }finally{await f.cleanup();}
 });
 
-test('queued native preview and result.page are verified again when the actual Slack send lane becomes available',async()=>{
+test('final send and manual recovery both reject a malformed current-schema native notice including one free-form fragment',async()=>{
+ const f=fixture();try{
+   await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
+   const {b,threadId,turnId,core}=await slackTurn(f);
+   const barrier=randomUUID();seedOutbox(f,barrier,'blocked in-flight record','uncertain');
+   assistant(b,threadId,turnId,'synthetic-final','never expose this','final_answer');
+   await waitFor(()=>core.store.state.outbox.some(x=>x.text.includes('A Codex answer is ready')));
+   const orig=core.store.state.outbox.find(o=>o.text.includes('A Codex answer is ready'))!,id=randomUUID(),sentinel='UNEXPECTED FRAGMENT';
+   core.store.transaction(s=>{
+     const row=s.outbox.find(o=>o.id===orig.id)!;row.text+=' '+sentinel;
+     s.outbox.push({...row,id,status:'uncertain',text:sentinel});
+   });
+   assert.throws(()=>f.runtime.recover('outbox',id),/SLACK_DELIVERY_SCOPE_UNVERIFIED/);
+   f.runtime.recover('outbox',barrier,'160.5');
+   await reached(()=>core.store.state.outbox.find(x=>x.id===orig.id)?.status==='failed');
+   assert.ok(f.posts.every(x=>!x.text.includes(sentinel)));
+ }finally{await f.cleanup();}
+});
+
+function expireRequest(row:any){row.expiresAt=Date.now()-1;}
+function nativeRequests(f:ReturnType<typeof fixture>,data:Awaited<ReturnType<typeof slackTurn>>,turnId=data.turnId){
+  const {b,threadId}=data;
+  b.emit('request',{epoch:b.epoch,id:880,method:'item/commandExecution/requestApproval',params:{threadId,turnId,cwd:f.a,command:'private native command sentinel'}});
+  b.emit('request',{epoch:b.epoch,id:881,method:'item/tool/requestUserInput',params:{threadId,turnId,questions:[{id:'q1',question:'private input question sentinel'}]}});
+}
+test('Slack-only native UI handoff restores only exact proved command decline and input interrupt at timeout',async()=>{
+ const f=fixture();try{
+  f.cfg.local!.enabled=false;await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
+  const data=await slackTurn(f),{b,sessionId,threadId,turnId,core,send}=data;
+  persistedRows(f,()=>[msg(turnId,'own-input','requested from this Slack thread',send.work.id)]);
+  nativeRequests(f,data);await waitFor(()=>core.store.state.pending.length===2);
+  const [cmd,input]=core.store.state.pending;
+  assert.equal(cmd?.status,'pending');assert.equal(input?.status,'pending');
+  assert.equal((await slackWork(f,'approval.respond',{requestId:cmd!.id,sessionId,turnId,epoch:b.epoch,decision:'accept'},'100.1','failed')).work.error,'LOCAL_ACTION_REQUIRED');
+  assert.equal((await slackWork(f,'input.respond',{requestId:input!.id,sessionId,turnId,epoch:b.epoch,answers:{q1:['yes']}},'100.1','failed')).work.error,'LOCAL_ACTION_REQUIRED');
+  const index=await slackWork(f,'approval.list',{sessionId});
+  assert.ok(JSON.parse(index.result!.text).every((row:any)=>row.status==='local-action-required'&&!row.details));
+  assert.equal(b.responses.length,0);
+  core.store.transaction(s=>s.pending.forEach(expireRequest));await Promise.all([core.expire(),core.expire()]);
+  assert.deepEqual(b.responses,[{id:880,result:{decision:'decline'}}]);
+  assert.deepEqual(b.calls.filter(x=>x.method==='turn/interrupt').map(x=>x.params),[{threadId,turnId}]);
+  assert.deepEqual(core.store.state.pending.map(p=>p.deadlineOutcome),['decline-submitted','interrupt-submitted']);
+  assert.ok(!JSON.stringify(core.store.state.outbox).includes('private native command sentinel'));
+ }finally{await f.cleanup();}
+});
+
+test('no timeout mutation when inputs changed without notification, native request resolved, or native turn is not owned',async()=>{
  const f=fixture();try{
   await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
-  const barrier=randomUUID();seedOutbox(f,barrier,'blocking in-flight record','uncertain');
-  const sensitiveAfterChange='OUTBOX SCOPE WITNESS SENTINEL';
-  const {rows,history}=await recordSlackHistory(f,sensitiveAfterChange);
-  const page=await slackWork(f,'result.page',{resultId:history.result!.id,page:1});
-  const core=page.core;
-  const blocked=core.store.state.outbox.filter(o=>o.text.includes(sensitiveAfterChange));
-  assert.ok(blocked.length>=2);assert.ok(blocked.every(o=>o.status==='queued'&&o.visibility?.proof?.kind==='history'));
-  rows.push(msg('turn-1','foreign-before-send','input received immediately before send','foreign-client'));
-  f.runtime.recover('outbox',barrier,'142.5');
-  const deadline=Date.now()+8000;
-  while(Date.now()<deadline&&!blocked.every(x=>core.store.state.outbox.find(o=>o.id===x.id)?.status==='failed'))await new Promise(r=>setTimeout(r,10));
-  assert.ok(blocked.every(x=>core.store.state.outbox.find(o=>o.id===x.id)?.error==='SLACK_DELIVERY_SCOPE_UNVERIFIED'));
-  assert.ok(f.posts.every(x=>!x.text.includes(sensitiveAfterChange)));
-  assert.equal(core.store.state.work.find(w=>w.id===page.work.id)?.status,'completed');
+  const data=await slackTurn(f),{b,core,turnId,send,threadId}=data;
+  nativeRequests(f,data, 'foreign-turn');await new Promise(r=>setTimeout(r,20));assert.equal(core.store.state.pending.length,0);
+  nativeRequests(f,data);await waitFor(()=>core.store.state.pending.length===2);
+  const call=b.rpc.bind(b);
+  b.rpc=async(method,params)=>{
+    if(method==='thread/read'){
+      // A request may resolve while awaiting an unrelated native read.
+      b.emit('notification','serverRequest/resolved',{requestId:881},b.epoch);
+      await waitFor(()=>core.store.state.pending.find(p=>p.rpcId===881)?.status==='resolved');
+    }
+    if(method==='thread/items/list')return{data:[msg(turnId,'known','requested from this Slack thread',send.work.id),msg(turnId,'mixed','foreign input without notification','foreign-client')],nextCursor:null};
+    return call(method,params);
+  };
+  core.store.transaction(s=>s.pending.forEach(expireRequest));await core.expire();await core.expire();
+  assert.deepEqual(core.store.state.pending.map(p=>[p.status,p.deadlineOutcome]),[['expired','not-attempted'],['resolved',undefined]]);
+  assert.equal(b.responses.length,0);
+  assert.ok(!b.calls.some(c=>c.method==='turn/interrupt'&&c.params.threadId===threadId));
+ }finally{await f.cleanup();}
+});
+
+test('deadline cannot act on a native edit that retains the original correlated client ID',async()=>{
+ const f=fixture();try{
+  f.cfg.local!.enabled=false;await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
+  const data=await slackTurn(f),{b,core,turnId,send}=data;
+  persistedRows(f,()=>[msg(turnId,'own-input','rewritten elsewhere but retained the ID',send.work.id)]);
+  nativeRequests(f,data);await waitFor(()=>core.store.state.pending.length===2);
+  core.store.transaction(s=>s.pending.forEach(expireRequest));await core.expire();
+  assert.deepEqual(core.store.state.pending.map(r=>r.deadlineOutcome),['not-attempted','not-attempted']);
+  assert.equal(b.responses.length,0);assert.ok(!b.calls.some(c=>c.method==='turn/interrupt'));
+ }finally{await f.cleanup();}
+});
+
+test('file tool cannot read, list or search a configured nondefault Codex Home through a project alias',async()=>{
+ const f=fixture();try{
+  const sentinel='PRIVATE CUSTOM HOME FILE';writeFileSync(join(f.b,'native-message.log'),sentinel);
+  await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
+  for(const [command,args] of [['files.list',{path:'.'}],['files.read',{path:'native-message.log'}],['files.search',{path:'.',query:'HOME FILE'}]] as const){
+    const result=await slackWork(f,command,{root:'two',...args},'100.1','failed');assert.equal(result.work.error,'PATH_FORBIDDEN');
+  }
+  assert.ok(!JSON.stringify(f.runtime.core('default').store.state.outbox).includes(sentinel));
  }finally{await f.cleanup();}
 });
 

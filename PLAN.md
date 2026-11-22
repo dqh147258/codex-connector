@@ -1,6 +1,6 @@
 # Local and Slack entry points for known Codex App Servers (2026-11-22)
 
-**Candidate, not a deployment.** The 2026-11-22 implementation plan was researched at the repository's default branch `master` (`798348e6037deb9d184dde01dde95f9d5e292dc0`). The actual implementation is based on `main` (`a27bf6a76ee1c3372b198576167f1f40f4208023`), 19 commits ahead with the original baseline as an ancestor. This keeps the existing Electron app, official WebSocket-over-proxy transport, durable Slack delivery and subscription features. No Electron renderer changes are required. Target for future review: **main**, not master. Do not deploy or merge this candidate based on mock results.
+**Candidate, not a deployment.** The 2026-11-22 implementation plan was researched at the repository's default branch `master` (`798348e6037deb9d184dde01dde95f9d5e292dc0`). The actual implementation is based on `main` (`a27bf6a76ee1c3372b198576167f1f40f4208023`), 19 commits ahead with the original baseline as an ancestor. This keeps the existing Electron app, official WebSocket-over-proxy transport, durable Slack delivery and subscription features. Desktop setup changes in the candidate preserve imported multi-target and local-only configurations. Target for future review: **main**, not master. Do not deploy or merge this candidate based on mock results.
 
 | Stage | Implementation and acceptance |
 |---|---|
@@ -22,7 +22,9 @@ Earlier project research informed three choices: [sender-scoped receipts](https:
 
 Status: implementation and local fake integration complete; published as Draft PR #1 (https://github.com/dqh147258/codex-connector/pull/1), awaiting live acceptance. No merge.
 
-## Required outcome
+This historical section describes the earlier standalone plan. Its remote decision and native text relay proposals are superseded by the current [native-output policy](docs/SECURITY.md#native-conversation-visibility-in-slack) and [interaction boundary](docs/PROTOCOL.md#native-requests-and-authority).
+
+## Original required outcome (historical)
 
 A least-privilege Windows/Linux/macOS background server receives strict, authenticated Slack bot command envelopes; manages sessions on the user's **default shared Codex daemon** where supported; routes each session to one output thread mentioning a configured, resolved dot user ID; supplies readonly project-file tools; and relays correlated approvals/user-input without autoapproval or policy bypass.
 
