@@ -12,7 +12,7 @@ Strict whole-message markers and JSON schema disallow actor fields, arbitrary RP
 
 Only the original Codex UI handles native approvals and input. Slack and Connector local APIs cannot submit a native decision. Older approval command names, templates, reactions and alleged human proof grant no authority. No command/diff, question, options or other native interaction contents are sent to Slack; when a destination is proved, it receives fixed status only.
 
-Expiry is not a human decision. Only an exact supported request from the original accepted Slack operation may be declined, or its exact input turn interrupted, after rechecking current request/turn identity, active connection epoch, origin and scope with a complete bounded readback. Unsupported, stale, changed, local, mixed or unknown cases are left alone. The App Server does not offer an atomic cancel-if-unchanged command here; readback and the exact RPC are separate observations. Do not recover an old callback by replaying it. Codex policy, authentication, model and reasoning remain inherited. This implementation does not elevate privileges or weaken the native policy.
+Expiry is Connector bookkeeping only. Even when the original Slack operation is known, a native client may have taken over before the expiry notification arrives. The timer does not re-read native content, send a decision/answer, interrupt the turn, or infer that Codex stopped. A currently known Slack origin can receive a fixed reminder; otherwise no outbound notification is attempted. Codex policy, authentication, model and reasoning remain inherited.
 
 ## Readonly files
 

@@ -82,7 +82,7 @@ Correlate request IDs and actual results. “Accepted”, a tool send receipt, o
 
 Use configured `root` plus relative `path` for `files.list/stat/read/search`. Absolute paths omit root and require the owner's local `filePolicy.allowAbsolutePaths` opt-in, disabled by default. It remains read-only with OS permissions, secret/link/device exclusions and output bounds. Slack cannot enable it. `allowAllSharedSessions` does not expand file access. A truncated result contains only this bounded query, not every file.
 
-All native approval and input decisions happen in the original Codex UI. Do not send an approval or input envelope, even with a human message timestamp, owner token, or same-thread consent. A fixed `LOCAL_ACTION_REQUIRED` notice directs the user to the native UI; it includes no command, diff, question, choices, or response template. Lack of a notice does not rule out an interaction. Timeout may decline the exact still-proven Slack-origin native callback or interrupt its exact input turn; it is not a human decision and does not act on local, changed or unproven work.
+Only the original Codex UI can answer native approvals or input requests. Do not send `approval.respond`, `input.respond`, an approval proof, or a copied prompt to Slack. Fixed `LOCAL_ACTION_REQUIRED` and expiry notices only ask the original owner to inspect Codex. Connector timers never read back native request content, send decisions or answers, or interrupt native work.
 
 ## Message delivery evidence
 

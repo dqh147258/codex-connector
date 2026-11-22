@@ -36,7 +36,8 @@ const nativeNotice={
   'failed':'The Codex turn failed. Inspect the original Codex UI.',
   'interrupted':'The Codex turn was interrupted.',
   'error':'Codex reported an execution error. Inspect the original Codex UI.',
-  'decision':'LOCAL_ACTION_REQUIRED: open the original Codex UI for this request.'
+  'decision':'LOCAL_ACTION_REQUIRED: open the original Codex UI for this request.',
+  'deadline':'The Connector reminder expired. Check the original Codex UI. No native action was taken.'
 } as const;
 type NativeNotice=keyof typeof nativeNotice;
 const safeThreadStatus=(value:unknown)=>typeof value==='string'&&['active','idle','notLoaded','systemError','unknown'].includes(value)?value:'unknown';
@@ -103,7 +104,7 @@ export class Connector {
     }catch{/* Server remains usable for help/files/status. No independent fallback. */}
     this.pump();this.flush();
   }
-  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],screenCapture:{enabled:this.config.screenPolicy?.enabled===true,desktopAvailable:!!this.screens,commands:['screen.list','screen.capture'],oneShot:true,unredacted:true,slackThreadOnly:true,maxDisplays:8,maxImageDimension:2560},fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:this.runtime?'Original Codex UI only. Known exact-request timeout may refuse/cancel; no Slack approvals.':'direct configured humans or verified same-thread human envelope; bots alone cannot approve',sessionDelivery:{command:'session.delivery',correlation:'queue start turn ID or userMessage.clientId',automaticRetry:false,completion:'matched terminal turn only'},sessionRecent:{command:'session.recent',defaultLimit:5,maxLimit:20,globalTopN:false,observation:'Producer lifecycle timestamps only; no content or automatic subscriptions'},sessionSearch:{command:'session.search',defaultSessionLimit:10,maxSessionLimit:20,roles:['all','user','assistant'],modes:['and','or'],recentBy:'backend updated_at, not execution activity',matching:'case-insensitive literal terms within one message',readOnly:true,continuation:'result.next'},sessionContent:{overview:'session.overview',messages:'session.messages',slackNativeText:this.runtime===undefined,batchMax:5,readOnly:true,semanticSummary:false},subscriptions:{commands:['session.subscribe','session.unsubscribe','session.subscriptions'],loadedOnly:true,localCancellationOnly:true},slackOutput:{mode:'compact',sessionDefaultView:'loaded',maxRowsPerSource:10,resultDetail:'result.page',nextPage:'result.next'},serviceManagement:'local template generation only'};}
+  capabilities(){return{...this.backend.capabilities(),instanceId:this.config.instanceId,slackTransport:{revision:SLACK_TRANSPORT_REVISION,connectorUserId:this.selfUserId||null,connectorBotId:this.selfBotId||null},sessionPolicy:{allowAllSharedSessions:this.config.sessionPolicy?.allowAllSharedSessions===true},outputChannel:this.config.slack.outputChannel,dot:this.store.state.dot,attachedThreads:[...this.attached],screenCapture:{enabled:this.config.screenPolicy?.enabled===true,desktopAvailable:!!this.screens,commands:['screen.list','screen.capture'],oneShot:true,unredacted:true,slackThreadOnly:true,maxDisplays:8,maxImageDimension:2560},fileTools:{mode:this.files.absolutePathsEnabled?'absolute-readonly-and-project-roots':'project-roots-only',allowAbsolutePaths:this.files.absolutePathsEnabled,readOnly:true,osPermissions:true,sensitivePathsBlocked:true,enablement:'Local desktop Settings only; stop connector, explicitly enable full-system read-only access, save and restart. Never enabled by Slack.'},approvalAuthority:this.runtime?'Original Codex UI only. Expiry only changes the reminder; no decision or interruption.':'direct configured humans or verified same-thread human envelope; bots alone cannot approve',sessionDelivery:{command:'session.delivery',correlation:'queue start turn ID or userMessage.clientId',automaticRetry:false,completion:'matched terminal turn only'},sessionRecent:{command:'session.recent',defaultLimit:5,maxLimit:20,globalTopN:false,observation:'Producer lifecycle timestamps only; no content or automatic subscriptions'},sessionSearch:{command:'session.search',defaultSessionLimit:10,maxSessionLimit:20,roles:['all','user','assistant'],modes:['and','or'],recentBy:'backend updated_at, not execution activity',matching:'case-insensitive literal terms within one message',readOnly:true,continuation:'result.next'},sessionContent:{overview:'session.overview',messages:'session.messages',slackNativeText:this.runtime===undefined,batchMax:5,readOnly:true,semanticSummary:false},subscriptions:{commands:['session.subscribe','session.unsubscribe','session.subscriptions'],loadedOnly:true,localCancellationOnly:true},slackOutput:{mode:'compact',sessionDefaultView:'loaded',maxRowsPerSource:10,resultDetail:'result.page',nextPage:'result.next'},serviceManagement:'local template generation only'};}
   private authorizeEvent(body:any):Source|undefined{
     const e=body?.event,s=this.config.slack;
     if(body?.team_id!==s.teamId||typeof body.event_id!=='string'||!e||e.type!=='message'||!['',undefined,'bot_message'].includes(e.subtype)||typeof e.text!=='string'||typeof e.user!=='string'||typeof e.ts!=='string'||!this.validTimestamp(e.ts)||(e.thread_ts!==undefined&&!this.validTimestamp(e.thread_ts)))return;
@@ -461,7 +462,7 @@ export class Connector {
     if(c==='files.list')return this.files.list(p.root,p.path,{limit:p.limit});if(c==='files.stat')return this.files.stat(p.root,p.path);
     if(c==='files.read')return this.files.read(p.root,p.path,{offset:p.offset,maxBytes:p.maxBytes});if(c==='files.search')return this.files.search(p.root,p.path,p.query,{limit:p.limit,maxDepth:p.maxDepth});
     if(c==='approval.list'){
-      const pending=this.store.state.pending.filter(r=>r.status==='pending'&&(!p.sessionId||r.sessionId===p.sessionId));
+      const pending=this.store.state.pending.filter(r=>(r.status==='pending'||slackCommand&&r.status==='local-required')&&r.expiresAt>Date.now()&&(!p.sessionId||r.sessionId===p.sessionId));
       if(slackCommand)return pending.filter(r=>r.slackOwner&&this.samePrincipal(r.slackOwner,w.source)&&this.sameCurrentPending(r))
         .map(r=>({id:r.id,sessionId:r.sessionId,turnId:r.turnId,kind:r.kind,expiresAt:r.expiresAt,status:'local-action-required'}));
       return pending.map(({rpcId,details,...r})=>r);
@@ -632,9 +633,6 @@ export class Connector {
       if(method!=='serverRequest/resolved'){
         const turnId=p.turnId||p.turn?.id,source=this.slackTurnSource(p.threadId,turnId);
         const session=this.store.state.sessions.find(s=>s.threadId===p.threadId&&this.authorizedSession(s));
-        // Keep the exact item evidence needed for a same-bound decision. No
-        // unowned tool payloads are ever used to compose a Slack prompt.
-        if(source&&session&&(method==='item/started'||method==='item/completed'))this.rememberItem(p);
         if(method==='turn/completed')this.staleTurnRequests(p.threadId,p.turn?.id);
         if(source&&session)this.scopedNotice(method,p,session,source);
         return;
@@ -826,19 +824,11 @@ export class Connector {
       previous.sessionId!==s.id||previous.threadId!==threadId||previous.turnId!==turnId||previous.method!==r.method||
       !previous.slackOwner||!this.samePrincipal(previous.slackOwner,owner)))return;
     this.store.transaction(draft=>{
-      // Persist exact native request identity but never its free-form body.
-      // Different origins can receive their fixed notice, not time out a
-      // request for a session bound to another Slack conversation.
+      // Reminders are never a control lease. Preserve identity and deadline
+      // for reporting; no raw question, command, options or permission data.
       if(!previous&&owner.channel===s.channel&&owner.threadTs===s.threadTs){
-        const file=this.items.get(stable([threadId,turnId,details.itemId]));
-        const mayDecline=details.availableDecisions===undefined||Array.isArray(details.availableDecisions)&&details.availableDecisions.includes('decline');
-        const eligible=kind==='command'?mayDecline&&typeof details.command==='string'&&!!details.command.trim()&&
-          (!details.kind||details.kind==='command')&&!!this.canonicalCwd(details.cwd)&&this.canonicalCwd(details.cwd)===this.canonicalCwd(s.cwd||this.config.projects[s.project]!):
-          kind==='file'?mayDecline&&!details.grantRoot&&deliveryId(details.itemId)&&Array.isArray(file?.changes)&&file.changes.length>0:
-          kind==='input'?Array.isArray(details.questions)&&details.questions.length>0&&details.questions.every((q:any)=>deliveryId(q?.id)&&!q.isSecret):false;
         const pending:Pending={id:randomUUID(),rpcId:r.id,epoch:r.epoch,sessionId:s.id,threadId,turnId,method:r.method,kind,
-          status:eligible?'pending':'local-required',details:{notice:'Open the original Codex UI.'},
-          decisions:kind==='command'||kind==='file'?mayDecline?['decline']:[]:[],slackOwner:owner,
+          status:'local-required',details:{notice:'Open the original Codex UI.'},decisions:[],slackOwner:owner,
           expiresAt:Date.now()+this.config.approvalTimeoutSec*1000};
         draft.pending.push(pending);
       }
@@ -887,91 +877,38 @@ export class Connector {
     return{requestId:pending.id,status:'submitted; awaiting server resolution notification'};
   }
   private disconnected(epoch:string){
-    this.localEvents?.markDisconnected();this.attached.clear();this.items.clear();this.slackInputs.clear();this.deliveryTurns.clear();this.store.transaction(s=>{for(const w of s.work)if(w.messageDelivery)w.messageDelivery.observationGap=true;for(const p of s.pending)if(p.epoch===epoch&&['pending','responding'].includes(p.status))p.status='stale';});
+    this.localEvents?.markDisconnected();this.attached.clear();this.items.clear();this.slackInputs.clear();this.deliveryTurns.clear();this.store.transaction(s=>{for(const w of s.work)if(w.messageDelivery)w.messageDelivery.observationGap=true;for(const p of s.pending)if(p.epoch===epoch&&(['pending','responding'].includes(p.status)||p.status==='local-required'&&!!p.slackOwner))p.status='stale';});
   }
   private sameCurrentPending(original:Pending){
     if(!this.runtime?.slackReady()||this.closing||!this.backend.connected||this.backend.epoch!==original.epoch||!original.slackOwner)return;
     const state=this.store.state,current=state.pending.find(p=>p.id===original.id);
-    if(!current||current.status!=='pending'||current.rpcId!==original.rpcId||current.threadId!==original.threadId||
+    if(!current||!['pending','local-required'].includes(current.status)||current.rpcId!==original.rpcId||current.threadId!==original.threadId||
       current.turnId!==original.turnId||current.epoch!==original.epoch||current.sessionId!==original.sessionId||
       current.method!==original.method||current.kind!==original.kind||current.expiresAt!==original.expiresAt||
       !current.slackOwner||!this.samePrincipal(original.slackOwner,current.slackOwner))return;
     const s=state.sessions.find(s=>s.id===current.sessionId&&s.threadId===current.threadId&&this.authorizedSession(s));
     const owner=this.slackTurnSource(current.threadId,current.turnId);
     if(!s||!owner||!this.samePrincipal(owner,current.slackOwner)||s.channel!==owner.channel||s.threadTs!==owner.threadTs)return;
-    if((current.kind==='command'||current.kind==='file')&&!current.decisions.includes('decline')||current.kind==='unsupported')return;
     return s;
   }
-  private async proveDeadline(original:Pending){
-    const s=this.sameCurrentPending(original);
-    if(!s)return false;
-    const epoch=this.backend.epoch,deadline=Date.now()+6000;
-    let bytes=0;
-    const read=async(method:string,params:unknown)=>{
-      if(!this.sameCurrentPending(original)||epoch!==this.backend.epoch||Date.now()>=deadline)throw new ConnectorError('SLACK_DEADLINE_UNVERIFIED');
-      let timer:ReturnType<typeof setTimeout>|undefined;
-      try{
-        const result=await Promise.race([this.backend.rpc(method,params),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new ConnectorError('SLACK_DEADLINE_UNVERIFIED')),Math.min(2000,deadline-Date.now()));})]);
-        bytes+=Buffer.byteLength(JSON.stringify(result)??'');
-        if(bytes>2*1024*1024||!this.sameCurrentPending(original))throw new ConnectorError('SLACK_DEADLINE_UNVERIFIED');
-        return result;
-      }finally{if(timer)clearTimeout(timer);}
-    };
-    try{
-      // Verify destination first and exact turn inputs last. No content from
-      // these RPCs is rendered or retained. This is an exact-target timeout,
-      // not authorization to publish text or act on a different/native turn.
-      const metadata=await read('thread/read',{threadId:original.threadId,includeTurns:false});
-      this.checkSessionThread(metadata?.thread,s);
-      const inputs=new Map<string,string>(),seen=new Set<string>(),clients=new Set<string>(),cursors=new Set<string>();
-      let cursor:string|undefined;
-      for(let n=0;n<4;n++){
-        const page=await read('thread/items/list',{threadId:original.threadId,turnId:original.turnId,limit:50,sortDirection:'asc',...(cursor?{cursor}:{})});
-        if(!Array.isArray(page?.data)||page.data.length>50||!(page.nextCursor===null||typeof page.nextCursor==='string'&&page.nextCursor.length>0&&page.nextCursor.length<=512&&!cursors.has(page.nextCursor)))return false;
-        for(const row of page.data){
-          if(row?.turnId!==original.turnId||!deliveryId(row.item?.id)||seen.has(row.item.id)||typeof row.item.type!=='string')return false;
-          seen.add(row.item.id);
-          if(row.item.type==='userMessage'){
-            const id=row.item.clientId,content=row.item.content;
-            if(!deliveryId(id)||clients.has(id)||!Array.isArray(content)||content.length!==1||
-              content[0]?.type!=='text'||typeof content[0].text!=='string')return false;
-            const work=this.store.state.work.find(w=>w.id===id);
-            // clientId is only a correlation key; another native client can
-            // edit a queued message without changing that key.
-            if(!work||work.request.params.text!==content[0].text)return false;
-            clients.add(id);inputs.set(row.item.id,id);
-          }
-        }
-        if(page.nextCursor===null)return this.inputsBelong(original.threadId,original.turnId,inputs,original.slackOwner!)&&!!this.sameCurrentPending(original);
-        cursor=page.nextCursor as string;cursors.add(cursor);
-      }
-    }catch{/* Missing exact proof: no native action. */}
-    return false;
-  }
-  private async expireScoped(p:Pending){
-    const verified=p.status==='pending'&&await this.proveDeadline(p);
-    // No await between current identity/epoch check and invoking the exact
-    // refusal/interrupt. Mark expired before the call so a crash cannot replay.
-    const allowed=verified&&!!this.sameCurrentPending(p);
-    const claimed=this.store.transaction(s=>{
-      const current=s.pending.find(x=>x.id===p.id);
-      if(!current||!['pending','local-required'].includes(current.status)||current.expiresAt>Date.now()||current.epoch!==p.epoch||current.rpcId!==p.rpcId)return false;
-      current.status='expired';current.deadlineOutcome=allowed?'outcome-uncertain':'not-attempted';return true;
-    });
-    if(!claimed||!allowed)return;
-    try{
-      if(p.kind==='command'||p.kind==='file')await this.backend.respond(p.rpcId,{decision:'decline'});
-      else await this.backend.rpc('turn/interrupt',{threadId:p.threadId,turnId:p.turnId});
-      this.store.transaction(s=>{const current=s.pending.find(x=>x.id===p.id);if(current?.status==='expired')current.deadlineOutcome=p.kind==='input'?'interrupt-submitted':'decline-submitted';});
-    }catch{/* Connection/ack uncertain. Leave the recorded attempt; never retry. */}
-  }
   async expire(){
-    if(this.store.state.results?.some(r=>r.expiresAt<=Date.now()))this.store.transaction(s=>{s.results=(s.results||[]).filter(r=>r.expiresAt>Date.now());});
-    for(const p of this.store.state.pending.filter(p=>['pending','local-required'].includes(p.status)&&p.expiresAt<=Date.now())){
-      if(this.runtime){await this.expireScoped(p);continue;}
-      if(p.status!=='pending')continue;
-      this.store.transaction(s=>{s.pending.find(x=>x.id===p.id)!.status='expired';const session=s.sessions.find(x=>x.id===p.sessionId);if(session)this.boundNotice(s,`Request ${p.id} expired; no approval granted.`,session);});
-      if(this.backend.connected&&p.epoch===this.backend.epoch){try{if(p.kind==='command'||p.kind==='file')await this.backend.respond(p.rpcId,{decision:'decline'});else if(p.kind==='input')await this.backend.rpc('turn/interrupt',{threadId:p.threadId,turnId:p.turnId});}catch{/* never replay stale callbacks */}}
+    const now=Date.now();
+    if(this.store.state.results?.some(r=>r.expiresAt<=now))this.store.transaction(s=>{s.results=(s.results||[]).filter(r=>r.expiresAt>now);});
+    for(const p of this.store.state.pending.filter(p=>['pending','local-required'].includes(p.status)&&p.expiresAt<=now)){
+      const route=this.runtime?this.sameCurrentPending(p):undefined;
+      this.store.transaction(s=>{
+        const current=s.pending.find(x=>x.id===p.id);
+        if(!current||!['pending','local-required'].includes(current.status)||current.expiresAt>now)return;
+        current.status='expired';current.deadlineOutcome='not-attempted';
+        // The protocol has no conditional pending-request interrupt. The
+        // deadline only expires our bookkeeping, regardless of ownership;
+        // no readback, callback refusal, answer or native interruption.
+        if(route&&p.slackOwner)this.scopedEvent(s,route,p.slackOwner,p.turnId,stable(['native-deadline',p.epoch,p.rpcId]),'deadline',true);
+        else if(!this.runtime){
+          const session=s.sessions.find(x=>x.id===p.sessionId);
+          if(session)this.boundNotice(s,'The Connector reminder expired. Check the original Codex UI. No native action was taken.',session);
+        }
+      });
     }
     this.flush();
   }

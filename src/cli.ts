@@ -5,7 +5,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { SocketModeClient, LogLevel } from '@slack/socket-mode';
 import { home, loadConfig, readToken } from './config.js';
-import { Runtime } from './runtime.js';
+import { Runtime, pinRuntimeHome } from './runtime.js';
 import { SlackLink } from './slack-link.js';
 import type { SlackPort } from './types.js';
 import { SlackClient } from './slack.js';
@@ -28,16 +28,16 @@ const allowedOptions:Record<string,string[]>={
 };
 
 async function start(){
-  const config=loadConfig(), local=config.local?.enabled!==false, wantsSlack=config.slack.enabled!==false;
+  const dir=pinRuntimeHome(home()),config=loadConfig(dir), local=config.local?.enabled!==false, wantsSlack=config.slack.enabled!==false;
   // Slack-only mode neither reads a local token nor opens a loopback listener.
-  const token=local?readToken():undefined;
+  const token=local?readToken(dir):undefined;
   if(token && config.local?.agents?.some(a=>a.tokenHash===createHash('sha256').update(token).digest('hex')))throw Error('Operator and scoped agent tokens must be distinct');
   const appToken=wantsSlack?process.env.SLACK_APP_TOKEN:undefined, botToken=wantsSlack?process.env.SLACK_BOT_TOKEN:undefined;
   const slack=wantsSlack&&appToken?.startsWith('xapp-')&&botToken?.startsWith('xoxb-')?new SlackClient(botToken):undefined;
   if(wantsSlack&&!slack&&!local)throw Object.assign(Error('Slack-only mode needs valid app and bot tokens'),{code:'SLACK_AUTH_FAILED'});
   const unavailable=async()=>{throw Error('SLACK_UNAVAILABLE');};
   const inert:SlackPort={post:unavailable,resolveDot:unavailable,humanMessage:unavailable,threadExists:unavailable};
-  const runtime=new Runtime(config,home(),slack??inert,desktopScreenPort());
+  const runtime=new Runtime(config,dir,slack??inert,desktopScreenPort());
   let server:ReturnType<typeof apiServer>|undefined;
   const link=slack?new SlackLink(config.slack.teamId,runtime,()=>slack.web.auth.test(),()=>new SocketModeClient({
     appToken:appToken!,logLevel:LogLevel.ERROR,autoReconnectEnabled:false,clientOptions:{retryConfig:{retries:0},rejectRateLimitedCalls:true,timeout:10000}

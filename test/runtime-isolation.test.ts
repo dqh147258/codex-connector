@@ -186,23 +186,25 @@ for(const localEnabled of [true,false])test(`shared Runtime local=${localEnabled
   }finally{await f.cleanup();}
 });
 
-test('native bodies from old cached results or queued and uncertain sends cannot cross the new policy or mode restart',async()=>{
+test('native bodies from old cached results or queued and uncertain sends cannot cross the new policy even on a same-mode restart',async()=>{
  const f=fixture();try{
   f.cfg.local!.enabled=false;await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
   const base=await slackWork(f,'help',{command:'server.list'});
-  const id=randomUUID(),priorQueued=randomUUID(),priorUncertain=randomUUID(),text='OLD UNPROVEN NATIVE BODY';
+  const id=randomUUID(),oldFileResult=randomUUID(),priorQueued=randomUUID(),priorUncertain=randomUUID(),text='OLD UNPROVEN NATIVE BODY';
   base.core.store.transaction(s=>{
     s.results!.push({...base.result!,scopeVersion:2,id,command:'session.messages',nextCommand:'session.messages',nextQuery:{threadId:'same-thread',cursor:'old'},text});
-    for(const [key,status] of [[priorQueued,'queued'],[priorUncertain,'sending']] as const)s.outbox.push({id:key,scopeVersion:2,visibility:base.result!.visibility,text,origin:persistedOrigin,channel:'CIN',threadTs:'100.1',root:false,status,attempts:0,nextAttemptAt:0});
+    s.results!.push({...base.result!,scopeVersion:3,id:oldFileResult,command:'files.read',text});
+    for(const [key,status] of [[priorQueued,'queued'],[priorUncertain,'sending']] as const)s.outbox.push({id:key,scopeVersion:3,visibility:base.result!.visibility,text,origin:persistedOrigin,channel:'CIN',threadTs:'100.1',root:false,status,attempts:0,nextAttemptAt:0});
   });
-  const r=await f.reopen(true),core=r.core('default');
+  const r=await f.reopen(false),core=r.core('default');
   for(const [command,params] of [['result.page',{resultId:id,page:1}],['result.next',{resultId:id}]] as const)
     assert.equal((await slackWork(f,command,params,'100.1','failed')).work.error,'RESULT_UNAVAILABLE');
+  assert.equal((await slackWork(f,'result.page',{resultId:oldFileResult,page:1},'100.1','failed')).work.error,'RESULT_UNAVAILABLE');
   assert.equal(core.store.state.outbox.find(o=>o.id===priorQueued)?.status,'failed');
   assert.equal(core.store.state.outbox.find(o=>o.id===priorUncertain)?.status,'uncertain');
   assert.throws(()=>r.recover('outbox',priorUncertain),/SLACK_DELIVERY_SCOPE_UNVERIFIED/);
   assert.equal(core.store.state.outbox.find(o=>o.id===priorUncertain)?.status,'failed');
-  await f.reopen(false);
+  await f.reopen(true);
   assert.equal((await slackWork(f,'result.page',{resultId:id,page:1},'100.1','failed')).work.error,'RESULT_UNAVAILABLE');
   assert.ok(f.posts.every(x=>!x.text.includes(text)));
  }finally{await f.cleanup();}
@@ -250,47 +252,55 @@ function nativeRequests(f:ReturnType<typeof fixture>,data:Awaited<ReturnType<typ
   b.emit('request',{epoch:b.epoch,id:880,method:'item/commandExecution/requestApproval',params:{threadId,turnId,cwd:f.a,command:'private native command sentinel'}});
   b.emit('request',{epoch:b.epoch,id:881,method:'item/tool/requestUserInput',params:{threadId,turnId,questions:[{id:'q1',question:'private input question sentinel'}]}});
 }
-test('Slack-only native UI handoff restores only exact proved command decline and input interrupt at timeout',async()=>{
+test('Slack-only approval and input reminders expire locally without reading or mutating native work',async()=>{
  const f=fixture();try{
   f.cfg.local!.enabled=false;await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
   const data=await slackTurn(f),{b,sessionId,threadId,turnId,core,send}=data;
   persistedRows(f,()=>[msg(turnId,'own-input','requested from this Slack thread',send.work.id)]);
   nativeRequests(f,data);await waitFor(()=>core.store.state.pending.length===2);
   const [cmd,input]=core.store.state.pending;
-  assert.equal(cmd?.status,'pending');assert.equal(input?.status,'pending');
+  assert.equal(cmd?.status,'local-required');assert.equal(input?.status,'local-required');
   assert.equal((await slackWork(f,'approval.respond',{requestId:cmd!.id,sessionId,turnId,epoch:b.epoch,decision:'accept'},'100.1','failed')).work.error,'LOCAL_ACTION_REQUIRED');
   assert.equal((await slackWork(f,'input.respond',{requestId:input!.id,sessionId,turnId,epoch:b.epoch,answers:{q1:['yes']}},'100.1','failed')).work.error,'LOCAL_ACTION_REQUIRED');
   const index=await slackWork(f,'approval.list',{sessionId});
   assert.ok(JSON.parse(index.result!.text).every((row:any)=>row.status==='local-action-required'&&!row.details));
   assert.equal(b.responses.length,0);
+  const baseline=b.calls.length;
   core.store.transaction(s=>s.pending.forEach(expireRequest));await Promise.all([core.expire(),core.expire()]);
-  assert.deepEqual(b.responses,[{id:880,result:{decision:'decline'}}]);
-  assert.deepEqual(b.calls.filter(x=>x.method==='turn/interrupt').map(x=>x.params),[{threadId,turnId}]);
-  assert.deepEqual(core.store.state.pending.map(p=>p.deadlineOutcome),['decline-submitted','interrupt-submitted']);
+  assert.deepEqual(b.responses,[]);assert.equal(b.calls.length,baseline);
+  assert.deepEqual(core.store.state.pending.map(p=>[p.status,p.deadlineOutcome]),[['expired','not-attempted'],['expired','not-attempted']]);
+  const reminders=core.store.state.outbox.filter(o=>o.text.includes('The Connector reminder expired.'));
+  assert.equal(reminders.length,2);assert.ok(reminders.every(o=>o.threadTs==='100.1'&&o.text.includes('No native action was taken.')));
+  await reached(()=>f.posts.filter(x=>x.text.includes('The Connector reminder expired.')).length===2);
   assert.ok(!JSON.stringify(core.store.state.outbox).includes('private native command sentinel'));
  }finally{await f.cleanup();}
 });
 
-test('no timeout mutation when inputs changed without notification, native request resolved, or native turn is not owned',async()=>{
+test('same-epoch native takeover and in-flight resolution cannot be interrupted by a Connector reminder deadline',async()=>{
  const f=fixture();try{
   await f.runtime.connectLocal();await f.runtime.enableSlack('USELF','BSELF');
   const data=await slackTurn(f),{b,core,turnId,send,threadId}=data;
-  nativeRequests(f,data, 'foreign-turn');await new Promise(r=>setTimeout(r,20));assert.equal(core.store.state.pending.length,0);
+  // A foreign turn should not even create a corresponding Slack reminder.
+  nativeRequests(f,data,'foreign-turn');await new Promise(r=>setTimeout(r,20));assert.equal(core.store.state.pending.length,0);
   nativeRequests(f,data);await waitFor(()=>core.store.state.pending.length===2);
-  const call=b.rpc.bind(b);
+  b.emit('notification','serverRequest/resolved',{requestId:880},b.epoch);
+  await waitFor(()=>core.store.state.pending.find(p=>p.rpcId===880)?.status==='resolved');
+  // Faithfully model that the native user has answered 881 and resumed the
+  // turn, with both native notifications still in transit. A legacy readback
+  // implementation could receive the old snapshot and still interrupt it.
+  const liveNative={answered:true,working:true,interrupts:0};
+  const real=b.rpc.bind(b),oldNativeSnapshot={data:[msg(turnId,'known','requested from this Slack thread',send.work.id)],nextCursor:null};
+  let attemptedReadback=0;
   b.rpc=async(method,params)=>{
-    if(method==='thread/read'){
-      // A request may resolve while awaiting an unrelated native read.
-      b.emit('notification','serverRequest/resolved',{requestId:881},b.epoch);
-      await waitFor(()=>core.store.state.pending.find(p=>p.rpcId===881)?.status==='resolved');
-    }
-    if(method==='thread/items/list')return{data:[msg(turnId,'known','requested from this Slack thread',send.work.id),msg(turnId,'mixed','foreign input without notification','foreign-client')],nextCursor:null};
-    return call(method,params);
+    if(method==='thread/items/list'){attemptedReadback++;return oldNativeSnapshot;}
+    if(method==='turn/interrupt'&&params.threadId===threadId&&params.turnId===turnId){liveNative.interrupts++;liveNative.working=false;}
+    return real(method,params);
   };
-  core.store.transaction(s=>s.pending.forEach(expireRequest));await core.expire();await core.expire();
-  assert.deepEqual(core.store.state.pending.map(p=>[p.status,p.deadlineOutcome]),[['expired','not-attempted'],['resolved',undefined]]);
-  assert.equal(b.responses.length,0);
-  assert.ok(!b.calls.some(c=>c.method==='turn/interrupt'&&c.params.threadId===threadId));
+  const epoch=b.epoch;core.store.transaction(s=>s.pending.forEach(expireRequest));
+  await core.expire();await core.expire();
+  assert.deepEqual(core.store.state.pending.map(p=>[p.status,p.deadlineOutcome]),[['resolved',undefined],['expired','not-attempted']]);
+  assert.equal(b.epoch,epoch);assert.equal(attemptedReadback,0);assert.equal(b.responses.length,0);
+  assert.deepEqual(liveNative,{answered:true,working:true,interrupts:0});
  }finally{await f.cleanup();}
 });
 

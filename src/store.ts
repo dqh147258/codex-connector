@@ -1,4 +1,4 @@
-import { closeSync, copyFileSync, constants, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, copyFileSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { validateMessageDelivery } from './session-delivery.js';
 import { validateActivityRecords } from './session-activity.js';
@@ -30,7 +30,7 @@ export class Store {
         for (const w of s.work) if(w.status==='queued'&&w.request.command==='screen.capture'){w.status='failed';w.error='SCREEN_REQUEST_EXPIRED';}
         for (const w of s.work) if (w.status === 'executing') { w.status = 'uncertain'; w.error = 'Restart during execution; never auto-replay'; }
         for (const o of s.outbox) if (o.status === 'sending') { o.status = 'uncertain'; o.error = 'Delivery may have occurred; inspect Slack before recovery'; }
-        for (const p of s.pending) if (['pending','responding'].includes(p.status)) p.status = 'stale';
+        for (const p of s.pending) if (['pending','responding'].includes(p.status) || p.status==='local-required' && p.slackOwner) p.status = 'stale';
       });
     } catch (e) { this.close(); throw e; }
   }
@@ -39,8 +39,18 @@ export class Store {
   transaction<T>(change: (draft: State) => T): T {
     this.assertHealthy(); const draft = structuredClone(this.value); const result = change(draft);
     try {
-      const path = join(this.dir, 'state.json'), temp = path + '.tmp', fd = openSync(temp, 'w', 0o600);
-      try { writeFileSync(fd, JSON.stringify(draft, null, 2)); fsyncSync(fd); } finally { closeSync(fd); }
+      const path = join(this.dir, 'state.json'), temp = path + '.tmp';
+      const previous=lstatSync(temp,{throwIfNoEntry:false,bigint:true});
+      if(previous&&(!previous.isFile()||previous.nlink!==1n))throw Error('UNSAFE_STATE_TEMP');
+      // Never truncate before checking the opened descriptor. A regular
+      // leftover temp is reusable after a crash, but a link or device is not.
+      const fd=openSync(temp,constants.O_WRONLY|constants.O_CREAT|(constants.O_NOFOLLOW||0)|(constants.O_NONBLOCK||0),0o600);
+      try {
+        const opened=fstatSync(fd,{bigint:true}),current=lstatSync(temp,{bigint:true});
+        if(!opened.isFile()||opened.nlink!==1n||!current.isFile()||current.nlink!==1n||opened.ino!==current.ino||opened.dev!==current.dev||
+          (previous&&(previous.ino!==opened.ino||previous.dev!==opened.dev)))throw Error('UNSAFE_STATE_TEMP');
+        ftruncateSync(fd,0);writeFileSync(fd,JSON.stringify(draft,null,2));fsyncSync(fd);
+      } finally { closeSync(fd); }
       renameSync(temp, path); this.value = draft;
     } catch (e) { this.poisoned = true; throw e; }
     return result;

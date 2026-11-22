@@ -130,7 +130,7 @@ CODEX_CONNECTOR_COMMAND_END
 
 ## Native interaction
 
-Only the original Codex UI can answer approvals or input requests. Do not send `approval.respond`, `input.respond`, canned proof, or a copied prompt to Slack. A fixed `LOCAL_ACTION_REQUIRED` notice does not supply a decision template or grant authority. Expiry may decline the exact verified Slack-origin callback or interrupt its exact input turn; it does not approve a request or act on local or unproven work.
+Only the original Codex UI can answer native approvals or input requests. Do not send `approval.respond`, `input.respond`, an approval proof, or a copied prompt to Slack. Fixed `LOCAL_ACTION_REQUIRED` and expiry notices only ask the original owner to inspect Codex. Connector timers never read back native request content, send decisions or answers, or interrupt native work.
 
 ## Message delivery evidence
 

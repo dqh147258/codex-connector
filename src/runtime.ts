@@ -1,5 +1,5 @@
-import { mkdirSync, closeSync, openSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, closeSync, openSync, unlinkSync, writeFileSync, realpathSync, lstatSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { SharedAppServer } from './codex.js';
 import { Connector, ConnectorError, type RuntimeContext } from './connector.js';
 import { Store } from './store.js';
@@ -8,6 +8,27 @@ import { OPERATOR, type Config, type LocalPrincipal, type Backend, type SlackPor
 import type { ScreenPort } from './screens.js';
 import type { CommandEnvelope } from './protocol.js';
 
+// These names are Connector-owned. An alias for the explicitly selected
+// home is resolved once, but a managed namespace/file must not lead outside
+// that canonical tree. Check only known paths; do not enumerate the disk.
+const managedFiles=['config.json','api.token','state.json','state.json.tmp','state.before-server-profiles.json','daemon.lock','runtime.lock'];
+function assertManagedFiles(dir:string) {
+  for(const name of managedFiles){
+    const file=lstatSync(join(dir,name),{throwIfNoEntry:false});
+    if(file&&(!file.isFile()||file.isSymbolicLink()||file.nlink!==1))throw Error('UNSAFE_CONNECTOR_HOME');
+  }
+}
+export function pinRuntimeHome(dir:string):string {
+  const pinned=realpathSync.native(resolve(dir));assertManagedFiles(pinned);return pinned;
+}
+function managedDirectory(parent:string,name:string):string {
+  const dir=join(parent,name);mkdirSync(dir,{recursive:true,mode:0o700});
+  const metadata=lstatSync(dir);if(!metadata.isDirectory()||metadata.isSymbolicLink())throw Error('UNSAFE_CONNECTOR_HOME');
+  // Junctions and other aliases must never place managed state in project space.
+  const canonical=realpathSync.native(dir);
+  if(canonical!==dir)throw Error('UNSAFE_CONNECTOR_HOME');
+  return dir;
+}
 type MakeBackend=(profile:Config['backend'],id:string)=>Backend;
 type Page={serverId?:string;sessionId:string;cursor?:string;limit?:number;waitMs?:number};
 /** Physical namespaces avoid ambiguous bare native IDs and preserve all old work,
@@ -17,19 +38,26 @@ export class Runtime {
   readonly backends=new Map<string,Backend>();
   private lock:number;private closed=false;private slackReady=false;private slackEpoch=0;
   private readonly blocked=new Set<string>();
+  private readonly dir:string;
   private readonly slackIds:string[];
-  constructor(readonly config:Config,private dir:string,slack:SlackPort,screens?:ScreenPort,
+  constructor(readonly config:Config,dir:string,slack:SlackPort,screens?:ScreenPort,
     makeBackend?:MakeBackend){
     const profiles=configuredServers(config),preferred=defaultServer(config),targets=validateIdentities(profiles);
-    const protectedHomes=[...new Set([...targets.values()].map(t=>t.home).filter((home):home is string=>home!==null))];
+    const selected=resolve(dir);
+    mkdirSync(selected,{recursive:true,mode:0o700});
+    this.dir=pinRuntimeHome(selected);
+    // Even if projects include this directory (or an ancestor), none of the
+    // root, per-server ledgers, backups or atomic temp writes are file tools' data.
+    const protectedHomes=[...new Set([selected,this.dir,...[...targets.values()].map(t=>t.home).filter((home):home is string=>home!==null)])];
     const unknownHome=[...targets.values()].some(target=>target.home===null);
     this.slackIds=config.slack.servers??(preferred?[preferred]:[]);
-    mkdirSync(dir,{recursive:true,mode:0o700});this.lock=openSync(join(dir,'runtime.lock'),'wx',0o600);
+    this.lock=openSync(join(this.dir,'runtime.lock'),'wx',0o600);
     try{
       writeFileSync(this.lock,String(process.pid));
       for(const [id,profile] of profiles){
         const target=targets.get(id)!;
-        const subdir=id==='default'?dir:join(dir,'servers',id);
+        const subdir=id==='default'?this.dir:managedDirectory(managedDirectory(this.dir,'servers'),id);
+        if(id!=='default')assertManagedFiles(subdir);
         let store:Store;
         try{store=new Store(subdir,{id,fingerprint:targetFingerprint(profile,target),allowLegacy:id==='default'&&profiles.size===1});}
         catch(e){if(['TARGET_CHANGED','LEGACY_TARGET_AMBIGUOUS'].includes((e as Error).message)){this.blocked.add(id);continue;}throw e;}
@@ -49,7 +77,7 @@ export class Runtime {
           this.cores.set(id,new Connector(config,store,backend,slack,1100,screens,context));
         }catch(e){store.close();throw e;}
       }
-    }catch(e){for(const c of this.cores.values())c.store.close();closeSync(this.lock);unlinkSync(join(dir,'runtime.lock'));throw e;}
+    }catch(e){for(const c of this.cores.values())c.store.close();closeSync(this.lock);unlinkSync(join(this.dir,'runtime.lock'));throw e;}
   }
   principal(id:string):LocalPrincipal|undefined{
     if(id==='local')return OPERATOR;

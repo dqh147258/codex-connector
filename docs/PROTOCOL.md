@@ -30,7 +30,7 @@ Each proxy connection has a unique epoch. Handlers capture both child identity a
 
 The original Codex UI is the only place to act on native approvals and user-input requests. Neither Slack envelopes (including an authenticated human's) nor Connector local API calls grant authority to answer. Slack receives at most a fixed same-origin interaction notice: no command, diff, prompt, question, options or response template.
 
-Expiry is a backend safety deadline, not remote approval. Only when current evidence still identifies the exact request/epoch/session/turn originating from the original accepted Slack operation, with current scope and routing intact, may Connector decline that exact supported command/file callback or interrupt that exact input turn. A request that is stale, resumed in another epoch, user-resolved, unsupported, foreign, local, or unproven is not answered based on old data. Do not retry a decision or interrupt another turn to resolve uncertainty.
+Expiry applies to the Connector reminder, not to the App Server request or turn. It records expiration locally, optionally relaying a fixed note to the same verified Slack origin, and never reads back native state to authorize or issue a decline, answer, or interrupt. Only the original Codex UI handles native approval and input.
 
 ## Durable delivery
 

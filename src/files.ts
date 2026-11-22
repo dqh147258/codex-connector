@@ -10,6 +10,9 @@ export interface FileLimits { maxReadBytes: number; maxFileBytes: number; maxEnt
 export interface FileEntry { path: string; type: 'file' | 'directory'; size: number; modifiedAt: string }
 const DEFAULTS: FileLimits = { maxReadBytes: 65536, maxFileBytes: 1024 * 1024, maxEntries: 200, maxDepth: 8, maxFiles: 1000, maxMatches: 100, maxSearchBytes: 4 * 1024 * 1024 };
 const DENIED_NAMES = new Set(['.git', '.git-credentials', '.gitconfig', '.config', '.local', '.cache', '.bash_history', '.zsh_history', '.history', '.bashrc', '.zshrc', '.profile', '.bash_profile', '.ssh', '.aws', '.azure', '.kube', '.gnupg', '.codex', '.codex-connector', '.npmrc', '.pypirc', '.netrc', '.docker', 'credentials', '.credentials', 'credentials.json', 'credentials.yml', 'credentials.yaml', 'secrets', '.secrets', 'secrets.json', 'secrets.yml', 'secrets.yaml', 'auth.json', 'api.token', 'service.env', 'daemon.env', 'state.json', 'config.local.json', 'shadow', 'gshadow', 'master.passwd', 'opasswd', 'keychains', 'dslocal', 'vault', 'protect', 'cookies', 'login data', 'web data', 'logins.json']);
+// Only reserved Connector artifacts are rejected by name outside the actual
+// runtime home. A normal source repository can still have its own config.json.
+const MANAGED_ARTIFACT = /^(?:\.?state\.before-server-profiles\.json(?:\.|$)|\.?state\.json\.tmp(?:\.|$)|(?:daemon|runtime)\.lock(?:\.|$)|\.?credentials\.enc(?:\.|$)|\.(?:config|desktop-preferences)\.json\.[0-9a-f-]{36}\.tmp$)/i;
 const SECRET_PATTERNS = [
   /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----/,
   /\b(?:xox[baprs]-|xapp-)[A-Za-z0-9-]{16,}/,
@@ -22,7 +25,7 @@ export function containsSensitiveContent(text: string): boolean { return SECRET_
 const forbidden = () => new FileAccessError('PATH_FORBIDDEN');
 function safeName(name: string): boolean {
   const lower = name.toLowerCase();
-  return !DENIED_NAMES.has(lower) && !/^(?:shadow|gshadow|master\.passwd|opasswd)(?:[-.~]|$)/.test(lower) && !lower.startsWith('.env') && !/^id_(?:rsa|dsa|ecdsa|ed25519)(?:\.|$)/.test(lower)
+  return !DENIED_NAMES.has(lower) && !MANAGED_ARTIFACT.test(name) && !/^(?:shadow|gshadow|master\.passwd|opasswd)(?:[-.~]|$)/.test(lower) && !lower.startsWith('.env') && !/^id_(?:rsa|dsa|ecdsa|ed25519)(?:\.|$)/.test(lower)
     && !/\.(?:pem|p12|pfx|key|keystore|kdbx|sqlite|sqlite3|db|token)$/i.test(name)
     && !/^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(name)
     && !/[\x00-\x1f\x7f\\:]/.test(name) && !/[. ]$/.test(name);
@@ -91,13 +94,20 @@ export class ReadonlyFiles {
     }
   }
   get absolutePathsEnabled(){return this.allowAbsolutePaths;}
-  private checkPrivate(full:string){if(this.privateRoots.some(root=>inside(root,full)))throw forbidden();}
+  private isPrivate(full:string){
+    // Conservative case-fold on platforms whose ordinary filesystems may
+    // resolve an alternate spelling to this same directory.
+    const pathKey=(p:string)=>process.platform==='linux'?p:p.toLowerCase();
+    const candidate=pathKey(full);
+    return this.privateRoots.some(root=>inside(pathKey(root),candidate));
+  }
+  private checkPrivate(full:string){if(this.isPrivate(full))throw forbidden();}
   private async checked(rootAlias: string | undefined, path: string): Promise<{ root: string; full: string; stats: BigIntStats; path: string }> {
     if(rootAlias===undefined){
       if(!this.allowAbsolutePaths)throw new FileAccessError('ABSOLUTE_PATHS_DISABLED');
       const {full,anchor,components}=absolutePathSyntax(path);this.checkPrivate(full);let at=anchor,stats=await lstat(anchor,{bigint:true});
       if(!stats.isDirectory()||stats.isSymbolicLink())throw forbidden();
-      for(const [index,component]of components.entries()){at=join(at,component);stats=await lstat(at,{bigint:true});if(stats.isSymbolicLink()||(!stats.isDirectory()&&!stats.isFile())||(index<components.length-1&&!stats.isDirectory())||(stats.isFile()&&stats.nlink>1n))throw forbidden();}
+      for(const [index,component]of components.entries()){at=join(at,component);this.checkPrivate(at);stats=await lstat(at,{bigint:true});if(stats.isSymbolicLink()||(!stats.isDirectory()&&!stats.isFile())||(index<components.length-1&&!stats.isDirectory())||(stats.isFile()&&stats.nlink>1n))throw forbidden();}
       const canonical=await realpath(full);this.checkPrivate(canonical);if(canonical!==full)throw forbidden();
       return{root:anchor,full,stats,path:full};
     }
@@ -113,12 +123,13 @@ export class ReadonlyFiles {
       if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw forbidden();
     }
     const root = await realpath(configured);
+    this.checkPrivate(root);
     // A configured symlink/junction itself is never silently expanded.
     if (root !== configured && process.platform !== 'win32') throw forbidden();
     validateRootSyntax(root);
     let full = root, stats = rootStat;
     for (const [index, component] of components.entries()) {
-      full = join(full, component); stats = await lstat(full, { bigint: true });
+      full = join(full, component); this.checkPrivate(full); stats = await lstat(full, { bigint: true });
       if (stats.isSymbolicLink() || (!stats.isDirectory() && !stats.isFile())) throw forbidden();
       if (index < components.length - 1 && !stats.isDirectory()) throw forbidden();
       if (stats.isFile() && stats.nlink > 1n) throw forbidden();
@@ -142,7 +153,7 @@ export class ReadonlyFiles {
       for await (const dirent of await opendir(directory.full)) {
         const name = dirent.name;
         if (++checked > this.limits.maxFiles || entries.length >= limit) { truncated = true; break; }
-        if (!safeName(name)) continue;
+        if (!safeName(name) || this.isPrivate(join(directory.full,name))) continue;
         try { const item = await this.checked(root, root===undefined?join(directory.path,name):directory.path === '.' ? name : `${directory.path}/${name}`); entries.push(this.entry(item.path, item.stats)); }
         catch (e) { if (!(e instanceof FileAccessError) && !['ENOENT','EACCES','EPERM'].includes((e as NodeJS.ErrnoException).code||'')) throw e; }
       }
@@ -205,7 +216,7 @@ export class ReadonlyFiles {
           for await (const dirent of await opendir(item.full)) {
             const name = dirent.name;
             if (++visited > this.limits.maxFiles) { truncated = true; stopped = true; break; }
-            if (!safeName(name)) continue;
+            if (!safeName(name) || this.isPrivate(join(item.full,name))) continue;
             if (stopped) break;
             try { await walk(root===undefined?join(item.path,name):item.path === '.' ? name : `${item.path}/${name}`, depth + 1); } catch (e) { if (e instanceof FileAccessError || ['ENOENT','EACCES','EPERM'].includes((e as NodeJS.ErrnoException).code||'')) skippedFiles++; else throw e; }
           }

@@ -125,7 +125,7 @@ node dist/src/cli.js help --command session.create
 
 回原 Codex 界面查看完整请求并亲自处理。Slack 的固定提示不包含命令、文件差异、问题、选项或决定模板；Slack 和本机 Connector API 都不接收原生批准或输入答复；`LOCAL_ACTION_REQUIRED` 指向原 Codex 界面。
 
-到期后，只有连接器能重新确认请求仍属于**原 Slack 线程接纳的同一请求与轮次**、权限和连接都仍有效，且有界读回完整时，才可能拒绝那一条命令/文件回调，或中断需要输入的那一轮。到期记录可在本机查看；验证和执行不是原子操作。身份、范围、轮次或连接变化，原生/本机来源不明，或协议不支持时，不自动响应、中断或重放。不要把没有 Slack 提醒当成没有待处理请求。
+连接器提醒到期时，只把自身记录标为“已过期”。如果仍能核对原 Slack 来源，可发一条固定提醒，请回原 Codex 界面查看；不补读正文，也不发送拒绝、答复或中断。用户可能已在本机回答并继续工作，因此到期不代表原生请求已解决，也不代表 Codex 已停止。
 
 ## 5. Codex Skill / 本地 API
 
@@ -193,4 +193,4 @@ Slack 使用 `session.list` 定位有明确 ID 的候选会话，或用 `session
 
 ## 远程屏幕截图（默认关闭）
 
-桌面版本新增 `screen.list` 与 `screen.capture {"displayId":"all"}` / 精确屏幕 ID：一次截图作为 JPEG 上传至原 Slack 线程。需要本机显式启用、系统屏幕录制权限和 Slack `files:write`；不逐次确认、不后台截屏。画面不自动脱敏。Wayland/PipeWire 不支持可靠的全部/指定屏幕映射，纯 CLI 无截图 provider。设置、风险、平台限制与验收说明见 [SCREENSHOTS.md](docs/SCREENSHOTS.md)。
+截图是独立且默认关闭的功能，不属于元数据通知。画面可能包括原生对话、审批提示和其它应用，且不会脱敏。要求全程只向 Slack 发送元数据的环境应保持关闭。经本机操作者单独启用并满足系统和 Slack 权限时，`screen.capture` 才把选定界面的 JPEG 发到原请求线程；不会后台截屏。见 [SCREENSHOTS.md](docs/SCREENSHOTS.md)。
